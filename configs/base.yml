@@ -1,0 +1,50 @@
+# configs/base.yml：共通の土台設定（paper/live/backtest から上書きする前提）
+# 役割：
+# - 戦略しきい値（features.*）と、ガード/リスク/窓/ログをひとまとめにする
+# - 自炊ワークフローの整合・安全装置・窓切替がこの数字を読む
+
+env: paper  # 既定は paper（各環境ファイルで上書き）  # 文書準拠
+product_code: FX_BTC_JPY  # 対象銘柄は固定（CFD/FX_BTC_JPY）
+tick_size: 1  # 価格刻み（1 tick = 1 JPY）
+
+size:  # 取引サイズの下限と既定値
+  min: 0.001     # 最小ロット
+  default: 0.01  # 既定ロット（最初は小さく）
+
+risk:  # リスク上限と非常停止（Kill-Switch）
+  max_inventory: 0.2  # 在庫の絶対上限（BTC）
+  kill:
+    daily_pnl_jpy: -30000  # 日次損益がこの値を下回ったら停止
+    max_dd_jpy: -20000     # ドローダウンがこの値を下回ったら停止
+
+guard:  # ガードレール（相場が速すぎる時は出さない）
+  max_mid_move_bp_30s: 25  # 直近30sのミッド変化が25bp超なら停止/縮小
+
+mode_switch:  # “窓”の扱い。メンテ時間/ファンディング計算時刻の前後で挙動変更
+  maintenance: { start: "04:00:00", end: "04:10:00", action: "pause" }  # JSTの例
+  funding_calc_jst: ["06:00:00","14:00:00","22:00:00"]  # 計算タイミング（受渡は遅延）
+  funding_transfer_lag_hours: 8  # 授受のラグ時間（時間）
+
+latency:  # まずは固定遅延のモデル（実測に置換予定）
+  rx_ms: 20  # 受信遅延の仮定
+  tx_ms: 20  # 送信遅延の仮定
+
+features:  # 戦略のしきい値（#1/#2 の主材料）
+  stall_T_ms: 250          # #1 静止→一撃：BestがTms静止
+  ca_ratio_win_ms: 500     # #2 C/Aゲート：集計窓（ms）
+  ca_threshold: 1.3        # #2 C/Aゲート：Cancel/Add 閾値（以下ならOK）
+  min_spread_tick: 1       # 最低スプレッド（tick）
+  ttl_ms: 800              # オーダーの寿命（ms）
+  age_ms: 200              # Age×MP（OFF時も計算は可能）
+  mp_offset_tick: 1.0      # Micropriceオフセット（tick）
+  tiny_prints_N: 20        # Tiny-Prints集計N（OFFの初期値）
+  tiny_prints_minCount: 14 # Tiny-Prints発火閾値（OFFの初期値）
+  eta_t_window_ms: 800     # Queue ETAの窓（OFFの初期値）
+
+strategies:  # まずは2本だけON（他はOFF）
+  - stall_then_strike  # #1 静止→一撃
+  - cancel_add_gate    # #2 キャンセル比ゲート
+
+logging:  # ログ出力の基本設定
+  level: INFO     # paper既定はINFO（paper.ymlでDEBUGに上書き予定）
+  rotate_mb: 128  # ログローテーションの閾値（MB）

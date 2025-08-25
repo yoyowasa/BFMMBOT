@@ -1,0 +1,6 @@
+# configs/live.yml：本番環境で base.yml を必要最小限だけ“上書き”
+env: live                  # 【関数】liveモード指定
+risk:
+  max_inventory: 0.2       # 【関数】本番の在庫上限（base既定を明示）
+logging:
+  level: INFO              # 【関数】本番のログレベル（base既定を明示）

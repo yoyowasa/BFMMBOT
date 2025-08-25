@@ -1,0 +1,41 @@
+# src/strategy/stall_then_strike.py
+# 役割：#1 静止→一撃（BestがTms静止 & Spread>=Sの直後にミッド±1tickへ最小ロット両面、条件外は即撤退）
+from __future__ import annotations
+
+from typing import List, Dict, Any  # 返り値の型
+from datetime import datetime  # 戦略判断時刻
+
+from src.core.orderbook import OrderBook  # Best/Spreadを参照
+from src.core.orders import Order  # 置く指値の表現
+from src.strategy.base import StrategyBase  # 共通IF
+
+class StallThenStrike(StrategyBase):
+    """【関数】#1 静止→一撃の最小実装（文書のトリガ/撤退に準拠）"""
+    name: str = "stall_then_strike"
+
+    def evaluate(self, ob: OrderBook, now: datetime, cfg) -> List[Dict[str, Any]]:
+        # 設定の読み出し（無ければ文書の最小値）:contentReference[oaicite:4]{index=4} :contentReference[oaicite:5]{index=5}
+        feats = cfg.features
+        stall_T = getattr(feats, "stall_T_ms", 250)
+        min_sp = getattr(feats, "min_spread_tick", 1)
+        ttl_ms = getattr(feats, "ttl_ms", 800)
+        lot = getattr(cfg.size, "default", 0.01)
+        tick = float(getattr(cfg, "tick_size", 1.0))
+
+        # Bestが未確定のときは何もしない
+        if ob.best_bid.price is None or ob.best_ask.price is None:
+            return []
+
+        # 現在の指標を取得（BestAge/Spread）:contentReference[oaicite:6]{index=6}
+        age_ms = ob.best_age_ms(now)
+        sp_tick = ob.spread_ticks()
+
+        # トリガ成立：ミッド±1tick に最小ロット両面
+        if age_ms >= stall_T and sp_tick >= min_sp:
+            mid = (ob.best_bid.price + ob.best_ask.price) / 2.0
+            return [
+                {"type": "place", "order": Order(side="buy",  price=mid - 1 * tick, size=lot, tif="GTC", ttl_ms=ttl_ms, tag="stall")},
+                {"type": "place", "order": Order(side="sell", price=mid + 1 * tick, size=lot, tif="GTC", ttl_ms=ttl_ms, tag="stall")},
+            ]
+        # 条件外：この戦略タグの注文は撤退
+        return [{"type": "cancel_tag", "tag": "stall"}]

@@ -1,0 +1,41 @@
+# pyproject.toml：このプロジェクトのパッケージ定義と依存関係を管理します（Poetry用）
+
+[tool.poetry]  # プロジェクトの基本情報（ビルドや配布の名刺）
+name = "mm-bf-cfd"
+version = "0.1.0"
+description = "bitFlyer CFD (FX_BTC_JPY) simple MM engine"  # 何を作るかの説明
+authors = ["you <you@example.com>"]  # あなたの名前とメールに置き換え可
+readme = "README.md"
+packages = [{ include = "src" }]  # src配下をパッケージとして扱う
+license = "MIT"
+
+[tool.poetry.dependencies]  # 実行に必要なライブラリ
+python = "^3.11"  # Windowsでも3.11固定（文書準拠）
+websockets = "^12.0"   # WebSocket購読（board/executions）
+httpx = "^0.27.0"      # REST/HTTPクライアント（整合やスナップ取得）
+pydantic = "^2.8.0"    # スキーマ/型検証（状態・イベント）
+pyyaml = "^6.0.1"      # YAML設定の読み書き
+orjson = "^3.10.0"     # 高速JSON（録画/ログ/IPC）
+polars = "^1.5.0"      # 列指向データ処理（特徴量/レポ）
+pyarrow = "^16.1.0"    # Arrow/Parquet I/O（ログ/テープ）
+loguru = "^0.7.2"      # ログ
+rich = "^13.7.1"       # CLI出力の見やすさ
+
+[tool.poetry.group.dev.dependencies]  # 開発用ツール群
+pytest = "^8.2.0"        # テスト
+pre-commit = "^3.7.0"    # 事前フック（lint自動化）
+ruff = "^0.5.5"          # Linter（高速）
+black = "^24.8.0"        # フォーマッタ
+isort = "^5.13.2"        # import整列
+
+[tool.black]  # コード整形のルール
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]  # Lintルール（必要に応じて後で詳細化）
+line-length = 100
+
+[build-system]  # Poetryビルドバックエンド指定
+requires = ["poetry-core>=1.8.0"]
+build-backend = "poetry.core.masonry.api"
+

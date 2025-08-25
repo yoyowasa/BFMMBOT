@@ -1,0 +1,6 @@
+# configs/paper.yml：paper環境で base.yml を安全側に“上書き”する設定
+env: paper                 # 【関数】paperモード指定：実行環境をpaperと明示
+risk:
+  max_inventory: 0.05      # 【関数】在庫上限の縮小：練習なので最大在庫を小さく
+logging:
+  level: DEBUG             # 【関数】詳細ログ：判断材料を多く残す
