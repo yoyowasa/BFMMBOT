@@ -1,20 +1,23 @@
-# 環境ファイル
+# APIキーなど環境ファイル（コミット禁止）
 .env
 *.env
 
-# ログ
+# 実行ログ・解析ログ（コミット禁止）
 logs/
 *.log
 
-# データ
-data/raw/
-data/derived/
-data/results/
+# 録画データや派生データ（コミット禁止）
+data/
+*.ndjson
+*.parquet
+*.arrow
 
-# キャッシュ
+# Pythonキャッシュや仮想環境
 __pycache__/
 *.pyc
-.parquet
-
-# 仮想環境
 .venv/
+
+# OS/エディタごみ
+.DS_Store
+Thumbs.db
+

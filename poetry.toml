@@ -1,0 +1,3 @@
+[virtualenvs]  # このプロジェクトでは、常に仮想環境を作る/使う
+create = true  # 仮想環境の自動作成をON
+in-project = true  # .venv をプロジェクト直下に作る（見失い防止）
