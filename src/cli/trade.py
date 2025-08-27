@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse  # 引数処理
 import asyncio  # 非同期ランタイム
 from loguru import logger  # 実行ログ
+from pathlib import Path  # run.log の保存先を扱う
 
 from src.core.utils import load_config  # 【関数】設定ローダー（base＋上書き）:contentReference[oaicite:12]{index=12}
 from src.runtime.engine import PaperEngine  # 【関数】paperエンジン（本ステップ）
@@ -22,6 +23,12 @@ def main() -> None:
     """【関数】エントリ：設定を読み、paperエンジンを走らせる"""
     args = _parse_args()
     cfg = load_config(args.config)
+    log_path = Path("logs/runtime/run.log")  # 【関数】ログファイルの出力先
+    log_path.parent.mkdir(parents=True, exist_ok=True)  # フォルダ作成
+    rotate_mb = getattr(getattr(cfg, "logging", None), "rotate_mb", 128)  # 既定128MB
+    level = getattr(getattr(cfg, "logging", None), "level", "INFO")  # 既定INFO
+    logger.add(log_path, level=level, rotation=f"{int(rotate_mb)} MB", enqueue=True)  # ローテ付きで出力
+
     if cfg.env != "paper":
         logger.warning(f"env is '{cfg.env}' (expected 'paper') - 続行はします")
     engine = PaperEngine(cfg, args.strategy)

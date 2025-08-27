@@ -106,8 +106,8 @@ def run_backtest_min(cfg, tape_path: str, strategy_name: str = "stall_then_strik
                         continue
                     sim.place(act["order"], now)
                     o = act["order"]
-                    order_log.add(ts=now.isoformat(), action="place", tif=o.tif, ttl_ms=o.ttl_ms,
-                                px=o.price, sz=o.size, reason=strat.name)
+                    order_log.add(ts=now.isoformat(), action="place", tif=o.tif, ttl_ms=o.ttl_ms, px=o.price, sz=o.size, reason=o.tag)  # バックテストでも“タグ名”で統一
+
 
                 elif act.get("type") == "cancel_tag":
                     for o in sim.cancel_by_tag(act["tag"]):  # 取消明細ごとに orders に記録

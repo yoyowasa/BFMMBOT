@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import asyncio  # 非同期ループ/キャンセル
 from collections import deque  # 30sミッド履歴でガード
-from datetime import datetime, timezone  # ts解析と現在時刻
+from datetime import datetime, timezone, timedelta  # ts解析と現在時刻 JST日付の境界計算にtimedeltaを使う
 from typing import Deque, Tuple  # 型ヒント
 
 from loguru import logger  # 実行ログ
+from pathlib import Path  # ハートビートNDJSONのファイル出力に使用
+import orjson  # 1行JSON化（高速）
 from src.core.realtime import event_stream  # 【関数】WS購読（board/executions）:contentReference[oaicite:2]{index=2}
 from src.core.orderbook import OrderBook  # 【関数】ローカル板（Best/Spread/C-A）:contentReference[oaicite:3]{index=3}
 from src.core.simulator import MiniSimulator  # 【関数】最小約定シミュ（価格タッチ）:contentReference[oaicite:4]{index=4}
@@ -38,6 +40,12 @@ class PaperEngine:
         self.guard_bp = None
         if getattr(cfg, "guard", None) is not None:
             self.guard_bp = getattr(cfg.guard, "max_mid_move_bp_30s", None)
+            self.kill_daily = getattr(getattr(getattr(cfg, "risk", None), "kill", None), "daily_pnl_jpy", None)  # 【関数】Kill: 日次PnL閾値
+            self.kill_dd = getattr(getattr(getattr(cfg, "risk", None), "kill", None), "max_dd_jpy", None)        # 【関数】Kill: 日次DD閾値
+            self.halted = False  # 【関数】Kill発火後は停止
+
+            self.max_inv = getattr(getattr(cfg, "risk", None), "max_inventory", None)  # 【関数】在庫上限ガードの設定読み込み：±BTCの上限
+
 
         # 戦略（#1/#2）を選択
         if strategy_name == "cancel_add_gate":
@@ -48,14 +56,23 @@ class PaperEngine:
         # ローカル板・シミュ・ログ器
         self.ob = OrderBook(tick_size=self.tick)
         self.sim = MiniSimulator()
-        self.order_log = OrderLog("logs/orders/order_log.parquet")
-        self.trade_log = TradeLog("logs/trades/trade_log.parquet")
-        self.decision_log = DecisionLog("logs/analytics/decision_log.parquet")
+        self.order_log = OrderLog("logs/orders/order_log.parquet", mirror_ndjson="logs/orders/order_log.ndjson")  # NDJSONミラー有効化
+        self.trade_log = TradeLog("logs/trades/trade_log.parquet", mirror_ndjson="logs/trades/trade_log.ndjson")  # NDJSONミラー有効化
+        self.decision_log = DecisionLog("logs/analytics/decision_log.parquet", mirror_ndjson="logs/analytics/decision_log.ndjson")  # NDJSONミラー有効化
+        self._hb_path = Path("logs/runtime/heartbeat.ndjson")  # 【関数】ハートビート出力先（NDJSON）
+        self._hb_path.parent.mkdir(parents=True, exist_ok=True)  # 親フォルダを用意
+        self._midguard_paused = False  # 直近の“ミッド変化ガード”状態を持つ
+
 
         # PnL最小モデルの内部状態（自炊Q/A/Rのミニ版）
         self.Q = 0.0  # 在庫（+ロング/−ショート）
         self.A = 0.0  # 平均建値
         self.R = 0.0  # 実現PnL累計
+        self._JST = timezone(timedelta(hours=9))  # 【関数】日次境界（JST）
+        jst_now = _now_utc().astimezone(self._JST)
+        jst_midnight = jst_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        self._day_start_utc = jst_midnight.astimezone(timezone.utc)  # 【関数】当日JST 0時（UTC）
+        self._daily_R, self._R_HWM = 0.0, 0.0  # 【関数】日次PnLとそのHWM（DD計算に使用）
 
         # 30秒ミッド履歴（ガード用）：(epoch_sec, mid)
         self._midwin: Deque[Tuple[float, float]] = deque()
@@ -81,6 +98,70 @@ class PaperEngine:
             return False
         move_bp = abs(mid - oldest_mid) / oldest_mid * 1e4
         return move_bp >= float(self.guard_bp)
+
+    def _in_maintenance(self, now: datetime) -> bool:
+        """【関数】JSTのメンテ窓に入っているかを判定（跨日にも対応）"""
+        m = getattr(getattr(self.cfg, "mode_switch", None), "maintenance", None)
+        if not m:
+            return False
+        try:
+            s, e = m.start, m.end  # "HH:MM:SS"
+        except AttributeError:
+            return False
+        jst = now.astimezone(self._JST)
+        start = jst.replace(hour=int(s[0:2]), minute=int(s[3:5]), second=int(s[6:8]), microsecond=0)
+        end = jst.replace(hour=int(e[0:2]), minute=int(e[3:5]), second=int(e[6:8]), microsecond=0)
+        if end >= start:
+            return start <= jst < end              # 同日内
+        else:
+            return jst >= start or jst < end       # 日跨ぎ(例: 23:55→00:05)
+
+    def _in_funding_calc(self, now: datetime) -> bool:
+        """【関数】Funding“計算”窓（JST）にいるか？（±5分で判定）"""
+        times = getattr(getattr(self.cfg, "mode_switch", None), "funding_calc_jst", None)
+        if not times:
+            return False
+        jst = now.astimezone(self._JST)
+        for s in times:  # "HH:MM:SS"
+            tgt = jst.replace(hour=int(s[0:2]), minute=int(s[3:5]), second=int(s[6:8]), microsecond=0)
+            if abs((jst - tgt).total_seconds()) <= 300:  # 5分以内なら窓中
+                return True
+        return False
+
+    def _in_funding_transfer(self, now: datetime) -> bool:
+        """【関数】Funding“授受”窓（計算+ラグ時間、JST）にいるか？（±5分で判定）"""
+        times = getattr(getattr(self.cfg, "mode_switch", None), "funding_calc_jst", None)
+        lag_h = getattr(getattr(self.cfg, "mode_switch", None), "funding_transfer_lag_hours", None)
+        if not times or lag_h is None:
+            return False
+        jst = now.astimezone(self._JST)
+        for s in times:
+            base = jst.replace(hour=int(s[0:2]), minute=int(s[3:5]), second=int(s[6:8]), microsecond=0)
+            tgt = base + timedelta(hours=int(lag_h))
+            if abs((jst - tgt).total_seconds()) <= 300:  # 5分以内なら窓中
+                return True
+        return False
+
+    def _roll_daily(self, now: datetime) -> None:
+        """【関数】日次境界（JST）を跨いだら R_day/HWM をリセット"""
+        jst = now.astimezone(self._JST)
+        jst_mid = jst.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start_utc = jst_mid.astimezone(timezone.utc)
+        if day_start_utc != self._day_start_utc:
+            self._day_start_utc = day_start_utc
+            self._daily_R, self._R_HWM = 0.0, 0.0  # 新しい日としてリセット
+
+    def _maybe_trigger_kill(self) -> tuple[bool, str | None, float, float]:
+        """【関数】Kill判定：Trueなら停止（理由, 日次R, 日次DDを返す）"""
+        daily_R = self._daily_R
+        dd = daily_R - self._R_HWM  # ≤ 0（下振れがDD）
+        # 日次PnL（下限到達でKill）
+        if self.kill_daily is not None and daily_R <= float(self.kill_daily):
+            return True, "daily", daily_R, dd
+        # 日次DD（下限到達でKill）
+        if self.kill_dd is not None and dd <= float(self.kill_dd):
+            return True, "dd", daily_R, dd
+        return False, None, daily_R, dd
 
     # ─────────────────────────────────────────────────────────────
     def _record_decision(self, now: datetime, actions) -> None:
@@ -118,11 +199,37 @@ class PaperEngine:
             spread_state=("zero" if feats["spread_tick"] == 0 else "ge1"),
         )
 
+    def _heartbeat(self, now: datetime, event: str, reason: str | None = None) -> None:
+        """【関数】ハートビート：Q/A/R・日次R・各ガード/窓の状態を1行JSONで追記する"""
+        j = {
+            "ts": now.isoformat(),
+            "event": event,           # "place" / "fill" / "pause" など直近イベント
+            "reason": reason,         # "inventory_guard" / "midmove_guard" / "maintenance" / "funding" など
+            "strategy": self.strat.name,
+            "Q": self.Q,              # 現在在庫（+ロング/−ショート）
+            "A": self.A,              # 平均建値
+            "R": self.R,              # 累計実現PnL
+            "R_day": self._daily_R,   # 日次実現PnL
+            "guard": {                # ガードのON/OFF（Trueで“新規停止中”）
+                "inventory": (self.max_inv is not None and abs(self.Q) >= float(self.max_inv)),
+                "midmove": self._midguard_paused,
+            },
+            "window": {
+                "maint": self._in_maintenance(now),
+                "funding": self._in_funding_calc(now) or self._in_funding_transfer(now),
+            },
+        }
+        self._hb_path.open("a", encoding="utf-8").write(orjson.dumps(j).decode("utf-8") + "\n")
+
     # ─────────────────────────────────────────────────────────────
     def _apply_fill_and_log(self, ts_iso: str, side: str, px: float, sz: float, tag: str) -> None:
         """【関数】Fillを在庫Q/A/Rに適用し、orders/tradesへ記録（最小PnL）"""
         # 1) orders：fill行
         self.order_log.add(ts=ts_iso, action="fill", tif="GTC", ttl_ms=None, px=px, sz=sz, reason=tag)
+        dt = _parse_iso(ts_iso)  # 【関数】この約定時刻で窓フラグを判定するためにdatetime化
+        is_maint = self._in_maintenance(dt)  # 【関数】メンテ窓か？
+        is_fund = self._in_funding_calc(dt) or self._in_funding_transfer(dt)  # 【関数】Funding窓か？
+
         # 2) PnL更新（最小）：ショート買い戻し/ロング利確を片側ずつ
         realized = 0.0
         if side == "sell":
@@ -148,11 +255,18 @@ class PaperEngine:
                 self.A = (self.A * self.Q + px * sz) / (self.Q + sz) if self.Q > 0 else px
                 self.Q += sz
         self.R += realized
+        self._daily_R += realized  # 【関数】日次PnLを更新
+        self._R_HWM = max(self._R_HWM, self._daily_R)  # 【関数】HWM更新（DD計算用）
+
         # 3) trades：約定行
         self.trade_log.add(
             ts=ts_iso, side=side, px=px, sz=sz, pnl=realized,
-            strategy=self.strat.name, tag=tag, inventory_after=self.Q
+            strategy=self.strat.name, tag=tag, inventory_after=self.Q,
+            window_funding=is_fund, window_maint=is_maint  # 【関数】どの窓中の約定かを明示
         )
+        self._heartbeat(dt, "fill", reason=tag)  # ハートビート：約定を要約
+
+
 
     # ─────────────────────────────────────────────────────────────
     async def run_paper(self) -> None:
@@ -167,7 +281,44 @@ class PaperEngine:
 
                 if ch.startswith("lightning_board_"):
                     # ローカル板更新
+                    # 日次境界（JST）を跨いだら R_day/HWM をリセット
+                    self._roll_daily(now)
+
+                    # Kill‑Switch 判定（trueで全キャンセル→停止）
+                    hit, why, rday, dd = self._maybe_trigger_kill()
+                    if hit:
+                        for o in self.sim.cancel_by_tag("stall"):
+                            self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
+                                            px=o.price, sz=o.remaining, reason="kill")
+                        for o in self.sim.cancel_by_tag("ca_gate"):
+                            self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
+                                            px=o.price, sz=o.remaining, reason="kill")
+                        self.halted = True
+                        logger.error(f"Kill‑Switch({why}) fired: R_day={rday:.2f}, DD={dd:.2f} → stopping")
+                        return  # 安全停止（finallyでログflush）  # 文書の“Kill到達で停止”に準拠
+
                     self.ob.update_from_event(ev)
+                    # メンテ窓：新規禁止＋同タグ一括Cancel（reason="window"）
+                    if self._in_maintenance(now):
+                        for o in self.sim.cancel_by_tag("stall"):
+                            self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
+                                            px=o.price, sz=o.remaining, reason="window")
+                        for o in self.sim.cancel_by_tag("ca_gate"):
+                            self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
+                                            px=o.price, sz=o.remaining, reason="window")
+                            self._heartbeat(now, "pause", reason="maintenance")
+                        continue  # このboardイベントでは新規Placeを行わない
+                    
+                    # Funding窓（計算 or 授受）：新規禁止＋同タグ一括Cancel（reason="funding"）
+                    if self._in_funding_calc(now) or self._in_funding_transfer(now):
+                        for o in self.sim.cancel_by_tag("stall"):
+                            self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
+                                            px=o.price, sz=o.remaining, reason="funding")  # 【関数】Funding窓で停止
+                        for o in self.sim.cancel_by_tag("ca_gate"):
+                            self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
+                                            px=o.price, sz=o.remaining, reason="funding")  # 【関数】Funding窓で停止
+                            self._heartbeat(now, "pause", reason="funding")
+                        continue  # このboardイベントでは新規Placeを行わない
 
                     # TTL失効を処理（取消ログ）
                     for o in self.sim.on_time(now):
@@ -176,6 +327,8 @@ class PaperEngine:
 
                     # ガード（速すぎるときは新規停止＋全取消）
                     paused = self._guard_midmove_bp(now)
+                    self._midguard_paused = paused  # 直近のミッド移動ガード状態を保持（ハートビートに載せる）
+
                     if paused:
                         for o in self.sim.cancel_by_tag("stall"):
                             self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
@@ -183,9 +336,25 @@ class PaperEngine:
                         for o in self.sim.cancel_by_tag("ca_gate"):
                             self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
                                                px=o.price, sz=o.remaining, reason="guard")
+                            self._heartbeat(now, "pause", reason="midmove_guard")  # 直近イベントを要約（ミッド変化ガードで停止）
                         continue  # 新規は出さない
+                    
+
 
                     # 戦略評価→意思決定ログ→アクション適用
+                    # 在庫上限ガード：|Q| が上限以上なら新規は出さず、同タグの未約定を一括Cancel（理由は "risk"）
+                    if self.max_inv is not None and abs(self.Q) >= float(self.max_inv):
+                        for o in self.sim.cancel_by_tag("stall"):
+                            self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
+                                            px=o.price, sz=o.remaining, reason="risk")  # 何を/なぜ記録したか（在庫上限）
+                        for o in self.sim.cancel_by_tag("ca_gate"):
+                            self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
+                                            px=o.price, sz=o.remaining, reason="risk")  # 何を/なぜ記録したか（在庫上限）
+                        logger.warning(f"risk guard: |Q|>={self.max_inv} → new orders paused")  # 画面でも分かるように一言
+                        self._heartbeat(now, "pause", reason="inventory_guard")  # ハートビート：在庫上限で停止
+                        continue  # このboardイベントでは新規Placeを行わない
+                   
+
                     actions = self.strat.evaluate(self.ob, now, self.cfg)
                     self._record_decision(now, actions)
                     for act in actions:
@@ -195,8 +364,10 @@ class PaperEngine:
                                 continue
                             self.sim.place(act["order"], now)
                             o = act["order"]
-                            self.order_log.add(ts=now.isoformat(), action="place", tif=o.tif, ttl_ms=o.ttl_ms,
-                                               px=o.price, sz=o.size, reason=self.strat.name)
+                            self.order_log.add(ts=now.isoformat(), action="place", tif=o.tif, ttl_ms=o.ttl_ms, px=o.price, sz=o.size, reason=o.tag)  # placeでも“注文タグ”（stall / ca_gate）を記録する
+
+                            self._heartbeat(now, "place", reason=o.tag)  # ハートビート：発注を要約
+
                         elif act.get("type") == "cancel_tag":
                             for o in self.sim.cancel_by_tag(act["tag"]):
                                 self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,

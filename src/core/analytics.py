@@ -10,9 +10,12 @@ from loguru import logger  # 進捗ログ
 
 class DecisionLog:
     """【関数】決定ログ（features と decision を保存）"""
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, mirror_ndjson: str | Path | None = None) -> None:
         self.path = Path(path)
         self.rows: List[Dict[str, Any]] = []
+        self._mirror = Path(mirror_ndjson) if mirror_ndjson else None  # NDJSONミラーの出力先（観察用）
+        if self._mirror: self._mirror.parent.mkdir(parents=True, exist_ok=True)  # 親フォルダを作成
+
 
     def add(
         self,
@@ -39,6 +42,10 @@ class DecisionLog:
             "best_age_ms": best_age_ms,
             "spread_state": spread_state,
         })
+        if self._mirror:
+            # リアルタイム確認のため、1行JSONを NDJSON ミラーに追記する
+            self._mirror.open("a", encoding="utf-8").write(orjson.dumps(self.rows[-1]).decode("utf-8") + "\n")
+
 
     def flush(self) -> Path:
         # 説明：貯めた判断を Parquet に書き出し（既存があれば縦結合）
