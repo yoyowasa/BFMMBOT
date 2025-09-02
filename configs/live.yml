@@ -1,6 +1,21 @@
 # configs/live.yml：本番環境で base.yml を必要最小限だけ“上書き”
 env: live                  # 【関数】liveモード指定
+tx:
+  min_interval_ms: 100  # 何をするか：新規注文の最小送信間隔（ms）。429回避のため送信をスロットリング
+
+size:
+  min: 0.001    # 何をするか：最小ロット（これ未満は切り上げる）
+  default: 0.01 # 何をするか：戦略がサイズ未指定のときに使う既定値
+  step: 0.001   # 何をするか：サイズ刻み（端数をこの刻みに丸める）
+
+cancel_all_on_start: true  # 何をするか：起動時に取り残しの注文を全キャンセルしてから運転を開始（安全起動）
+tick_size: 1  # 何をするか：価格の最小刻み（例：JPYは1）。liveの発注価格はこの刻みに丸めて送信・記録する
+
+canary_minutes: 60  # 何をするか：liveを最大60分だけ運転し、超えたら全取消→停止（安全確認のカナリア）
+fees:
+  bps: 0.0  # 何をするか：手数料のベーシスポイント。PnLはこのコストを差し引いた“実コスト後”で記録されます
+
 risk:
   max_inventory: 0.2       # 【関数】本番の在庫上限（base既定を明示）
-logging:
-  level: INFO              # 【関数】本番のログレベル（base既定を明示）
+logging: { level: INFO, heartbeat_status_sec: 5 }  # 何をするか：心拍（status＝Q/A/R）を5秒間隔でNDJSONに追記する
+

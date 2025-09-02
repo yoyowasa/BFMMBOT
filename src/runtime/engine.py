@@ -20,6 +20,7 @@ from src.core.logs import OrderLog, TradeLog  # 【関数】発注/約定ログ�
 from src.core.analytics import DecisionLog  # 【関数】意思決定ログ（Parquet）:contentReference[oaicite:6]{index=6}
 from src.strategy.stall_then_strike import StallThenStrike  # #1 静止→一撃（ON）:contentReference[oaicite:7]{index=7}
 from src.strategy.cancel_add_gate import CancelAddGate  # #2 キャンセル比ゲート（ON）:contentReference[oaicite:8]{index=8}
+from src.strategy.age_microprice import AgeMicroprice  # #3 エイジ×MP
 
 def _parse_iso(ts: str) -> datetime:
     """【関数】ISO→datetime（'Z'も+00:00に正規化）"""
@@ -47,11 +48,14 @@ class PaperEngine:
             self.max_inv = getattr(getattr(cfg, "risk", None), "max_inventory", None)  # 【関数】在庫上限ガードの設定読み込み：±BTCの上限
 
 
-        # 戦略（#1/#2）を選択
+        # 戦略（#1/#2/#3）を選択
         if strategy_name == "cancel_add_gate":
             self.strat = CancelAddGate()
+        elif strategy_name == "age_microprice":
+            self.strat = AgeMicroprice()
         else:
             self.strat = StallThenStrike()
+
 
         # ローカル板・シミュ・ログ器
         self.ob = OrderBook(tick_size=self.tick)
@@ -60,6 +64,12 @@ class PaperEngine:
         self.trade_log = TradeLog("logs/trades/trade_log.parquet", mirror_ndjson="logs/trades/trade_log.ndjson")  # NDJSONミラー有効化
         self.decision_log = DecisionLog("logs/analytics/decision_log.parquet", mirror_ndjson="logs/analytics/decision_log.ndjson")  # NDJSONミラー有効化
         self._hb_path = Path("logs/runtime/heartbeat.ndjson")  # 【関数】ハートビート出力先（NDJSON）
+        self._events_dir = Path("logs/events")  # 役割：窓イベントのCSVフォルダ
+        (self._events_dir / "maintenance.csv").touch(exist_ok=True)  # 初回起動でも tail できるよう空ファイルを作る
+        (self._events_dir / "funding_schedule.csv").touch(exist_ok=True)  # 同上
+        self._events_dir.mkdir(parents=True, exist_ok=True)  # 役割：フォルダを作成
+        self._maint_prev, self._fund_prev = False, False  # 役割：直前の窓状態（enter/exit検出用）
+
         self._hb_path.parent.mkdir(parents=True, exist_ok=True)  # 親フォルダを用意
         self._midguard_paused = False  # 直近の“ミッド変化ガード”状態を持つ
 
@@ -298,6 +308,16 @@ class PaperEngine:
                         return  # 安全停止（finallyでログflush）  # 文書の“Kill到達で停止”に準拠
 
                     self.ob.update_from_event(ev)
+                    # 窓の現在状態を判定（true/false）し、前回から変わったらCSVに記録
+                    maint_now = self._in_maintenance(now)
+                    fund_now = self._in_funding_calc(now) or self._in_funding_transfer(now)
+                    if maint_now != self._maint_prev:
+                        self._log_window_event("maintenance", "enter" if maint_now else "exit", now)  # 役割：メンテ窓の出入りを記録
+                        self._maint_prev = maint_now
+                    if fund_now != self._fund_prev:
+                        self._log_window_event("funding", "enter" if fund_now else "exit", now)  # 役割：Funding窓の出入りを記録
+                        self._fund_prev = fund_now
+
                     # メンテ窓：新規禁止＋同タグ一括Cancel（reason="window"）
                     if self._in_maintenance(now):
                         for o in self.sim.cancel_by_tag("stall"):

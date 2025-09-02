@@ -1,0 +1,57 @@
+1) リアルタイム動作を追う（NDJSONミラー）
+
+何が分かる？ 発注／取消／約定／意思決定が発生順に流れます。
+ファイル：logs/orders/order_log.ndjson（place/cancel/fill/partial）、logs/trades/trade_log.ndjson（約定とPnL）、logs/analytics/decision_log.ndjson（特徴量→decision）。列は仕様固定です。
+
+見るコマンド（例）
+
+Get-Content logs\orders\order_log.ndjson -Tail 20 -Wait
+Get-Content logs\trades\trade_log.ndjson -Tail 20 -Wait
+Get-Content logs\analytics\decision_log.ndjson -Tail 20 -Wait
+
+2) “今の状態”をひと目で（ハートビート）
+
+何が分かる？ 在庫 Q・平均建値 A・実現PnL R/R_day、停止理由（inventory_guard/midmove_guard/maintenance/funding）を1行要約。
+ファイル：logs/runtime/heartbeat.ndjson。
+
+見るコマンド
+
+Get-Content logs\runtime\heartbeat.ndjson -Tail 20 -Wait
+
+3) 運転ログを通しで（回転ログ）
+
+何が分かる？ INFO/WARN などのランタイム出力を時系列で保存（サイズローテ）。
+ファイル：logs/runtime/run.log（configs/* の logging.level と rotate_mb に準拠）。
+
+見るコマンド
+
+Get-Content logs\runtime\run.log -Tail 50 -Wait
+
+4) あとから資料化して共有（Parquet→CSV/NDJSON 変換）
+
+何が分かる？ Parquet本体（仕様準拠）を読みやすい形式に出力。
+出力先：data/results/…。元の Parquet は logs/.../*.parquet に保持。
+
+出力コマンド（例）
+
+poetry run python -m src.cli.export --kind orders   --format csv    --limit 200 --out data/results/orders_preview.csv
+poetry run python -m src.cli.export --kind trades   --format ndjson                 --out data/results/trades_export.ndjson
+poetry run python -m src.cli.export --kind analytics --format csv   --limit 100 --out data/results/decision_preview.csv
+
+5) 最短で“中身を数行だけ”確認（Parquet直読み）
+
+何が分かる？ ファイルを増やさず先頭数行をコンソールに。列は仕様固定。
+
+コマンド
+
+poetry run python -c "import polars as pl; print(pl.read_parquet('logs/orders/order_log.parquet').head(5))"
+poetry run python -c "import polars as pl; print(pl.read_parquet('logs/trades/trade_log.parquet').head(5))"
+poetry run python -c "import polars as pl; print(pl.read_parquet('logs/analytics/decision_log.parquet').head(5))"
+
+使い分け（超簡潔）
+
+いま何で止まってる？ → ハートビート heartbeat.ndjson。
+
+どの注文が出た／埋まった？ → orders/trades の NDJSON を -Wait。
+
+なぜその判断？ → analytics の NDJSON（features_json と decision）。

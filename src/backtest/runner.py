@@ -14,6 +14,7 @@ from src.core.logs import OrderLog, TradeLog  # 【関数】Parquet ログ出力
 
 from src.core.simulator import MiniSimulator  # 最小シミュ（本ステップ）
 from src.strategy.stall_then_strike import StallThenStrike  # 戦略#1（本ステップ）
+from src.strategy.age_microprice import AgeMicroprice  # #3 エイジ×MPを選べるようにする
 from src.strategy.cancel_add_gate import CancelAddGate  # #2 キャンセル比ゲートを選べるようにする
 
 def _parse_iso(ts: str) -> datetime:
@@ -34,11 +35,14 @@ def run_backtest_min(cfg, tape_path: str, strategy_name: str = "stall_then_strik
 
     ob = OrderBook(tick_size=float(getattr(cfg, "tick_size", 1.0)))
     sim = MiniSimulator()
-    # 【関数】戦略選択：引数で #1/#2 を切替（既定は #1）
+    # 【関数】戦略選択：引数で #1/#2/#3 を切替（既定は #1）
     if strategy_name == "cancel_add_gate":
         strat = CancelAddGate()
+    elif strategy_name == "age_microprice":
+        strat = AgeMicroprice()
     else:
         strat = StallThenStrike()
+
 
 
     start = cfg.period.start if getattr(cfg, "period", None) else None
