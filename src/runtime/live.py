@@ -6,6 +6,14 @@ from __future__ import annotations
 import os  # 何をするか：APIキー/シークレットを環境変数から読む
 from typing import Any  # 何をするか：cfg の型ヒント用
 from loguru import logger  # 何をするか：進行ログを出す
+import math  # 何をするか：サイズの刻み丸め（floor）で使う
+
+import csv  # 何をするか：窓イベント（enter/exit）をCSVに書くために使う
+import atexit  # 何をするか：終了時に1回だけ処理するフックを登録する
+import sys  # 何をするか：未捕捉例外のフック(sys.excepthook)を差し替えるために使う
+
+from types import SimpleNamespace  # 何をするか：起動時シード用の簡易な注文オブジェクトを作る
+import time  # 何をするか：WS再接続の待ち時間（バックオフ）に使う
 import signal  # 何をするか：Ctrl+C/SIGTERM を捕まえて安全停止する
 from threading import Event  # 何をするか：停止フラグを扱う
 
@@ -22,15 +30,8 @@ from src.strategy.age_microprice import AgeMicroprice  # 何をするか：#3 �
 from src.core.logs import OrderLog, TradeLog  # 何をするか：orders/trades を Parquet＋NDJSON に記録する
 from src.core.analytics import DecisionLog  # 何をするか：戦略の意思決定ログ（Parquet＋NDJSONミラー）を扱う
 
-# 何をするか：前ステップで作った exchange adapter を使う
-from src.core.exchange import (
-    BitflyerExchange,
-    ExchangeError,
-    AuthError,
-    RateLimitError,
-    ServerError,
-    NetworkError,
-)
+from src.core.exchange import BitflyerExchange, ExchangeError, RateLimitError, ServerError, NetworkError, AuthError  # 何をするか：認証/権限エラー(AuthError)を検知して安全停止する
+
 
 def _select_strategy(name: str, cfg):
     """何をするか：戦略名から実体を生成（#1/#2/#3のいずれか）"""
@@ -59,7 +60,9 @@ def _in_maintenance(now: datetime, cfg) -> bool:
     maint = getattr(ms, "maintenance", None)
     if not maint:
         return False
-    start_s, end_s = maint.get("start"), maint.get("end")
+    start_s = (maint.get("start") if isinstance(maint, dict) else getattr(maint, "start", None))  # 何をするか：Pydantic属性/辞書の両対応で開始時刻(JST文字列)を取得
+    end_s   = (maint.get("end")   if isinstance(maint, dict) else getattr(maint, "end",   None))  # 何をするか：Pydantic属性/辞書の両対応で終了時刻(JST文字列)を取得
+
     if not (start_s and end_s):
         return False
     jst = now.astimezone(timezone(timedelta(hours=9)))
@@ -129,6 +132,56 @@ def _net_inventory_btc(ex: BitflyerExchange) -> float:
         q += sz if side == "BUY" else -sz
     return q
 
+def _seed_live_orders_from_active(ex: BitflyerExchange, live_orders: dict[str, dict]) -> None:
+    """何をするか：取引所に残っている未約定(ACTIVE)注文を見つけて、監視辞書(live_orders)へ投入する"""
+    try:
+        items = ex.list_active_child_orders(count=100)  # 何をするか：ACTIVEな子注文を最大100件取得
+    except ExchangeError:
+        return  # 何をするか：一時失敗は何もしない（次回に回す）
+    for it in items or []:
+        acc = str(it.get("child_order_acceptance_id") or "")
+        if not acc or acc in live_orders:
+            continue  # 何をするか：IDなし/すでに監視中ならスキップ
+        side = str(it.get("side", "")).upper()
+        px = float((it.get("price") or it.get("average_price") or 0.0) or 0.0)
+        sz = float(it.get("size", 0.0) or 0.0)
+        executed = float(it.get("executed_size", 0.0) or 0.0)
+        avg = float(it.get("average_price", 0.0) or 0.0)
+        o = SimpleNamespace(side=side, price=px, size=sz, tag="seed", tif="GTC", ttl_ms=None)  # 何をするか：最小限の“注文情報”を用意
+        live_orders[acc] = {"deadline": None, "order": o, "executed": executed, "avg_price": avg}  # 何をするか：TTLなしで監視（Fillで自然に片付く）
+
+def _seed_inventory_and_avg_px(ex: BitflyerExchange) -> tuple[float | None, float]:
+    """何をするか：取引所の建玉一覧から“平均コスト（参考）”と“ネット建玉(BTC)”を取得して初期状態に入れる"""
+    try:
+        positions = ex.get_positions()  # 何をするか：現在保有している建玉一覧を取得
+    except ExchangeError:
+        return None, 0.0  # 何をするか：取れない時は安全にゼロ開始
+
+    long_sz = long_not = 0.0
+    short_sz = short_not = 0.0
+    for p in positions or []:
+        sz = float(p.get("size", 0.0) or 0.0)
+        px = float(p.get("price", 0.0) or 0.0)
+        side = str(p.get("side", "")).upper()
+        if sz <= 0.0 or px <= 0.0:
+            continue
+        if side == "BUY":
+            long_sz += sz
+            long_not += sz * px
+        elif side == "SELL":
+            short_sz += sz
+            short_not += sz * px
+
+    net = long_sz - short_sz  # 何をするか：ロング合計−ショート合計＝ネット建玉（+ロング/−ショート）
+    if net > 0.0 and long_sz > 0.0:
+        avg = long_not / long_sz  # 何をするか：ロング側の平均建値
+    elif net < 0.0 and short_sz > 0.0:
+        avg = short_not / short_sz  # 何をするか：ショート側の平均建値
+    else:
+        avg, net = None, 0.0  # 何をするか：ネットがゼロなら平均は不要
+
+    return avg, net
+
 def _hb_write(path: Path, *, event: str, **fields) -> None:
     """何をするか：ハートビート(NDJSON)に1行追記して、運転状況をリアルタイム可視化する"""
     rec = {"event": event}
@@ -136,6 +189,97 @@ def _hb_write(path: Path, *, event: str, **fields) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)  # 何をするか：ディレクトリを事前作成
     with path.open("a", encoding="utf-8") as f:
         f.write(orjson.dumps(rec).decode("utf-8") + "\n")  # 何をするか：1行JSONを追記
+
+def _best_px(side) -> float | None:
+    """何をするか：best_bid/best_ask に入るオブジェクト/辞書/数値から“価格(float)”だけを取り出す"""
+    if side is None:
+        return None
+    if isinstance(side, (int, float)):
+        return float(side)
+    for attr in ("price", "px", "p"):  # 何をするか：代表的な属性名を順に試す
+        v = getattr(side, attr, None)
+        if isinstance(v, (int, float)):
+            return float(v)
+    if isinstance(side, dict):  # 何をするか：辞書形式にも対応
+        for key in ("price", "px", "p"):
+            v = side.get(key)
+            if isinstance(v, (int, float)):
+                return float(v)
+    return None  # 何をするか：どれにも当てはまらなければ未取得（None）
+
+def _normalize_px_sz(cfg, px: float, sz: float) -> tuple[float | None, float | None]:
+    """何をする関数か：価格をtick、サイズをstepへ丸め、最小サイズ未満は(None, None)を返して発注を止める"""
+    tick = getattr(cfg, "tick_size", None)
+    step = getattr(getattr(cfg, "size", None), "step", None)
+    minsz = getattr(getattr(cfg, "size", None), "min", None)
+
+    if (tick is not None) and (tick > 0):
+        px = round(px / float(tick)) * float(tick)  # 何をするか：価格を最寄りのtickへ丸める
+
+    if (step is not None) and (step > 0):
+        sz = math.floor(sz / float(step)) * float(step)  # 何をするか：サイズは超過しないよう“切り捨て”で刻みに合わせる
+
+    if (minsz is not None) and (sz < float(minsz)):
+        return None, None  # 何をするか：最小サイズ未満は発注を止める
+
+    return px, sz
+
+def _csv_event_write(path: Path, row: dict) -> None:
+    """何をするか：イベントCSV（enter/exit）を1行追記（初回はヘッダも書く）"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new = not path.exists()
+    with path.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if new:
+            w.writeheader()
+        w.writerow(row)
+
+def _mk_atexit(hb_path: Path):
+    """何をするか：プロセス終了時に heartbeat に stop を1行書く関数を返す"""
+    def _on_exit():
+        try:
+            _hb_write(hb_path, event="stop", ts=_now_utc().isoformat(), reason="exit")  # 何をするか：終了の合図を記録
+        except Exception:
+            pass  # 何をするか：終了間際のエラーは握って静かに終わる
+    return _on_exit
+
+def _mk_excepthook(ex: BitflyerExchange, hb_path: Path, live_orders: dict[str, dict], orig_hook):
+    """何をするか：未捕捉例外が起きたら“全取消→killを書いて停止”する excepthook を作って返す"""
+    def _hook(exc_type, exc, tb):
+        logger.exception(f"live: unexpected error → cancel_all & halt: {exc}")  # 何をするか：原因をrun.logに記録（スタック付き）
+        try:
+            if live_orders:  # 何をするか：生きている注文を片付ける
+                ex.cancel_all_child_orders()
+                live_orders.clear()
+        except Exception:
+            pass  # 何をするか：片付け中の二次エラーは握る
+        try:
+            _hb_write(hb_path, event="kill", ts=_now_utc().isoformat(), reason="exception")  # 何をするか：ハートビートに“例外停止”を記録
+        except Exception:
+            pass
+        try:
+            orig_hook(exc_type, exc, tb)  # 何をするか：元のフックにも渡して正常終了パスへ
+        except Exception:
+            pass
+    return _hook
+
+def _stream_with_reconnect(product_code: str, hb_path: Path, *, max_backoff_s: int = 10):
+    """何をするか：WSが切れたら心拍にpauseを書き、待ってから自動再接続してイベントを流し続ける"""
+    backoff = 1
+    while True:
+        try:
+            for ev in stream_events(product_code):
+                backoff = 1  # 何をするか：イベントを受け取れたらバックオフを初期化
+                yield ev
+        except Exception as e:
+            logger.warning(f"ws reconnect: {e}")  # 何をするか：再接続の理由をrun.logに残す
+            try:
+                _hb_write(hb_path, event="pause", ts=_now_utc().isoformat(), reason="ws_reconnect")  # 何をするか：心拍に“再接続”を記録
+            except Exception:
+                pass
+            time.sleep(backoff)  # 何をするか：少し待ってから再接続（バックオフ）
+            backoff = min(max_backoff_s, backoff * 2 if backoff < max_backoff_s else max_backoff_s)
+            continue
 
 def _log_window_event(events_dir: Path, kind: str, action: str, ts: datetime) -> None:
     """何をするか：窓（maintenance / funding）の入退をCSVに1行追記して記録する"""
@@ -283,10 +427,24 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True) -> None:
                 ob = OrderBook()  # 何をするか：ローカル板（戦略の入力）を用意
             strat = _select_strategy(strategy_name, cfg)  # 何をするか：戦略に設定（cfg）を渡す
             live_orders: dict[str, dict] = {}  # 何をするか：受理ID→TTLなどのメタ情報を保持
+            if not bool(getattr(cfg, "cancel_all_on_start", True)):  # 何をするか：起動時に全取消しない運用なら、残っている注文を監視にシード
+                _seed_live_orders_from_active(ex, live_orders)
+
             mid_hist = deque(maxlen=2048)  # 何をするか：ミッド価格の履歴（30秒変化ガード用）
             max_bp = getattr(getattr(cfg, "guard", None), "max_mid_move_bp_30s", None)  # 何をするか：ミッド変化ガードの閾値
             inv_limit = getattr(getattr(cfg, "risk", None), "max_inventory", None)  # 何をするか：在庫上限
+            dry_limit_s = getattr(cfg, "dry_run_max_sec", None)  # 何をするか：dry-runの自動停止（秒）。Noneなら無効
+
+            max_active = getattr(getattr(cfg, "risk", None), "max_active_orders", None)  # 何をするか：同時アクティブ注文数の上限（個）
+            max_spread_bp = getattr(getattr(cfg, "guard", None), "max_spread_bp", None)  # 何をするか：スプレッドが広すぎる時の停止しきい値(bp)
+            stale_ms = int(getattr(getattr(cfg, "guard", None), "max_stale_ms", 3000))  # 何をするか：WS/板の鮮度しきい値(ms)。超えたら新規を止める
+            last_ev_at = _now_utc()  # 何をするか：直近イベントの時刻（鮮度ガードの基準）
             hb_path = Path("logs/runtime/heartbeat.ndjson")  # 何をするか：ハートビートの出力先
+            maint_prev = None  # 何をするか：メンテ窓の前回状態（enter/exit検知用）
+            fund_prev = None   # 何をするか：Funding窓（計算or授受）の前回状態（enter/exit検知用）
+            maint_csv = Path("logs/events/maintenance.csv")  # 何をするか：メンテ窓のイベントCSVのパス
+            fund_csv = Path("logs/events/funding.csv")       # 何をするか：Funding窓のイベントCSVのパス
+
             hb_interval_s = int(getattr(getattr(cfg, "logging", None), "heartbeat_status_sec", 5))  # 何をするか：ステータス心拍の間隔（秒）
             hb_next = _now_utc() + timedelta(seconds=hb_interval_s)  # 何をするか：次に出す時刻
 
@@ -302,23 +460,41 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True) -> None:
             hb_path.parent.mkdir(parents=True, exist_ok=True)  # 何をするか：保存先フォルダを作る
 
             halted = False  # 何をするか：Kill 到達後は新規を出さない
-            pnl_state = {"pos": 0.0, "avg_px": None}  # 何をするか：建玉と平均コスト（PnL計算用）
+            pnl_state = (lambda a,n: {"pos": n, "avg_px": a})(*_seed_inventory_and_avg_px(ex))  # 何をするか：起動時の建玉(数量/平均建値)を反映してPnL状態を初期化
             daily_R, R_HWM = 0.0, 0.0  # 何をするか：日次実現PnLとその高値（HWM）
             _jst = timezone(timedelta(hours=9))  # 何をするか：JST（Killの日次境界に使用）
             jst_day = _now_utc().astimezone(_jst).date()  # 何をするか：当日のJST日付
             kill_cfg = getattr(getattr(cfg, "risk", None), "kill", None)  # 何をするか：Killしきい値
             min_tx_ms = int(getattr(getattr(cfg, "tx", None), "min_interval_ms", 100))  # 何をするか：新規注文を連続で送らない最小間隔（ms）
+            place_dedup_ms = int(getattr(getattr(cfg, "tx", None), "place_dedup_ms", 300))  # 何をするか：同一(side×price×tag)の連打をこのms以内ならスキップ
+            last_place: dict[str, datetime] = {}  # 何をするか：直近に出した(side|price|tag)→時刻 を覚える
             _last_tx_at = _now_utc() - timedelta(milliseconds=min_tx_ms)  # 何をするか：直近の送信時刻（初期は「今−間隔」で即送れる状態）
             fee_bps = float(getattr(getattr(cfg, "fees", None), "bps", 0.0))  # 何をするか：手数料のbps設定（未指定は0.0）
             canary_min = int(getattr(cfg, "canary_minutes", 60))  # 何をするか：最長運転時間（分）。未指定は60分
 
             logger.info(f"live: starting loop product={product_code} strategy={strategy_name}")  # 何をするか：起動ログ
-            
-            if bool(getattr(cfg, "cancel_all_on_start", True)):  # 何をするか：起動時に既存注文を掃除（既定ON）
-                try: ex.cancel_all_child_orders(); logger.info("live: startup safety — cancel_all issued")
-                except ExchangeError as e: logger.warning(f"live: startup cancel_all failed: {e}")
+            _hb_write(hb_path, event="start", ts=_now_utc().isoformat(), reason="launch", product=product_code, strategy=strategy_name)  # 何をするか：起動の合図を心拍に1行記録
+            atexit.register(_mk_atexit(hb_path))  # 何をするか：プログラム終了時に stop を1行だけ書くよう登録
+
+            try:
+                _ = ex.list_active_child_orders(count=1)  # 何をするか：認証/権限・疎通の最小チェック（実発注なし）
+            except AuthError as e:
+                logger.error(f"live: auth failed → halt: {e}")  # 何をするか：理由をrun.logへ
+                _hb_write(hb_path, event="kill", ts=_now_utc().isoformat(), reason="auth")  # 何をするか：心拍に“auth停止”を記録
+                return  # 何をするか：安全に終了（実運転に入らない）
+
+            sys.excepthook = _mk_excepthook(ex, hb_path, live_orders, sys.excepthook)  # 何をするか：未捕捉例外→全取消&kill停止のフックを登録
+            if getattr(cfg, "cancel_all_on_start", True):  # 何をするか：起動時の安全装置（全取消）設定を確認
+                if dry_run:  # 何をするか：dry-run中は実際に取消しを実行しない（安全にスキップ）
+                    logger.info("live(dry-run): startup safety — skip cancel_all")  # 何をするか：スキップした事実をrun.logへ記録
+                else:
+                    ex.cancel_all_child_orders()  # 何をするか：本運転のみ、残っている全ての子注文を取消
+                    logger.info("live: startup safety — cancel_all issued")  # 何をするか：実行した事実をrun.logへ記録
+
 
             started_at = _now_utc()  # 何をするか：Canary の開始時刻
+            _JST = timezone(timedelta(hours=9))  # 何をするか：JSTのタイムゾーン
+            day_start_utc = _now_utc().astimezone(_JST).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)  # 何をするか：当日のJST=00:00（UTCに直した時刻）
 
             stop_event = Event()  # 何をするか：停止フラグ（signal 受信で立てる）
 
@@ -330,9 +506,52 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True) -> None:
             signal.signal(signal.SIGTERM, _on_signal)  # 何をするか：SIGTERM（停止要求）で停止
 
             _hb_write(hb_path, event="start", ts=_now_utc().isoformat(), product=product_code, strategy=strategy_name)  # 何をするか：起動を記録
+            ob = OrderBook()  # 何をするか：ローカル板（戦略の入力）を用意
+            strat = _select_strategy(strategy_name, cfg)  # 何をするか：選択した戦略を設定(cfg)付きで組み立てる
 
-            for ev in stream_events(product_code):  # 何をするか：WSのboard/executionsイベントを受け取る
+
+            for ev in _stream_with_reconnect(product_code, hb_path):  # 何をするか：WSが切れても自動再接続しながらイベントを処理
                 now = _now_utc()  # 何をするか：UTCの現在時刻
+                if dry_run and dry_limit_s and (now - started_at).total_seconds() >= float(dry_limit_s):  # 何をするか：dry-runの時間制限を超えたら終了
+                    logger.info("live(dry-run): time limit reached → halt")  # 何をするか：終了理由をrun.logに記録
+                    _hb_write(hb_path, event="kill", ts=now.isoformat(), reason="dryrun_done", runtime_sec=int((now - started_at).total_seconds()))  # 何をするか：心拍に終了理由と経過秒を記録
+                    return  # 何をするか：run_live を安全に終了
+
+                # 何をするか：現在の窓状態を判定（メンテ／Funding計算・授受のどれかでもTrue）
+                maint_now = _in_maintenance(now, cfg)
+                if maint_now:  # 何をするか：メンテ窓の間は新規発注を止める
+                    logger.debug("pause: maintenance window")
+                    _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="maintenance")
+                    continue  # 何をするか：この周回は新規パートへ進まない
+
+                if fund_now:  # 何をするか：Funding（計算/授受）窓の間も新規発注を止める
+                    logger.debug("pause: funding window")
+                    _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="funding")
+                    continue  # 何をするか：この周回は新規パートへ進まない
+
+                fund_now = (_in_funding_calc(now, cfg) or _in_funding_transfer(now, cfg))
+
+                # 何をするか：窓の“出入り”を検知してCSVに1行追記（enter/exit）
+                if (maint_prev is not None) and (maint_now != maint_prev):
+                    _csv_event_write(maint_csv, {"ts": now.isoformat(), "event": ("enter" if maint_now else "exit")})
+                if (fund_prev is not None) and (fund_now != fund_prev):
+                    _csv_event_write(fund_csv, {"ts": now.isoformat(), "event": ("enter" if fund_now else "exit")})
+
+                # 何をするか：次回の比較用に前回状態を更新
+                maint_prev, fund_prev = maint_now, fund_now
+
+                if stale_ms and (now - last_ev_at).total_seconds() * 1000.0 >= stale_ms:  # 何をするか：前回イベントからの空白が長すぎたら新規停止
+                    logger.debug(f"pause: stale_data gap={int((now - last_ev_at).total_seconds()*1000)}ms ≥ {stale_ms}ms")
+                    _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="stale_data")  # 何をするか：心拍に停止理由を記録
+                    last_ev_at = now  # 何をするか：連続通知を避けるため基準を更新
+                    continue  # 何をするか：この周回は新規発注パートへ進まない
+
+                if now >= day_start_utc + timedelta(days=1):  # 何をするか：JSTで新しい日になったか？
+                    day_start_utc = now.astimezone(_JST).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)  # 何をするか：新しい“今日”の起点をセット
+                    daily_R, R_HWM = 0.0, 0.0  # 何をするか：日次PnLとその日HWMをリセット
+                    logger.info("live: JST day rollover → reset daily PnL/HWM")  # 何をするか：run.logに書く
+                    _hb_write(hb_path, event="start", ts=now.isoformat(), reason="day_reset")  # 何をするか：心拍にも“日次リセット”を記録
+
                 if stop_event.is_set():  # 何をするか：停止フラグが立っていたら安全停止
                     if live_orders:
                         ex.cancel_all_child_orders()  # 何をするか：生きている注文をすべて取消
@@ -348,6 +567,53 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True) -> None:
                     break  # 何をするか：live を終了
 
                 ob.update_from_event(ev)  # 何をするか：ローカル板にイベントを反映
+                bid = _best_px(getattr(ob, "best_bid", None))  # 何をするか：オブジェクト/辞書/数値を価格(float)に正規化
+                ask = _best_px(getattr(ob, "best_ask", None))  # 何をするか：同上
+                if (bid is None) or (ask is None) or (ask <= bid):  # 何をするか：片側欠落 or 反転板を検知（float同士の比較）
+
+                    logger.debug("pause: bad_book (missing side or ask<=bid)")  # 何をするか：理由をrun.logに記録
+                    _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="bad_book")  # 何をするか：心拍に停止を記録
+                    continue  # 何をするか：この周回は新規発注パートへ進まない
+
+                # 何をするか：best_ask と best_bid のスプレッド(bp)がしきい値以上なら、その周回は新規発注を止める
+                if max_spread_bp is not None:
+                    bid = _best_px(getattr(ob, "best_bid", None))
+                    ask = _best_px(getattr(ob, "best_ask", None))
+
+                    if (bid is not None) and (ask is not None) and (ask > bid) and (bid > 0):
+                        spread_bp = ((ask - bid) / ((ask + bid) / 2.0)) * 10000.0
+                        if spread_bp >= float(max_spread_bp):
+                            logger.debug(f"pause: wide_spread {spread_bp:.1f}bp ≥ {float(max_spread_bp)}bp")  # 何をするか：理由をrun.logに記録
+                            _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="wide_spread", spread_bp=spread_bp)  # 何をするか：心拍にも停止を記録
+                            continue  # 何をするか：この周回は新規発注パートに進まない
+
+                last_ev_at = now  # 何をするか：イベントを受け取れたので鮮度の基準時刻を更新
+                mid = _mid_from_ob(ob)  # 何をするか：最新のミッド価格を得る
+                bp_30s = None  # 何をするか：30秒変化の大きさ（bp）を一時的に保持
+                if mid is not None:
+                    mid_hist.append((now, mid))  # 何をするか：ミッドの履歴を追加
+                    older_than = now - timedelta(seconds=35)  # 何をするか：古すぎる履歴（35秒超）は捨てる
+                    while mid_hist and mid_hist[0][0] < older_than:
+                        mid_hist.popleft()
+                    cutoff = now - timedelta(seconds=30)  # 何をするか：30秒前の基準点を探す
+                    ref = None
+                    for t, m in mid_hist:
+                        if t <= cutoff:
+                            ref = m
+                        else:
+                            break
+                    paused_mid = False
+                    if (max_bp is not None) and (ref is not None) and (ref > 0):
+                        bp_30s = abs((mid - ref) / ref) * 10000.0
+                        paused_mid = bp_30s >= float(max_bp)
+                else:
+                    paused_mid = False
+
+                if paused_mid:  # 何をするか：ミッド変化が大きい間は新規発注を止める
+                    logger.debug(f"pause: midmove_guard Δ30s={bp_30s:.1f}bp ≥ {float(max_bp)}bp")  # 何をするか：理由をrun.logに記録
+                    _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="midmove_guard")  # 何をするか：心拍にも停止を記録
+                    continue  # 何をするか：この周回は新規発注パートに進まない
+
                 if now >= hb_next:  # 何をするか：定期ステータスの時刻になったら
                     _hb_write(hb_path, event="status", ts=now.isoformat(),
                             Q=float(pnl_state.get("pos", 0.0)),  # 何をするか：建玉（BTC）
@@ -413,11 +679,16 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True) -> None:
 
                 # 何をするか：TTL 超過の注文を自動キャンセル
                 for acc_id, meta in list(live_orders.items()):
-                    if now >= meta["deadline"]:
-                        o = meta["order"]  # 何をするか：元注文情報（tif/ttl/px/sz）を取り出す
-                        ex.cancel_child_order(child_order_acceptance_id=acc_id)  # 何をするか：TTL超過分を取消
-                        del live_orders[acc_id]  # 何をするか：監視対象から外す
-                        order_log.add(ts=now.isoformat(), action="cancel", tif=getattr(o, "tif", "GTC"), ttl_ms=getattr(o, "ttl_ms", None), px=getattr(o, "price", None), sz=getattr(o, "size", None), reason="ttl")  # 何をするか：TTL取消を記録
+                    if (meta.get("deadline") is not None) and (now >= meta["deadline"]):  # 何をするか：締切のある注文だけTTL取消の対象にする
+                        o = meta["order"]  # 何をするか：元注文情報（tif/ttl/px/sz）を参照
+                        try:
+                            ex.cancel_child_order(child_order_acceptance_id=acc_id)  # 何をするか：TTL超過の注文を取消
+                        except (RateLimitError, ServerError, NetworkError, ExchangeError) as e:
+                            logger.warning(f"ttl cancel failed for {acc_id}: {e}")  # 何をするか：失敗は記録して今回は見送り（次周回で再試行）
+                            continue
+                        del live_orders[acc_id]  # 何をするか：成功したら監視リストから外す
+                        order_log.add(ts=now.isoformat(), action="cancel", tif=getattr(o, "tif", "GTC"), ttl_ms=getattr(o, "ttl_ms", None), px=getattr(o, "price", None), sz=getattr(o, "size", None), reason="ttl")  # 何をするか：ordersログにTTL取消を記録
+                        _hb_write(hb_path, event="cancel", ts=now.isoformat(), acc=acc_id, reason="ttl", px=getattr(o, "price", None), sz=getattr(o, "size", None))  # 何をするか：ハートビートにもTTL取消を1行記録
 
                 fills = _pull_fill_deltas(ex, live_orders)  # 何をするか：今回ぶんの増分約定を取り出す
                 for side, px, sz, tag, done in fills:  # 何をするか：done=True なら完了（fill）、False なら部分約定（partial）
@@ -427,14 +698,32 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True) -> None:
 
                     trade_log.add(ts=now.isoformat(), side=side, px=px, sz=sz, fee=fee, pnl=realized, strategy=strategy_name, tag=tag, inventory_after=pnl_state["pos"], window_funding=fund_now, window_maint=maint_now)  # 何をするか：手数料込みで trades を記録
                     order_log.add(ts=now.isoformat(), action=("fill" if done else "partial"), tif=None, ttl_ms=None, px=px, sz=sz, reason=tag)  # 何をするか：ordersログにも fill/partial を記録する
+                    daily_R += realized  # 何をするか：当日実現PnL(JPY)を更新（手数料込みの realized を積算）
+                    R_HWM = max(R_HWM, daily_R)  # 何をするか：当日の最高益(HWM)を更新
+                    if (not dry_run) and _check_kill(daily_R, R_HWM, kill_cfg):  # 何をするか：dry-run時はKillを発火させない（疎通運転で止まらない）
+                        logger.warning(f"kill-switch: daily_pnl={daily_R:.0f} JPY, dd={R_HWM - daily_R:.0f} JPY → halt")  # 何をするか：停止理由をrun.logへ
+                        if live_orders:
+                            ex.cancel_all_child_orders()  # 何をするか：生きている注文を全て取消
+                            live_orders.clear()
+                        _hb_write(hb_path, event="kill", ts=now.isoformat(), daily_pnl_jpy=daily_R, dd_jpy=R_HWM - daily_R)  # 何をするか：心拍にKillを記録
+                        return  # 何をするか：run_live を終了（安全停止）
+
+                # 何をするか：全部さばけた（=注文サイズぶん約定済み）の注文は監視から外す（TTLや二重取消を防ぐ）
+                for _acc_id, _meta in list(live_orders.items()):
+                    _o = _meta.get("order")
+                    if _o is None: 
+                        continue  # 何をするか：保険（order情報が無い場合は何もしない）
+                    if float(_meta.get("executed", 0.0)) >= float(getattr(_o, "size", 0.0)) - 1e-12:
+                        del live_orders[_acc_id]  # 何をするか：完了注文を片付ける
+
                     _hb_write(hb_path, event="fill", ts=now.isoformat(), side=side, px=px, sz=sz, pnl=realized, tag=tag)  # 何をするか：約定とPnLを記録
 
                     if realized != 0.0:
                         daily_R += realized
                         R_HWM = max(R_HWM, daily_R)
-                if _check_kill(daily_R, R_HWM, kill_cfg):  # 何をするか：Kill到達なら停止
-                    logger.warning(f"kill-switch: daily_pnl={daily_R:.0f} JPY, dd={R_HWM - daily_R:.0f} JPY → halt")
-                    _hb_write(hb_path, event="kill", ts=now.isoformat(), daily_pnl_jpy=daily_R, dd_jpy=R_HWM - daily_R)  # 何をするか：Kill発火を記録
+                    if (not dry_run) and _check_kill(daily_R, R_HWM, kill_cfg):  # 何をするか：dry-run時はKillを発火させない（疎通運転で止まらない）
+                        logger.warning(f"kill-switch: daily_pnl={daily_R:.0f} JPY, dd={R_HWM - daily_R:.0f} JPY → halt")
+                        _hb_write(hb_path, event="kill", ts=now.isoformat(), daily_pnl_jpy=daily_R, dd_jpy=R_HWM - daily_R)  # 何をするか：Kill発火を記録
 
                     if live_orders:
                         ex.cancel_all_child_orders()
@@ -445,15 +734,46 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True) -> None:
 
                 # 何をするか：戦略を評価して、必要なら注文（Order）を発行
                 try:
-                    actions = strat.evaluate(ob)
-                    decision_log.add(ts=now.isoformat(), strategy=strategy_name, features_json={}, decision=("place" if actions else "hold"), expected_edge_bp=None, eta_ms=None, ca_ratio=None, best_age_ms=None, spread_state=None)  # 何をするか：この時点の判断を固定スキーマで記録（不足の特徴量は None で埋める）
+                    inv_paused = (inv_limit is not None) and (abs(float(pnl_state.get("pos", 0.0))) >= float(inv_limit))  # 何をするか：在庫上限に達しているかを判定
+                    if inv_paused:  # 何をするか：在庫が上限以上なら今回は新規を出さない
+                        logger.debug(f"pause: inventory guard |Q|={abs(pnl_state.get('pos', 0.0)):.3f} >= {float(inv_limit)}")  # 何をするか：理由をrun.logに記録
+                        _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="inventory_guard")  # 何をするか：ハートビートに停止を記録
+                        continue  # 何をするか：このループでは新規発注パートへ進まない
+
+                    if _in_maintenance(now, cfg):  # 何をするか：メンテ窓中は新規発注を止める
+                        logger.debug("pause: maintenance window")  # 何をするか：理由をrun.logに記録
+                        _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="maintenance")  # 何をするか：心拍に停止を記録
+                        continue  # 何をするか：この周回は新規発注パートへ進まない
+
+                    if _in_funding_calc(now, cfg) or _in_funding_transfer(now, cfg):  # 何をするか：Funding計算/授受の窓中は新規発注を止める
+                        logger.debug("pause: funding window")  # 何をするか：理由をrun.logに記録
+                        _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="funding")  # 何をするか：心拍に停止を記録
+                        continue  # 何をするか：この周回は新規発注パートへ進まない
+                                        
+                    if (max_active is not None) and (len(live_orders) >= int(max_active)):  # 何をするか：アクティブ注文が上限以上なら新規を止める
+                        logger.debug(f"pause: active_guard A={len(live_orders)} ≥ {int(max_active)}")  # 何をするか：理由をrun.logに記録
+                        _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="active_guard", A=len(live_orders))  # 何をするか：心拍にも停止を記録
+                        continue  # 何をするか：この周回は新規発注パートに進まない
+
+                    try:
+                        t0 = time.perf_counter()  # 何をするか：戦略評価の開始時刻（ms測定）
+                        actions = strat.evaluate(ob, now, cfg)  # 何をするか：戦略の実シグネチャ(ob, now, cfg)に合わせて呼び出す
+                    except Exception as e:
+                        logger.exception(f"strategy error: {e}")  # 何をするか：原因をrun.logに記録（スタック付き）
+                        _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="strategy_error")  # 何をするか：心拍に“戦略エラー”を記録
+                        decision_log.add(ts=now.isoformat(), strategy=strategy_name, decision="error", eta_ms=int((time.perf_counter() - t0) * 1000))  # 何をするか：decisionログに“error”を最小項目で記録
+                        continue  # 何をするか：今回は新規発注パートへ進まない（安全に次の周回へ）
+
+                    decision_log.add(ts=now.isoformat(), strategy=strategy_name, decision=("place" if actions else "hold"), eta_ms=int((time.perf_counter() - t0) * 1000))  # 何をするか：評価にかかった時間(ms)を記録
                 except Exception as e:
                     logger.error(f"strategy evaluate failed: {e}")
                     continue
 
+
                 for o in actions or []:
                     elapsed_ms = (now - _last_tx_at).total_seconds() * 1000.0  # 何をするか：前回送信からの経過ms
                     if elapsed_ms < min_tx_ms:  # 何をするか：まだ最小間隔に達していなければ送らない
+                        _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="throttle", elapsed_ms=int(elapsed_ms), min_ms=min_tx_ms)  # 何をするか：スロットリングで見送ったことを心拍に記録
                         logger.debug(f"throttle tx: {elapsed_ms:.0f}ms < {min_tx_ms}ms")  # 何をするか：スロットリングしたことを記録
                         continue
 
@@ -464,20 +784,38 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True) -> None:
                     if sz < min_sz: sz = min_sz  # 何をするか：丸めた結果が下限未満なら下限に引き上げる
 
                     px = _round_to_tick(o.price, tick)  # 何をするか：戦略の価格をtickに丸めてから使う
+                    tag = getattr(o, "tag", "")  # 何をするか：発注理由（タグ）
+                    dedup_key = f"{o.side}|{px}|{tag}"  # 何をするか：連打判定のキー（side×price×tag）
+                    if dedup_key in last_place and (now - last_place[dedup_key]).total_seconds() * 1000.0 < place_dedup_ms:
+                        _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="dedup", key=dedup_key, within_ms=place_dedup_ms)  # 何をするか：短時間の同一発注を見送ったことを心拍に記録
+                        logger.debug(f"dedup skip: {dedup_key} within {place_dedup_ms}ms")  # 何をするか：短時間の同一発注は見送る
+                        continue
+
 
                     try:
+                        if dry_run:  # 何をするか：dry-run時は実発注せずスキップ（ログはrun.logにだけ残す）
+                            logger.info(f"live[dry_run]: skip place side={o.side} px={px} sz={sz} tag={getattr(o, 'tag', '')}")
+                            continue
+
                         acc = ex.send_child_order(
                             side=o.side, size=sz, price=px, time_in_force=getattr(o, "tif", "GTC")
                         )  # 何をするか：RESTで新規注文を送る
+                        px, sz = _normalize_px_sz(cfg, px, sz)  # 何をするか：価格/サイズを取引所の刻みに合わせる（最低サイズ未満はNone）
+                        if (px is None) or (sz is None):
+                            logger.debug("pause: size_too_small after normalize")  # 何をするか：小さすぎるので今回は出さない
+                            _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="size_too_small")  # 何をするか：心拍にスキップ理由を記録
+                            continue  # 何をするか：この周回は発注を行わない
+
+                        last_place[dedup_key] = now  # 何をするか：この(side×price×tag)は今出した、と記録
                         _last_tx_at = now  # 何をするか：送信できたので直近送信時刻を更新
 
                         deadline = _ttl_deadline(now, getattr(o, "ttl_ms", getattr(getattr(cfg, "features", None), "ttl_ms", None)))  # 何をするか：TTL未指定なら config の features.ttl_ms を使う
                         if deadline:
-                            live_orders[acc] = {"deadline": deadline, "order": o, "executed": 0.0, "avg_price": 0.0}  # 何をするか：増分約定の単価推定に使う平均価格も保持
-                            order_log.add(ts=now.isoformat(), action="place", tif=getattr(o, "tif", "GTC"), ttl_ms=getattr(o, "ttl_ms", None), px=px, sz=sz, reason=getattr(o, "tag", ""))  # 何をするか：記録も丸め後の価格で統一
-                            _hb_write(hb_path, event="place", ts=now.isoformat(), reason=getattr(o, "tag", ""), tif=getattr(o, "tif", "GTC"), ttl_ms=getattr(o, "ttl_ms", None), px=px, sz=sz)  # 何をするか：心拍にも丸め後の価格を出す
+                            live_orders[acc] = {"deadline": deadline, "order": o, "executed": 0.0, "avg_price": 0.0}  # 何をするか：TTLがNoneでも監視登録する
+                            order_log.add(ts=now.isoformat(), action="place", tif=getattr(o, "tif", "GTC"), ttl_ms=getattr(o, "ttl_ms", None), px=px, sz=sz, reason=getattr(o, "tag", ""))  # 何をするか：placeを必ず記録
+                            _hb_write(hb_path, event="place", ts=now.isoformat(), acc=acc, reason=getattr(o, "tag", ""), tif=getattr(o, "tif", "GTC"), ttl_ms=getattr(o, "ttl_ms", None), px=px, sz=sz)  # 何をするか：心拍にも必ず記録
 
-                    except (RateLimitError, ServerError, ExchangeError) as e:
+                    except (RateLimitError, ServerError, NetworkError, ExchangeError) as e:
                         logger.warning(f"send order rejected: {e}")
                         continue
 

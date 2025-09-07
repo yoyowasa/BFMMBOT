@@ -241,6 +241,16 @@ class BitflyerExchange:
         data = self._request("GET", "/v1/me/getpositions", params=params, idempotent=True, max_retries=3)
         return data
 
+    def get_child_order_by_acceptance_id(self, acceptance_id: str) -> List[Dict[str, Any]]:
+        """何をするか：受理IDで子注文の詳細（状態/約定量/残量/平均価格など）を照会して返す"""
+        params: Dict[str, Any] = {
+            "product_code": self.product_code,
+            "child_order_acceptance_id": acceptance_id,
+            "count": 1,  # 何をするか：対象は一意のため1件だけ取得
+        }
+        data = self._request("GET", "/v1/me/getchildorders", params=params, idempotent=True, max_retries=3)
+        return data  # 何をするか：APIの素の配列（0件 or 1件）をそのまま返す
+
     def list_active_child_orders(self, *, count: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         未約定（ACTIVE）の子注文一覧を取得する関数。
@@ -251,12 +261,3 @@ class BitflyerExchange:
             params["count"] = count
         data = self._request("GET", "/v1/me/getchildorders", params=params, idempotent=True, max_retries=3)
         return data  # APIはJSON配列を返す
-
-    def get_child_order_by_acceptance_id(self, acceptance_id: str) -> List[Dict[str, Any]]:
-        """
-        child_order_acceptance_id で注文を検索する関数。
-        - 発注結果が不明な時の事後照会などに利用
-        """
-        params = {"product_code": self.product_code, "child_order_acceptance_id": acceptance_id}
-        data = self._request("GET", "/v1/me/getchildorders", params=params, idempotent=True, max_retries=3)
-        return data

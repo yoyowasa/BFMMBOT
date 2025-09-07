@@ -6,6 +6,11 @@ from __future__ import annotations
 import os  # 何をするか：APIキーを .env から読む
 import argparse  # 何をするか：CLI引数を扱う
 from loguru import logger  # 何をするか：人間が読めるログを出す
+try:
+    from dotenv import load_dotenv, find_dotenv  # 何をするか：.env を読み込むためのヘルパー
+except Exception:
+    load_dotenv = lambda *a, **k: None  # 何をするか：dotenv未導入でも壊れないようにダミー関数を用意
+    find_dotenv = lambda *a, **k: ""    # 何をするか：見つからないときは空文字を返すダミー
 
 # 何をするか：REST送信口（exchange adapter）を使って、未約定一覧/建玉照会で疎通確認
 from src.core.exchange import BitflyerExchange, ExchangeError, AuthError, RateLimitError, ServerError, NetworkError
@@ -35,6 +40,8 @@ def check_exchange(product_code: str) -> None:
 
 def main() -> None:
     """何をするか：CLI入口。--product-code が無ければ FX_BTC_JPY（ワークフロー既定）で確認"""
+    load_dotenv(find_dotenv())  # 何をするか：作業ディレクトリの .env を読み込んでから環境変数を参照する
+
     p = argparse.ArgumentParser(description="bitFlyer live ヘルスチェック（実発注なし）")
     p.add_argument("--product-code", default="FX_BTC_JPY", help="何をするか：確認する銘柄（既定=FX_BTC_JPY）")
     args = p.parse_args()

@@ -6,6 +6,13 @@ from __future__ import annotations
 import argparse  # 引数処理
 import asyncio  # 非同期ランタイム
 from loguru import logger  # 実行ログ
+try:
+    from dotenv import load_dotenv, find_dotenv  # 何をするか：.env を読み込む（healthと同じ方式）
+except Exception:
+    load_dotenv = lambda *_, **__: None  # 何をするか：dotenv未導入でも壊れないダミー（渡された引数は捨てる）
+    find_dotenv = lambda *_, **__: ""    # 何をするか：dotenv未導入でも壊れないダミー（空文字を返す）
+
+
 from pathlib import Path  # run.log の保存先を扱う
 
 from src.core.utils import load_config  # 【関数】設定ローダー（base＋上書き）:contentReference[oaicite:12]{index=12}
@@ -25,6 +32,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     """【関数】エントリ：設定を読み、paperエンジンを走らせる"""
+    load_dotenv(find_dotenv())  # 何をするか：プロジェクト直下の .env を読み込んでから run_live を呼ぶ
     args = _parse_args()
     cfg = load_config(args.config)
     # 何をするか：設定の env を見て live/paper を切り替える（ワークフローの 8.3→8.4 切替）

@@ -10,9 +10,15 @@ from __future__ import annotations
 import asyncio  # 再接続の待ち・キャンセル制御
 import json  # JSON-RPCの組み立て（送信のみは標準でOK）
 from datetime import datetime, timezone  # 受信刻印(ts)の付与
+import time  # 何をするか：dry-run用ダミーストリームで sleep に使う
+
 from typing import AsyncIterator, Dict, Any, Iterable  # 型ヒント
 import websockets  # WebSocket接続（poetryで導入済み）
 from loguru import logger  # 見やすいログ
+from queue import Queue  # 何をするか：非同期→同期ブリッジのキュー
+import threading         # 何をするか：asyncストリームをバックグラウンドで回すために使う
+
+
 
 _WS_URL = "wss://ws.lightstream.bitflyer.com/json-rpc"  # Lightning WS（文書の購読先）:contentReference[oaicite:5]{index=5}
 
@@ -100,3 +106,36 @@ async def event_stream(
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2.0, max_backoff)
             continue
+
+def stream_events(product_code: str = "FX_BTC_JPY", channels: Iterable[str] | None = None):
+    """何をする関数か：asyncな event_stream(...) をバックグラウンドで動かし、同期forで使えるようにするブリッジ"""
+    q: Queue = Queue(maxsize=1024)  # 何をするか：イベント受け渡し用のキュー
+    _STOP = object()                # 何をするか：終了の合図
+
+    async def _runner():
+        """何をするか：asyncのevent_streamから受けたイベントを順次キューへ入れる"""
+        try:
+            async for ev in event_stream(product_code=product_code, channels=channels):
+                q.put(ev)  # 何をするか：受け取ったイベントを同期側へ渡す
+        except Exception as e:
+            logger.exception(f"realtime: runner error → stop: {e}")
+        finally:
+            q.put(_STOP)  # 何をするか：終了の合図を送る
+
+    def _run_loop():
+        """何をするか：専用イベントループで_runnerを回す"""
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(_runner())
+        finally:
+            loop.close()
+
+    th = threading.Thread(target=_run_loop, daemon=True)  # 何をするか：バックグラウンドでasyncを回す
+    th.start()
+
+    while True:
+        item = q.get()  # 何をするか：キューから順に取り出して同期forの呼び出し側へ渡す
+        if item is _STOP:
+            break
+        yield item

@@ -1,7 +1,31 @@
 # configs/live.yml：本番環境で base.yml を必要最小限だけ“上書き”
 env: live                  # 【関数】liveモード指定
+product_code: FX_BTC_JPY  # 何をするか：取引銘柄を指定（例：FX_BTC_JPY）。WS購読とRESTの対象になる
+
+dry_run_max_sec: 120  # 例：2分で自動終了
+
+mode_switch:
+  maintenance:
+    start: ""  # 何をするか：メンテ開始(JST)。例 "03:55:00"
+    end: ""    # 何をするか：メンテ終了(JST)。例 "04:15:00"
+  funding_calc_jst: []  # 何をするか：Funding計算タイミング(JST)の配列。例 ["08:00:00","16:00:00","00:00:00"]
+  funding_transfer_lag_hours: 8  # 何をするか：計算から授受までのラグ時間(時間)。この1時間を“授受窓”として停止
+
+risk:
+  max_inventory: 0.20      # 何をするか：建玉の絶対値上限（BTC）。超えたら新規停止
+  max_active_orders: 8  # 何をするか：同時に生きてよい注文の上限。Aがこの個数以上なら新規を止める
+
+  kill:
+    daily_pnl_jpy: -30000  # 何をするか：当日実現PnLがこの額以下なら Kill（全取消→停止）
+    max_dd_jpy: -20000     # 何をするか：当日HWMからの落差（DD）がこの額以上なら Kill
+guard:
+  max_mid_move_bp_30s: 25  # 何をするか：30秒のミッド変化が25bp(0.25%)以上なら“いまは我慢”して新規発注を止める
+  max_stale_ms: 3000  # 何をするか：前回イベントからこのms以上あいたら“いまは我慢”（新規発注を止める）
+  max_spread_bp: 10  # 何をするか：スプレッドが10bp(=0.10%)以上なら“いまは我慢”して新規発注を止める
+
 tx:
   min_interval_ms: 100  # 何をするか：新規注文の最小送信間隔（ms）。429回避のため送信をスロットリング
+  place_dedup_ms: 300  # 何をするか：同じ(side×price×tag)をこのms以内に連打しそうならスキップ（重複発注を抑止）
 
 size:
   min: 0.001    # 何をするか：最小ロット（これ未満は切り上げる）
@@ -18,4 +42,5 @@ fees:
 risk:
   max_inventory: 0.2       # 【関数】本番の在庫上限（base既定を明示）
 logging: { level: INFO, heartbeat_status_sec: 5 }  # 何をするか：心拍（status＝Q/A/R）を5秒間隔でNDJSONに追記する
+logging: { level: INFO, heartbeat_status_sec: 5, rotate_mb: 128 }  # 何をするか：run.log をこのサイズ(MB)でローテーション
 
