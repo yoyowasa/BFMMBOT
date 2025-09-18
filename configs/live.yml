@@ -1,8 +1,9 @@
 # configs/live.yml：本番環境で base.yml を必要最小限だけ“上書き”
 env: live                  # 【関数】liveモード指定
 product_code: FX_BTC_JPY  # 何をするか：取引銘柄を指定（例：FX_BTC_JPY）。WS購読とRESTの対象になる
+canary_minutes: 30  # 何をするか：実運転のカナリア（最長分）。超えたら kill(canary) で安全停止（未設定/0なら無効）
 
-dry_run_max_sec: 120  # 例：2分で自動終了
+dry_run_max_sec: 14400  # 例：2分で自動終了
 
 mode_switch:
   maintenance:
@@ -29,7 +30,7 @@ tx:
 
 size:
   min: 0.001    # 何をするか：最小ロット（これ未満は切り上げる）
-  default: 0.01 # 何をするか：戦略がサイズ未指定のときに使う既定値
+  default: 0.001 # 何をするか：戦略がサイズ未指定のときに使う既定値
   step: 0.001   # 何をするか：サイズ刻み（端数をこの刻みに丸める）
 
 cancel_all_on_start: true  # 何をするか：起動時に取り残しの注文を全キャンセルしてから運転を開始（安全起動）
@@ -37,7 +38,7 @@ tick_size: 1  # 何をするか：価格の最小刻み（例：JPYは1）。liv
 
 canary_minutes: 60  # 何をするか：liveを最大60分だけ運転し、超えたら全取消→停止（安全確認のカナリア）
 fees:
-  bps: 0.0  # 何をするか：手数料のベーシスポイント。PnLはこのコストを差し引いた“実コスト後”で記録されます
+  bps: 3.0  # 何をするか：手数料のベーシスポイント。PnLはこのコストを差し引いた“実コスト後”で記録されます
 
 risk:
   max_inventory: 0.2       # 【関数】本番の在庫上限（base既定を明示）

@@ -21,6 +21,7 @@ pyarrow = "^16.1.0"    # Arrow/Parquet I/O（ログ/テープ）
 loguru = "^0.7.2"      # ログ
 rich = "^13.7.1"       # CLI出力の見やすさ
 python-dotenv = "^1.1.1"
+pydantic-settings = ">=2,<3"  # 何をするか：設定読み込みで BaseSettings を使う場合に備える（将来の不足防止）
 
 [tool.poetry.group.dev.dependencies]  # 開発用ツール群
 pytest = "^8.2.0"        # テスト

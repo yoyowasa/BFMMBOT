@@ -18,6 +18,11 @@ from pathlib import Path  # run.log の保存先を扱う
 from src.core.utils import load_config  # 【関数】設定ローダー（base＋上書き）:contentReference[oaicite:12]{index=12}
 from src.runtime.engine import PaperEngine  # 【関数】paperエンジン（本ステップ）
 from src.runtime.live import run_live  # 何をするか：本番（live）の最小導線（疎通確認）を呼び出す
+try:
+    from src.runtime.engine import run_paper  # 何をするか：標準のペーパー入口（無い環境もあるのでtryで受ける）
+except Exception:
+    run_paper = None  # 何をするか：無いときは後段で動的に探すためのダミーにする
+
 
 def _parse_args() -> argparse.Namespace:
     """【関数】引数を読む：--config（必須）/ --strategy（#1 既定 か #2）"""
@@ -27,6 +32,7 @@ def _parse_args() -> argparse.Namespace:
                 choices=["stall_then_strike", "cancel_add_gate", "age_microprice"],
                 help="どの戦略で動かすか（#1/#2/#3）")
     p.add_argument("--dry-run", action="store_true", help="何をするか：liveでも実発注せず疎通確認だけ行う（安全テスト）")
+    p.add_argument("--paper", action="store_true", help="何をするか：取引所へ発注せず、板に当たれば fills をシミュレートする")
 
     return p.parse_args()
 
@@ -37,7 +43,36 @@ def main() -> None:
     cfg = load_config(args.config)
     # 何をするか：設定の env を見て live/paper を切り替える（ワークフローの 8.3→8.4 切替）
     if getattr(cfg, "env", "paper") == "live":
-        run_live(cfg, args.strategy, dry_run=args.dry_run)  # 何をするか：CLIの --dry-run 指定で実発注を抑止（可観測性はそのまま）
+        if args.paper:  # 何をするか：--paper 指定なら疑似発注（fillsまで再現）
+            rp = run_paper  # 何をするか：まずは通常のrun_paperを候補にする
+            if rp is None:
+                import importlib  # 何をするか：モジュールを動的に読み込んで関数を探す
+                try:
+                    mod = importlib.import_module("src.runtime.engine")  # 何をするか：engine内の別名候補を探す
+                    for name in ("run_paper", "paper_main", "run_paper_engine", "paper_run"):
+                        fn = getattr(mod, name, None)
+                        if callable(fn):
+                            rp = fn
+                            break
+                except Exception:
+                    rp = None
+                if rp is None:
+                    try:
+                        mod2 = importlib.import_module("src.runtime.paper")  # 何をするか：paper専用モジュールがあれば使う
+                        for name in ("run_paper", "main", "run"):
+                            fn = getattr(mod2, name, None)
+                            if callable(fn):
+                                rp = fn
+                                break
+                    except Exception:
+                        rp = None
+            if rp is None:
+                raise RuntimeError("paper runner が見つかりません（engine.run_paper / engine.paper_main / runtime.paper.main などを確認）")  # 何をするか：どこにも無ければ分かりやすく停止
+            rp(cfg, args.strategy)  # 何をするか：見つけた入口でペーパー運転を開始
+        else:
+            run_live(cfg, args.strategy, dry_run=args.dry_run)  # 何をするか：従来どおりlive/dry-run
+
+
         return  # 何をするか：live 分岐ではここで終了（paper へは進まない）
 
     log_path = Path("logs/runtime/run.log")  # 【関数】ログファイルの出力先
