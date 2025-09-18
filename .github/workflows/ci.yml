@@ -1,28 +1,43 @@
-name: CI
+name: CI  # 何をするか：Poetry＋pytestでロック再現性のあるCIを回す
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main" ]  # 何をするか：mainへのpushで実行
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main" ]  # 何をするか：main向けPRで実行
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest  # 何をするか：Ubuntuランナーで実行
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4  # 何をするか：ソースを取得
 
-      - name: Set up Python
+      - name: Set up Python  # 何をするか：CIで使うPythonをセットアップ
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Poetry
-        run: pip install poetry
+      - name: Install Poetry  # 何をするか：Poetryを固定版で導入し、.venvをリポ内に作る
+        uses: snok/install-poetry@v1
+        with:
+          version: 1.8.3
+          virtualenvs-create: true
+          virtualenvs-in-project: true
 
-      - name: Install dependencies
-        run: poetry install
+      - name: Sync lockfile (no update)  # 何をするか：pyproject変更時でもCI内でlockを同期（依存の更新はしない）
+        run: poetry lock --no-update --no-interaction
 
-      - name: Run tests
+      - name: Cache virtualenv (.venv)  # 何をするか：Poetryの仮想環境をキャッシュして高速化
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: v1-poetry-venv-${{ runner.os }}-${{ hashFiles('poetry.lock') }}  # 何をするか：同期済みlockのハッシュでキー化
+          restore-keys: |
+            v1-poetry-venv-${{ runner.os }}-
+
+      - name: Install dependencies  # 何をするか：poetry.lockと完全一致の環境を再現
+        run: poetry install --no-interaction --no-ansi --sync
+
+      - name: Run tests  # 何をするか：pytestを静かに実行
         run: poetry run pytest -q
