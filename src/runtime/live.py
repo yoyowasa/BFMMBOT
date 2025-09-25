@@ -323,6 +323,11 @@ def _log_window_event(events_dir: Path, kind: str, action: str, ts: datetime) ->
     line = f"{ts.isoformat()},{action}\n"  # 何をするか：列は ts,action の2列（シンプルに固定）
     (events_dir / fname).open("a", encoding="utf-8").write(line)
 
+
+def _act(o, key, default=None):
+    """何をする関数か：oがdictでも属性でも同じ書き方で値を取り出す"""
+    return (o.get(key, default) if isinstance(o, dict) else getattr(o, key, default))
+
 def _pull_fill_deltas(ex: BitflyerExchange, live_orders: dict[str, dict]) -> list[tuple[str, float, float, str, bool]]:  # 何をするか：“増分約定”に finalかどうかの旗(done)を追加で返す
     """何をするか：受理IDごとに“今回ぶんの増分約定”だけを取り出して (side, price, size, tag) のリストで返す"""
     fills: list[tuple[str, float, float, str]] = []
@@ -348,7 +353,8 @@ def _pull_fill_deltas(ex: BitflyerExchange, live_orders: dict[str, dict]) -> lis
                 px = (avg_new * executed - prev_avg * prev_exec) / delta
             except ZeroDivisionError:
                 px = avg_new or meta["order"].price
-            fills.append((meta["order"].side, float(px), float(delta), getattr(meta["order"], "tag", ""), state == "COMPLETED" or (outstanding <= 1e-12 and executed > 0.0)))  # 何をするか：(side, px, sz, tag, done) を積む
+            fills.append((_act(meta["order"], "side"), float(px), float(delta), _act(meta["order"], "tag", ""), state == "COMPLETED" or (outstanding <= 1e-12 and executed > 0.0)))  # 何をするか：dict/属性両対応でside/tagを取得する
+
 
         # 何をするか：ローカル状態を更新（次回差分計算のため）
         meta["executed"] = executed

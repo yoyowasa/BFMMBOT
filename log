@@ -55,3 +55,11 @@ poetry run python -c "import polars as pl; print(pl.read_parquet('logs/analytics
 どの注文が出た／埋まった？ → orders/trades の NDJSON を -Wait。
 
 なぜその判断？ → analytics の NDJSON（features_json と decision）。
+
+poetry run python -m src.cli.trade --config configs/live.yml --strategy cancel_add_gate
+
+ # 何をするか：ドライランで本番ランナーを観察起動（注文は送信しない）
+poetry run python -m src.cli.trade --config configs/live.yml --strategy cancel_add_gate --dry-run
+
+# 何をするか：疑似発注エンジンを起動し、約定/取消/手数料/PnL をシミュレーションしてログ出力する
+poetry run python -m src.cli.trade --config configs/live.yml --strategy cancel_add_gate --paper

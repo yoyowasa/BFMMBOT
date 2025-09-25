@@ -134,14 +134,11 @@ def _round_to_tick(px: float, tick: float) -> float:
     return float(round(float(px) / float(tick)) * float(tick))
 
 def _select_strategy(strategy_name: str, cfg):
-    """何をする関数か：戦略名からインスタンスを作る（最小セット。必要に応じて増やす）"""
-    name = (strategy_name or "").strip().lower()
-    if name == "stall_then_strike":
-        try:
-            return StallThenStrike(cfg)  # 何をするか：コンストラクタがcfgを受ける場合
-        except Exception:
-            return StallThenStrike()     # 何をするか：受けない実装にも対応
-    raise RuntimeError(f"paper: unsupported strategy_name='{strategy_name}'")
+    """何をする関数か：live側の選択ロジックを再利用して戦略インスタンスを生成する"""
+    # 何をするか：関数内だけで使う遅延importで依存ループを避ける
+    from src.runtime.live import _select_strategy as _select_strategy_live
+    return _select_strategy_live(strategy_name, cfg)
+
 
 # ---- メイン：疑似発注ランナー ----
 
