@@ -9,6 +9,8 @@ from loguru import logger  # 何をするか：進行ログを出す
 import json  # 何をするか：heartbeatをndjsonで書くためにJSONへ直す
 from zoneinfo import ZoneInfo  # 何をするか：JST（Asia/Tokyo）へのタイムゾーン変換に使う
 
+from src.core.exchange import RateLimitError  # 何をするか：取引所のレート制限例外を型で捕捉する
+
 from datetime import datetime  # 何をするか：heartbeatのts(ISO)を日時に直してレート制限に使う
 
 import math  # 何をするか：サイズの刻み丸め（floor）で使う
@@ -35,7 +37,7 @@ from src.strategy.age_microprice import AgeMicroprice  # 何をするか：#3 �
 from src.core.logs import OrderLog, TradeLog  # 何をするか：orders/trades を Parquet＋NDJSON に記録する
 from src.core.analytics import DecisionLog  # 何をするか：戦略の意思決定ログ（Parquet＋NDJSONミラー）を扱う
 
-from src.core.exchange import BitflyerExchange, ExchangeError, RateLimitError, ServerError, NetworkError, AuthError  # 何をするか：認証/権限エラー(AuthError)を検知して安全停止する
+from src.core.exchange import BitflyerExchange, ExchangeError, ServerError, NetworkError, AuthError  # 何をするか：認証/権限エラー(AuthError)を検知して安全停止する
 
 
 def _select_strategy(name: str, cfg):
@@ -518,6 +520,7 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True) -> None:
             _last_tx_at = _now_utc() - timedelta(milliseconds=min_tx_ms)  # 何をするか：直近の送信時刻（初期は「今−間隔」で即送れる状態）
             fee_bps = float(getattr(getattr(cfg, "fees", None), "bps", 0.0))  # 何をするか：手数料のbps設定（未指定は0.0）
             canary_min = int(getattr(cfg, "canary_minutes", 60))  # 何をするか：最長運転時間（分）。未指定は60分
+            throttle_until: datetime | None = None  # 何をするか：レート制限に当たった時のクールダウン期限
 
             logger.info(f"live: starting loop product={product_code} strategy={strategy_name}")  # 何をするか：起動ログ
             _hb_write(hb_path, event="start", ts=_now_utc().isoformat(), reason="launch", product=product_code, strategy=strategy_name)  # 何をするか：起動の合図を心拍に1行記録
@@ -559,6 +562,10 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True) -> None:
 
             for ev in _stream_with_reconnect(product_code, hb_path):  # 何をするか：WSが切れても自動再接続しながらイベントを処理
                 now = _now_utc()  # 何をするか：UTCの現在時刻
+                if throttle_until and now >= throttle_until:
+                    throttle_until = None  # 何をするか：クールダウンが明けたら解除
+
+                throttled = throttle_until is not None and now < throttle_until  # 何をするか：現在クールダウン中か判定
                 if (not dry_run) and canary_m and (now - started_at).total_seconds() >= float(canary_m) * 60.0:  # 何をするか：実運転のみ時間超過で停止
                     logger.info("live: canary time limit reached → halt")  # 何をするか：停止理由をrun.logへ
                     _hb_write(hb_path, event="kill", ts=now.isoformat(), reason="canary", runtime_sec=int((now - started_at).total_seconds()))  # 何をするか：心拍に“canary停止”を記録
@@ -748,20 +755,31 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True) -> None:
                         logger.debug(f"pause inventory_guard: |Q|={abs(Q)} ≥ {inv_limit}")
                         continue
 
-                # 何をするか：TTL 超過の注文を自動キャンセル
-                for acc_id, meta in list(live_orders.items()):
-                    if (meta.get("deadline") is not None) and (now >= meta["deadline"]):  # 何をするか：締切のある注文だけTTL取消の対象にする
-                        o = meta["order"]  # 何をするか：元注文情報（tif/ttl/px/sz）を参照
-                        try:
-                            ex.cancel_child_order(child_order_acceptance_id=acc_id)  # 何をするか：TTL超過の注文を取消
-                        except (RateLimitError, ServerError, NetworkError, ExchangeError) as e:
-                            logger.warning(f"ttl cancel failed for {acc_id}: {e}")  # 何をするか：失敗は記録して今回は見送り（次周回で再試行）
-                            continue
-                        del live_orders[acc_id]  # 何をするか：成功したら監視リストから外す
-                        order_log.add(ts=now.isoformat(), action="cancel", tif=getattr(o, "tif", "GTC"), ttl_ms=getattr(o, "ttl_ms", None), px=getattr(o, "price", None), sz=getattr(o, "size", None), reason="ttl")  # 何をするか：ordersログにTTL取消を記録
-                        _hb_write(hb_path, event="cancel", ts=now.isoformat(), acc=acc_id, reason="ttl", px=getattr(o, "price", None), sz=getattr(o, "size", None))  # 何をするか：ハートビートにもTTL取消を1行記録
+                # 何をするか：TTL 超過の注文を自動キャンセル（レート制限中は呼ばない）
+                if not throttled:
+                    for acc_id, meta in list(live_orders.items()):
+                        if (meta.get("deadline") is not None) and (now >= meta["deadline"]):  # 何をするか：締切のある注文だけTTL取消の対象にする
+                            o = meta["order"]  # 何をするか：元注文情報（tif/ttl/px/sz）を参照
+                            try:
+                                ex.cancel_child_order(child_order_acceptance_id=acc_id)  # 何をするか：TTL超過の注文を取消
+                            except (RateLimitError, ServerError, NetworkError, ExchangeError) as e:
+                                logger.warning(f"ttl cancel failed for {acc_id}: {e}")  # 何をするか：失敗は記録して今回は見送り（次周回で再試行）
+                                throttle_until = _now_utc() + timedelta(seconds=10)
+                                throttled = True
+                                _hb_write(hb_path, event="pause", ts=_now_utc().isoformat(), reason="throttle")
+                                break
+                            del live_orders[acc_id]  # 何をするか：成功したら監視リストから外す
+                            order_log.add(ts=now.isoformat(), action="cancel", tif=getattr(o, "tif", "GTC"), ttl_ms=getattr(o, "ttl_ms", None), px=getattr(o, "price", None), sz=getattr(o, "size", None), reason="ttl")  # 何をするか：ordersログにTTL取消を記録
+                            _hb_write(hb_path, event="cancel", ts=now.isoformat(), acc=acc_id, reason="ttl", px=getattr(o, "price", None), sz=getattr(o, "size", None))  # 何をするか：ハートビートにもTTL取消を1行記録
 
-                fills = _pull_fill_deltas(ex, live_orders)  # 何をするか：今回ぶんの増分約定を取り出す
+                try:
+                    fills = [] if throttled else _pull_fill_deltas(ex, live_orders)  # 何をするか：レート制限中はRESTを呼ばない
+                except RateLimitError as e:
+                    logger.error(f"live: exchange RateLimit → cooldown: {e}")  # 何をするか：停止せずクールダウンへ切替
+                    throttle_until = _now_utc() + timedelta(seconds=10)        # 何をするか：10秒は新規/取消を止める
+                    throttled = True
+                    _hb_write(hb_path, event="pause", ts=_now_utc().isoformat(), reason="throttle")  # 何をするか：心拍に“throttle”を記録
+                    continue  # 何をするか：haltせず次周回へ
                 for side, px, sz, tag, done in fills:  # 何をするか：done=True なら完了（fill）、False なら部分約定（partial）
                     realized = _apply_fill_and_pnl(pnl_state, side, px, sz)  # 何をするか：建玉を更新し実現PnLを積算
                     fee = px * sz * (fee_bps / 10000.0)  # 何をするか：約定金額×bpsで手数料（正=コスト/負=リベート）
@@ -829,6 +847,9 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True) -> None:
                     logger.error(f"strategy evaluate failed: {e}")
                     continue
 
+
+                if throttled:
+                    continue
 
                 for o in actions or []:
                     sz = float(_act(o, "size", getattr(getattr(cfg, "size", None), "default", 0.0)) or 0.0)  # 何をするか：dict/object両対応でサイズ取得（未指定ならconfigのdefault）
@@ -935,9 +956,18 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True) -> None:
                         _hb_write(hb_path, event="place", ts=now.isoformat(), acc=acc, reason=_act(o, "tag", ""), tif=_act(o, "tif", "GTC"), ttl_ms=_act(o, "ttl_ms", None), px=px, sz=sz)  # 何をするか：発注イベントを心拍に記録
 
 
-                    except (RateLimitError, ServerError, NetworkError, ExchangeError) as e:
+                    except RateLimitError as e:
+                        logger.error(f"live: exchange RateLimit → cooldown: {e}")  # 何をするか：停止せずクールダウンへ切替
+                        throttle_until = _now_utc() + timedelta(seconds=10)        # 何をするか：10秒は新規/取消を止める
+                        throttled = True
+                        _hb_write(hb_path, event="pause", ts=_now_utc().isoformat(), reason="throttle")  # 何をするか：心拍に“throttle”を記録
+                        break
+                    except (ServerError, NetworkError, ExchangeError) as e:
                         logger.warning(f"send order rejected: {e}")
                         continue
+
+                if throttled:
+                    continue
 
         except (AuthError, RateLimitError, ServerError, NetworkError, ExchangeError) as e:
             logger.error(f"live: exchange 疎通に失敗しました: {e}")
