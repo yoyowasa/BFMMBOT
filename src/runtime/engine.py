@@ -9,7 +9,7 @@ import asyncio  # 非同期ループ/キャンセル
 from collections import deque  # 30sミッド履歴でガード
 from datetime import datetime, timezone, timedelta  # ts解析と現在時刻 JST日付の境界計算にtimedeltaを使う
 from typing import Deque, Tuple  # 型ヒント
-
+import csv  # 役割：窓イベントをCSVに1行追記するために使用
 from loguru import logger  # 実行ログ
 from pathlib import Path  # ハートビートNDJSONのファイル出力に使用
 import orjson  # 1行JSON化（高速）
@@ -276,6 +276,32 @@ class PaperEngine:
         )
         self._heartbeat(dt, "fill", reason=tag)  # ハートビート：約定を要約
 
+    def _log_window_event(self, window_type: str, action: str, ts: datetime) -> None:
+        """役割：メンテ/ファンディング等の“窓”の入退を1行CSVで記録する"""
+        events_dir = Path("logs") / "events"  # 役割：イベントログの保存先
+        events_dir.mkdir(parents=True, exist_ok=True)  # 役割：ディレクトリを必ず作成
+
+        # 役割：窓の種類ごとに出力ファイル名を選ぶ（仕様：maintenance.csv / funding_schedule.csv）
+        if window_type == "maintenance":
+            outfile = events_dir / "maintenance.csv"
+        elif window_type == "funding":
+            outfile = events_dir / "funding_schedule.csv"
+        else:
+            outfile = events_dir / f"{window_type}.csv"
+
+        is_new = not outfile.exists()  # 役割：ファイルが無いときはヘッダ行を書く
+
+        # 役割：ts を UTC ISO8601 に正規化（naive なら UTC を付与して保存）
+        if getattr(ts, "tzinfo", None) is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        ts_iso = ts.astimezone(timezone.utc).isoformat()
+
+        # 役割：CSV へ追記（列：ts, window, action）
+        with outfile.open("a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if is_new:
+                w.writerow(["ts", "window", "action"])
+            w.writerow([ts_iso, window_type, action])
 
 
     # ─────────────────────────────────────────────────────────────

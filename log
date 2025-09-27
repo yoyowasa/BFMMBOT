@@ -63,3 +63,69 @@ poetry run python -m src.cli.trade --config configs/live.yml --strategy cancel_a
 
 # 何をするか：疑似発注エンジンを起動し、約定/取消/手数料/PnL をシミュレーションしてログ出力する
 poetry run python -m src.cli.trade --config configs/live.yml --strategy cancel_add_gate --paper
+
+
+了解。運用・監視・集計の“実行コマンド”を全部まとめて出します（あなたの環境＝PowerShell前提）。
+1コマンドずつ何をするかを先頭コメントで明記しています。表は使いません。コード変更はありません。
+
+1) 起動系（実APIの使い分け）
+# 何をするか：REST/WSの疎通と認証を確認（発注はしない）
+poetry run python -m src.cli.health --product-code FX_BTC_JPY
+
+# 何をするか：ドライラン（観察専用）。戦略判定とガードは動くが、注文は出さない
+poetry run python -m src.cli.trade --config configs/live.yml --strategy cancel_add_gate --dry-run
+
+# 何をするか：疑似発注（paper）。TTL/部分約定/手数料/ネットPnLまでシミュレーション
+poetry run python -m src.cli.trade --config configs/live.yml --strategy cancel_add_gate --paper
+
+# 何をするか：実稼働（本当に発注が出る）
+poetry run python -m src.cli.trade --config configs/live.yml --strategy cancel_add_gate
+
+2) ランタイム監視（心拍）
+# 何をするか：心拍をリアルタイム監視（start/pause/status/place/partial/fill/cancel/kill）
+Get-Content -Path logs/runtime/heartbeat.ndjson -Wait
+
+# 何をするか：心拍のイベント別件数を集計して全体像をつかむ
+Get-Content logs/runtime/heartbeat.ndjson | ConvertFrom-Json | Group-Object event | Sort-Object Count -Descending | Format-Table Name,Count -AutoSize
+
+# 何をするか：pause の理由別件数（どのゲートで止まっているか）
+Get-Content logs/runtime/heartbeat.ndjson | ConvertFrom-Json | Where-Object event -eq 'pause' | Group-Object reason | Sort-Object Count -Descending | Format-Table Name,Count -AutoSize
+
+# 何をするか：直近50件を簡易表示（主要フィールドのみ）
+Get-Content logs/runtime/heartbeat.ndjson | Select-Object -Last 50 | ForEach-Object { $x = $_ | ConvertFrom-Json; "$($x.ts) event=$($x.event) reason=$($x.reason) side=$($x.side) px=$($x.px) sz=$($x.sz) pnl=$($x.pnl)" }
+
+3) 注文ログ（orders）
+# 何をするか：注文アクション（place/cancel/...）の件数
+Get-Content logs/orders/order_log.ndjson | ConvertFrom-Json | Group-Object action | Sort-Object Count -Descending | Format-Table Name,Count -AutoSize
+
+# 何をするか：直近20件の注文操作を確認
+Get-Content logs/orders/order_log.ndjson | Select-Object -Last 20
+
+4) 約定ログ（trades）— NDJSONの手早い確認
+# 何をするか：直近20件の約定（部分/完全）を主要項目で確認
+Get-Content logs/trades/trade_log.ndjson | Select-Object -Last 20 | ForEach-Object { $x = $_ | ConvertFrom-Json; "$($x.ts) $($x.side) px=$($x.px) sz=$($x.sz) fee=$($x.fee) pnl=$($x.pnl) inv_after=$($x.inventory_after)" }
+
+5) 約定ログ（Parquet）— 集計（pyarrowのみ使用）
+# 何をするか：全体のトレード件数・ネットPnL合計・手数料合計を算出
+poetry run python -c "import pyarrow.parquet as pq, pyarrow.compute as pc; t=pq.read_table('logs/trades/trade_log.parquet'); s_pnl=(pc.sum(t['pnl']).as_py() or 0); s_fee=(pc.sum(t['fee']).as_py() or 0); print(f'trades={t.num_rows} net_pnl_jpy={s_pnl:.2f} fees_jpy={s_fee:.2f}')"
+
+# 何をするか：本日分（UTC日付）のネットPnLと手数料（DAYは自動で今日に設定）
+$env:DAY=(Get-Date -Format yyyy-MM-dd); poetry run python -c "import os,pyarrow.parquet as pq, pyarrow.compute as pc; d=os.environ.get('DAY'); t=pq.read_table('logs/trades/trade_log.parquet'); m=pc.starts_with(t['ts'], pc.scalar(d)); ft=t.filter(m); s=(pc.sum(ft['pnl']).as_py() or 0); f=(pc.sum(ft['fee']).as_py() or 0); print(f'day={d} trades={ft.num_rows} net_pnl_jpy={s:.2f} fees_jpy={f:.2f}')"
+
+# 何をするか：inventory_after の最終値（現在の在庫目安）を確認
+poetry run python -c "import pyarrow.parquet as pq; t=pq.read_table('logs/trades/trade_log.parquet'); import pyarrow as pa; import pyarrow.compute as pc; n=t.num_rows; print('inventory_after(last)=', t['inventory_after'][n-1].as_py() if n>0 else 0.0)"
+
+6) CSVのクイック確認（paper/ライブ共通）
+# 何をするか：orders.csv の最後の10行を確認
+Get-Content logs/orders.csv | Select-Object -Last 10
+
+# 何をするか：trades.csv の最後の10行を確認
+Get-Content logs/trades.csv | Select-Object -Last 10
+
+7) 設定確認（YAMLを眺めるだけ）
+# 何をするか：現在のlive設定を画面表示（PowerShellで中身をざっと見る）
+Get-Content configs/live.yml
+
+8) 追加：ランタイムの“スロットル中”の様子だけ追う
+# 何をするか：心拍から throttle の行だけをライブ表示（レート制限追跡）
+Get-Content logs/runtime/heartbeat.ndjson -Wait | ForEach-Object { if (($_ | ConvertFrom-Json).reason -eq 'throttle') { $_ } }
