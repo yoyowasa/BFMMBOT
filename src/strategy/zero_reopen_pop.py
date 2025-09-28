@@ -125,12 +125,23 @@ class ZeroReopenPop(StrategyBase):
         ask_px = getattr(getattr(ob, "best_ask", None), "price", None)
         if bid_px is None or ask_px is None:
             return "buy"
-        mid = (bid_px + ask_px) / 2.0
-        # ask−mid が大きい＝上に開いた ⇒ 戻りBUYを mid−1tick に置く
-        if (ask_px - mid) >= (mid - bid_px):
-            return "buy"
-        # それ以外＝下に開いた ⇒ 戻りSELLを mid＋1tick に置く
-        return "sell"
+
+        mid = None
+        microprice = getattr(ob, "microprice", None)
+        if callable(microprice):
+            try:
+                mid = microprice()
+            except Exception:
+                mid = None
+        if mid is None:
+            mid = (bid_px + ask_px) / 2.0
+
+        bid_offset = abs(mid - bid_px)
+        ask_offset = abs(ask_px - mid)
+
+        if ask_offset > bid_offset:
+            return "sell"
+        return "buy"
 
     def _build_entry(self, ob: OrderBook, side: str) -> Dict[str, Any]:
         """【関数】エントリー生成：片面1発の指値（GTC+TTL・最小ロット・戦略タグ付）を作る"""
