@@ -21,6 +21,7 @@ from src.core.analytics import DecisionLog  # 【関数】意思決定ログ（P
 from src.strategy.stall_then_strike import StallThenStrike  # #1 静止→一撃（ON）:contentReference[oaicite:7]{index=7}
 from src.strategy.cancel_add_gate import CancelAddGate  # #2 キャンセル比ゲート（ON）:contentReference[oaicite:8]{index=8}
 from src.strategy.age_microprice import AgeMicroprice  # #3 エイジ×MP
+from src.strategy.zero_reopen_pop import ZeroReopenPop, zero_reopen_config_from  # ゼロ→再拡大“一拍”だけ片面+即IOC利確
 
 def _parse_iso(ts: str) -> datetime:
     """【関数】ISO→datetime（'Z'も+00:00に正規化）"""
@@ -33,7 +34,7 @@ def _now_utc() -> datetime:
 class PaperEngine:
     """リアルタイム“paper”の最小エンジン"""
 
-    def __init__(self, cfg, strategy_name: str) -> None:
+    def __init__(self, cfg, strategy_name: str, *, strategy_cfg=None) -> None:
         # 設定（製品コード/刻み/ガード閾値）
         self.cfg = cfg
         self.product = getattr(cfg, "product_code", "FX_BTC_JPY") or "FX_BTC_JPY"
@@ -53,6 +54,9 @@ class PaperEngine:
             self.strat = CancelAddGate()
         elif strategy_name == "age_microprice":
             self.strat = AgeMicroprice()
+        elif strategy_name == "zero_reopen_pop":
+            zr_cfg = strategy_cfg or zero_reopen_config_from(cfg)
+            self.strat = ZeroReopenPop(cfg=zr_cfg)
         else:
             self.strat = StallThenStrike()
 
