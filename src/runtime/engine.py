@@ -23,7 +23,6 @@ from src.strategy.cancel_add_gate import CancelAddGate  # #2 キャンセル比�
 from src.strategy.age_microprice import AgeMicroprice  # #3 エイジ×MP
 from src.strategy.zero_reopen_pop import ZeroReopenPop, zero_reopen_config_from  # ゼロ→再拡大“一拍”だけ片面+即IOC利確
 
-
 def _parse_iso(ts: str) -> datetime:
     """【関数】ISO→datetime（'Z'も+00:00に正規化）"""
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
@@ -58,7 +57,6 @@ class PaperEngine:
         elif strategy_name == "zero_reopen_pop":
             zr_cfg = strategy_cfg or zero_reopen_config_from(cfg)
             self.strat = ZeroReopenPop(cfg=zr_cfg)
-
         else:
             self.strat = StallThenStrike()
 

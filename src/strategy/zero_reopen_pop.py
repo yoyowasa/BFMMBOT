@@ -5,8 +5,6 @@
 from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional
 
-
-
 # 何をするimportか：戦略の骨組み・板の読み取り・注文生成・時刻取得（すべて既存の共通層を利用）
 from src.strategy.base import StrategyBase
 from src.core.orderbook import OrderbookView  # best/中値/tick/スプレッド/健全性 health_ok() を提供
@@ -71,6 +69,8 @@ class ZeroReopenPop(StrategyBase):
         self.cfg = cfg or ZeroReopenConfig()
         self._last_spread_zero_ms: int = -10**9
         self._last_action_ms: int = -10**9
+        self._lock_until_ms: int = -10**9  # 何をするか：同時に複数枚を出さない“発注ロック”の期限ms（TTL中は新規禁止）
+
 
     # -------------------------
     # 内部ヘルパ（責務を明記）
@@ -92,6 +92,9 @@ class ZeroReopenPop(StrategyBase):
             return False
         if (now - self._last_action_ms) < self.cfg.cooloff_ms:
             return False
+        if now < self._lock_until_ms:
+            return False  # 何をするか：まだTTL中＝前の注文が生きているので、新しい発注をロックして1枚運用を守る
+
         if ob.best_bid() is None or ob.best_ask() is None:
             return False
         return True
@@ -154,10 +157,14 @@ class ZeroReopenPop(StrategyBase):
             side = self._choose_side(ob)
             order = self._build_entry(ob, side)
             self._last_action_ms = now
+            self._lock_until_ms = now + self.cfg.ttl_ms  # 何をするか：このTTLの間は新規発注を禁止して“同時1枚だけ”を保証する
+
             return [order]
         # ふだんは何もしない（Idle）
         return []
 
     def on_fill(self, ob: OrderbookView, my_fill) -> List[Order]:
         """【関数】約定イベント：+1tickのIOC利確を即返して“秒速で退出”する"""
+        self._lock_until_ms = now_ms() - 1  # 何をするか：約定で用件完了→ロックを即解除して次のチャンスを待てるようにする
+
         return [self._build_take_profit(ob, my_fill)]

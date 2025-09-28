@@ -18,7 +18,6 @@ from src.strategy.age_microprice import AgeMicroprice  # #3 エイジ×MPを選�
 from src.strategy.cancel_add_gate import CancelAddGate  # #2 キャンセル比ゲートを選べるようにする
 from src.strategy.zero_reopen_pop import ZeroReopenPop, zero_reopen_config_from  # ゼロ→再拡大“一拍”だけ片面+即IOC利確を選べるようにする
 
-
 def _parse_iso(ts: str) -> datetime:
     """【関数】ISO文字列→datetime（'Z' を +00:00 に）"""
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
@@ -44,7 +43,6 @@ def run_backtest_min(cfg, tape_path: str, strategy_name: str = "stall_then_strik
         strat = AgeMicroprice()
     elif strategy_name == "zero_reopen_pop":
         strat = ZeroReopenPop(cfg=zero_reopen_config_from(cfg))
-
     else:
         strat = StallThenStrike()
 
