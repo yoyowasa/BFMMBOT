@@ -31,10 +31,7 @@ from collections import deque  # 何をするか：ミッド変化ガード用�
 from src.core.orderbook import OrderBook  # 何をするか：ローカル板（戦略の入力）
 from src.core.orders import Order  # 何をするか：戦略が返す注文モデル（tif/ttl_ms/price/size/tag）
 from src.core.realtime import stream_events  # 何をするか：WSのboard/executionsストリーム
-from src.strategy.stall_then_strike import StallThenStrike  # 何をするか：#1 戦略
-from src.strategy.cancel_add_gate import CancelAddGate  # 何をするか：#2 戦略
-from src.strategy.age_microprice import AgeMicroprice  # 何をするか：#3 戦略
-from src.strategy.zero_reopen_pop import ZeroReopenPop, zero_reopen_config_from  # 何をするか：ゼロ→再拡大“一拍”だけ片面+即IOC利確の戦略
+from src.strategy import build_strategy  # 何をするか：戦略インスタンスを中央ファクトリから取得する
 from src.core.logs import OrderLog, TradeLog  # 何をするか：orders/trades を Parquet＋NDJSON に記録する
 from src.core.analytics import DecisionLog  # 何をするか：戦略の意思決定ログ（Parquet＋NDJSONミラー）を扱う
 
@@ -42,20 +39,8 @@ from src.core.exchange import BitflyerExchange, ExchangeError, ServerError, Netw
 
 
 def _select_strategy(name: str, cfg, strategy_cfg=None):
-    """何をするか：戦略名から実体を生成（#1/#2/#3のいずれか）"""
-    if name == "stall_then_strike":
-        try: return StallThenStrike(cfg)
-        except TypeError: return StallThenStrike()
-    if name == "cancel_add_gate":
-        try: return CancelAddGate(cfg)
-        except TypeError: return CancelAddGate()
-    if name == "age_microprice":
-        try: return AgeMicroprice(cfg)
-        except TypeError: return AgeMicroprice()
-    if name == "zero_reopen_pop":
-        zr_cfg = strategy_cfg or zero_reopen_config_from(cfg)
-        return ZeroReopenPop(cfg=zr_cfg)
-    raise ValueError(f"unknown strategy: {name}")
+    """何をするか：戦略名から実体を生成（中央ファクトリへ委譲）"""
+    return build_strategy(name, cfg, strategy_cfg=strategy_cfg)
 
 def _now_utc() -> datetime:
     """何をするか：UTC現在時刻を返す（ログ/TTL計算の基準）"""
