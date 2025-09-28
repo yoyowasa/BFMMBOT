@@ -54,7 +54,6 @@ def zero_reopen_config_from(cfg: Any) -> ZeroReopenConfig | None:
 
     raise TypeError("zero_reopen_pop config must be a mapping or ZeroReopenConfig instance")
 
-
 class ZeroReopenPop(StrategyBase):
     """
     何をする戦略か：
@@ -71,6 +70,7 @@ class ZeroReopenPop(StrategyBase):
         self._last_spread_zero_ms: int = -10**9
         self._last_action_ms: int = -10**9
         self._lock_until_ms: int = -10**9  # 何をするか：同時に複数枚を出さない“発注ロック”の期限ms（TTL中は新規禁止）
+
 
     # -------------------------
     # 内部ヘルパ（責務を明記）
@@ -94,6 +94,7 @@ class ZeroReopenPop(StrategyBase):
             return False
         if now < self._lock_until_ms:
             return False  # 何をするか：まだTTL中＝前の注文が生きているので、新しい発注をロックして1枚運用を守る
+
         if ob.best_bid() is None or ob.best_ask() is None:
             return False
         return True
@@ -157,6 +158,7 @@ class ZeroReopenPop(StrategyBase):
             order = self._build_entry(ob, side)
             self._last_action_ms = now
             self._lock_until_ms = now + self.cfg.ttl_ms  # 何をするか：このTTLの間は新規発注を禁止して“同時1枚だけ”を保証する
+
             return [order]
         # ふだんは何もしない（Idle）
         return []
@@ -164,4 +166,5 @@ class ZeroReopenPop(StrategyBase):
     def on_fill(self, ob: OrderbookView, my_fill) -> List[Order]:
         """【関数】約定イベント：+1tickのIOC利確を即返して“秒速で退出”する"""
         self._lock_until_ms = now_ms() - 1  # 何をするか：約定で用件完了→ロックを即解除して次のチャンスを待てるようにする
+
         return [self._build_take_profit(ob, my_fill)]
