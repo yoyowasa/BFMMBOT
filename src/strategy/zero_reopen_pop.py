@@ -83,7 +83,7 @@ class ZeroReopenPop(StrategyBase):
             self._last_spread_zero_ms = now
 
     def _is_reopen(self, ob: OrderbookView, now: int) -> bool:
-        """【関数】再拡大判定：“直近ゼロあり かつ 現在は≥min_spread_tick”かどうか"""
+        """【関数】再拡大判定：“直近ゼロあり かつ 現在のspreadが[min,max]帯”かどうか"""
         seen_zero_recently = (now - self._last_spread_zero_ms) <= self.cfg.seen_zero_window_ms
         return seen_zero_recently and (self.cfg.min_spread_tick <= ob.spread_ticks() <= self.cfg.max_spread_tick)  # 何をするか：1〜上限tickの“ちょうど良い開き”だけ許可
 
