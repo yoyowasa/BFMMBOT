@@ -18,10 +18,7 @@ from src.core.orderbook import OrderBook  # 【関数】ローカル板（Best/S
 from src.core.simulator import MiniSimulator  # 【関数】最小約定シミュ（価格タッチ）:contentReference[oaicite:4]{index=4}
 from src.core.logs import OrderLog, TradeLog  # 【関数】発注/約定ログ（Parquet）:contentReference[oaicite:5]{index=5}
 from src.core.analytics import DecisionLog  # 【関数】意思決定ログ（Parquet）:contentReference[oaicite:6]{index=6}
-from src.strategy.stall_then_strike import StallThenStrike  # #1 静止→一撃（ON）:contentReference[oaicite:7]{index=7}
-from src.strategy.cancel_add_gate import CancelAddGate  # #2 キャンセル比ゲート（ON）:contentReference[oaicite:8]{index=8}
-from src.strategy.age_microprice import AgeMicroprice  # #3 エイジ×MP
-from src.strategy.zero_reopen_pop import ZeroReopenPop, zero_reopen_config_from  # ゼロ→再拡大“一拍”だけ片面+即IOC利確
+from src.strategy import build_strategy  # 何をするか：戦略生成を中央ファクトリに委譲する
 
 def _parse_iso(ts: str) -> datetime:
     """【関数】ISO→datetime（'Z'も+00:00に正規化）"""
@@ -50,15 +47,7 @@ class PaperEngine:
 
 
         # 戦略（#1/#2/#3）を選択
-        if strategy_name == "cancel_add_gate":
-            self.strat = CancelAddGate()
-        elif strategy_name == "age_microprice":
-            self.strat = AgeMicroprice()
-        elif strategy_name == "zero_reopen_pop":
-            zr_cfg = strategy_cfg or zero_reopen_config_from(cfg)
-            self.strat = ZeroReopenPop(cfg=zr_cfg)
-        else:
-            self.strat = StallThenStrike()
+        self.strat = build_strategy(strategy_name, cfg, strategy_cfg=strategy_cfg)
 
 
         # ローカル板・シミュ・ログ器

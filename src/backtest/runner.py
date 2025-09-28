@@ -13,16 +13,19 @@ from src.core.analytics import DecisionLog  # 【関数】決定ログ（analyti
 from src.core.logs import OrderLog, TradeLog  # 【関数】Parquet ログ出力
 
 from src.core.simulator import MiniSimulator  # 最小シミュ（本ステップ）
-from src.strategy.stall_then_strike import StallThenStrike  # 戦略#1（本ステップ）
-from src.strategy.age_microprice import AgeMicroprice  # #3 エイジ×MPを選べるようにする
-from src.strategy.cancel_add_gate import CancelAddGate  # #2 キャンセル比ゲートを選べるようにする
-from src.strategy.zero_reopen_pop import ZeroReopenPop, zero_reopen_config_from  # ゼロ→再拡大“一拍”だけ片面+即IOC利確を選べるようにする
+from src.strategy import build_strategy  # 何をするか：戦略インスタンスを中央ファクトリから取得する
 
 def _parse_iso(ts: str) -> datetime:
     """【関数】ISO文字列→datetime（'Z' を +00:00 に）"""
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
-def run_backtest_min(cfg, tape_path: str, strategy_name: str = "stall_then_strike") -> Dict[str, Any]:
+def run_backtest_min(
+    cfg,
+    tape_path: str,
+    strategy_name: str = "stall_then_strike",
+    *,
+    strategy_cfg=None,
+) -> Dict[str, Any]:
     """【関数】最小バックテストランナー
     - 役割: boardでローカル板を更新→戦略でPlace/Cancelを出す→executionsでFill判定
     - 返り値: 置いた/消した/埋まった件数などのサマリ
@@ -36,15 +39,8 @@ def run_backtest_min(cfg, tape_path: str, strategy_name: str = "stall_then_strik
 
     ob = OrderBook(tick_size=float(getattr(cfg, "tick_size", 1.0)))
     sim = MiniSimulator()
-    # 【関数】戦略選択：引数で #1/#2/#3 を切替（既定は #1）
-    if strategy_name == "cancel_add_gate":
-        strat = CancelAddGate()
-    elif strategy_name == "age_microprice":
-        strat = AgeMicroprice()
-    elif strategy_name == "zero_reopen_pop":
-        strat = ZeroReopenPop(cfg=zero_reopen_config_from(cfg))
-    else:
-        strat = StallThenStrike()
+    # 【関数】戦略選択：中央ファクトリに委譲（既定は #1）
+    strat = build_strategy(strategy_name, cfg, strategy_cfg=strategy_cfg)
 
 
 
