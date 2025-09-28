@@ -226,3 +226,4 @@ for oid, placed_at_ms, tag in open_orders:
   if tag == "zero_reopen" and should_cancel(ob, now, placed_at_ms, state, cfg):
     cancels.append(oid)
 return cancels
+
