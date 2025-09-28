@@ -133,3 +133,97 @@ CFD向けフル構成/ログ仕様/CLI・設定・ロジック仕様（#7 Zero�
 ロールアウト/多段導入・障害対応・安全装置（Caution/Halted）の運用規約。
 
 バックテスト/リプレイ検証・設定外出し・EOD・SLO/SLAの物差し。
+
+## 11. 擬似コード（I/O定義と主要分岐）
+
+### インターフェース（受け取り・返し）
+# Order: {side: "BUY"/"SELL", price: float, size: float, tif: "GTC"/"IOC", ttl_ms: int, tag: str}
+# OrderbookView: best_bid(), best_ask(), mid_price(), tick_size(), spread_ticks(), health_ok()
+# Fill: {side: "BUY"/"SELL", price: float, size: float, tag: str}
+# Time: now_ms(): int
+
+# 設定（外だし想定）
+struct Config {
+  min_spread_tick: int = 1
+  ttl_ms: int = 800
+  size_min: float = 0.001
+  cooloff_ms: int = 250
+  seen_zero_window_ms: int = 1000
+}
+
+# 内部状態
+struct State {
+  last_spread_zero_ms: int = -INF   # 【何をするか】直近にspread==0を見た時刻を記録する
+  last_action_ms: int = -INF        # 【何をするか】連打防止の冷却起点を記録する
+}
+
+# 【関数】mark_zero(ob, now, state) -> None
+# 何をする：spread==0を見た時刻を記録して“直後”判定を可能にする
+if ob.spread_ticks() == 0:
+  state.last_spread_zero_ms = now
+  return
+
+# 【関数】is_reopen(ob, now, state, cfg) -> Bool
+# 何をする：直近にゼロがあり、現在は再拡大（>=min_spread_tick）かを判定する
+seen_zero_recently = (now - state.last_spread_zero_ms) <= cfg.seen_zero_window_ms
+return seen_zero_recently and (ob.spread_ticks() >= cfg.min_spread_tick)
+
+# 【関数】pass_gates(ob, now, state, cfg) -> Bool
+# 何をする：標準ガードとクールダウンをまとめて判定する
+if not ob.health_ok(): return False
+if (now - state.last_action_ms) < cfg.cooloff_ms: return False
+if ob.best_bid() is None or ob.best_ask() is None: return False
+return True
+
+# 【関数】choose_side(ob) -> ("BUY"|"SELL")
+# 何をする：ミッドに対するbestのズレから、逆向きに1tick待つ側を決める
+mid = ob.mid_price()
+bid = ob.best_bid()
+ask = ob.best_ask()
+if (ask - mid) >= (mid - bid): return "BUY"
+else: return "SELL"
+
+# 【関数】build_entry(ob, side, cfg) -> Order
+# 何をする：片面1発の指値（GTC+TTL、最小ロット、tag付）を生成する
+tick = ob.tick_size()
+mid = ob.mid_price()
+if side == "BUY": px = mid - tick
+else: px = mid + tick
+return Order(side=side, price=px, size=cfg.size_min, tif="GTC", ttl_ms=cfg.ttl_ms, tag="zero_reopen")
+
+# 【関数】build_take_profit(ob, fill) -> Order
+# 何をする：+1tickのIOC利確を即時生成して秒速撤退する
+tick = ob.tick_size()
+if fill.side == "BUY": px = fill.price + tick; out_side = "SELL"
+else: px = fill.price - tick; out_side = "BUY"
+return Order(side=out_side, price=px, size=fill.size, tif="IOC", ttl_ms=200, tag="zero_reopen_take")
+
+# 【関数】should_cancel(ob, now, placed_at_ms, state, cfg) -> Bool
+# 何をする：条件喪失/TTL超過/再クロス/ガード失効を検出して取消要否を返す
+if not ob.health_ok(): return True
+if ob.spread_ticks() == 0: return True
+if (now - placed_at_ms) > cfg.ttl_ms: return True
+return False
+
+# 【関数】on_board(ob, now, state, cfg) -> List[Order]
+# 何をする：板イベントで、ゼロ記録→再拡大＆ゲート合格なら1枚だけ返す
+mark_zero(ob, now, state)
+if is_reopen(ob, now, state, cfg) and pass_gates(ob, now, state, cfg):
+  side = choose_side(ob)
+  order = build_entry(ob, side, cfg)
+  state.last_action_ms = now
+  return [order]
+return []
+
+# 【関数】on_fill(ob, fill, cfg) -> List[Order]
+# 何をする：fill受信で+1tickのIOCを即返して利確する
+return [build_take_profit(ob, fill)]
+
+# 【関数】periodic_check(ob, now, open_orders, state, cfg) -> List[cancel_ids]
+# 何をする：開いている“zero_reopen”タグ注文をshould_cancelで順次キャンセルする
+cancels = []
+for oid, placed_at_ms, tag in open_orders:
+  if tag == "zero_reopen" and should_cancel(ob, now, placed_at_ms, state, cfg):
+    cancels.append(oid)
+return cancels
+
