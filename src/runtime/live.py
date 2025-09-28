@@ -34,6 +34,7 @@ from src.core.realtime import stream_events  # 何をするか：WSのboard/exec
 from src.strategy.stall_then_strike import StallThenStrike  # 何をするか：#1 戦略
 from src.strategy.cancel_add_gate import CancelAddGate  # 何をするか：#2 戦略
 from src.strategy.age_microprice import AgeMicroprice  # 何をするか：#3 戦略
+from src.strategy.zero_reopen_pop import ZeroReopenPop  # 何をするか：ゼロ→再拡大“一拍”だけ片面+即IOC利確の戦略
 from src.core.logs import OrderLog, TradeLog  # 何をするか：orders/trades を Parquet＋NDJSON に記録する
 from src.core.analytics import DecisionLog  # 何をするか：戦略の意思決定ログ（Parquet＋NDJSONミラー）を扱う
 
@@ -51,6 +52,8 @@ def _select_strategy(name: str, cfg):
     if name == "age_microprice":
         try: return AgeMicroprice(cfg)
         except TypeError: return AgeMicroprice()
+    if name == "zero_reopen_pop":
+        return ZeroReopenPop()
     raise ValueError(f"unknown strategy: {name}")
 
 def _now_utc() -> datetime:

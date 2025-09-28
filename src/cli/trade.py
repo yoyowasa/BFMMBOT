@@ -29,8 +29,8 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run paper trading (real-time)")
     p.add_argument("--config", required=True, help="configs/paper.yml など")
     p.add_argument("--strategy", default="stall_then_strike",
-                choices=["stall_then_strike", "cancel_add_gate", "age_microprice"],
-                help="どの戦略で動かすか（#1/#2/#3）")
+                choices=["stall_then_strike", "cancel_add_gate", "age_microprice", "zero_reopen_pop"],
+                help="どの戦略で動かすか（#1/#2/#3/#4）")
     p.add_argument("--dry-run", action="store_true", help="何をするか：liveでも実発注せず疎通確認だけ行う（安全テスト）")
     p.add_argument("--paper", action="store_true", help="何をするか：取引所へ発注せず、板に当たれば fills をシミュレートする")
 
