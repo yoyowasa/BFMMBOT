@@ -16,7 +16,8 @@ from src.core.simulator import MiniSimulator  # 最小シミュ（本ステッ�
 from src.strategy.stall_then_strike import StallThenStrike  # 戦略#1（本ステップ）
 from src.strategy.age_microprice import AgeMicroprice  # #3 エイジ×MPを選べるようにする
 from src.strategy.cancel_add_gate import CancelAddGate  # #2 キャンセル比ゲートを選べるようにする
-from src.strategy.zero_reopen_pop import ZeroReopenPop  # ゼロ→再拡大“一拍”だけ片面+即IOC利確を選べるようにする
+from src.strategy.zero_reopen_pop import ZeroReopenPop, zero_reopen_config_from  # ゼロ→再拡大“一拍”だけ片面+即IOC利確を選べるようにする
+
 
 def _parse_iso(ts: str) -> datetime:
     """【関数】ISO文字列→datetime（'Z' を +00:00 に）"""
@@ -42,7 +43,8 @@ def run_backtest_min(cfg, tape_path: str, strategy_name: str = "stall_then_strik
     elif strategy_name == "age_microprice":
         strat = AgeMicroprice()
     elif strategy_name == "zero_reopen_pop":
-        strat = ZeroReopenPop()
+        strat = ZeroReopenPop(cfg=zero_reopen_config_from(cfg))
+
     else:
         strat = StallThenStrike()
 

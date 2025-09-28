@@ -18,6 +18,7 @@ from pathlib import Path  # run.log の保存先を扱う
 from src.core.utils import load_config  # 【関数】設定ローダー（base＋上書き）:contentReference[oaicite:12]{index=12}
 from src.runtime.engine import PaperEngine  # 【関数】paperエンジン（本ステップ）
 from src.runtime.live import run_live  # 何をするか：本番（live）の最小導線（疎通確認）を呼び出す
+from src.strategy.zero_reopen_pop import ZeroReopenConfig, zero_reopen_config_from  # 何をするか：Zero→Reopen Popの設定器を読み込む
 try:
     from src.runtime.engine import run_paper  # 何をするか：標準のペーパー入口（無い環境もあるのでtryで受ける）
 except Exception:
@@ -41,6 +42,9 @@ def main() -> None:
     load_dotenv(find_dotenv())  # 何をするか：プロジェクト直下の .env を読み込んでから run_live を呼ぶ
     args = _parse_args()
     cfg = load_config(args.config)
+    zero_reopen_cfg: ZeroReopenConfig | None = None
+    if args.strategy == "zero_reopen_pop":
+        zero_reopen_cfg = zero_reopen_config_from(cfg)
     # 何をするか：設定の env を見て live/paper を切り替える（ワークフローの 8.3→8.4 切替）
     if getattr(cfg, "env", "paper") == "live":
         if args.paper:  # 何をするか：--paper 指定なら疑似発注（fillsまで再現）
@@ -68,9 +72,12 @@ def main() -> None:
                         rp = None
             if rp is None:
                 raise RuntimeError("paper runner が見つかりません（engine.run_paper / engine.paper_main / runtime.paper.main などを確認）")  # 何をするか：どこにも無ければ分かりやすく停止
-            rp(cfg, args.strategy)  # 何をするか：見つけた入口でペーパー運転を開始
+            try:
+                rp(cfg, args.strategy, strategy_cfg=zero_reopen_cfg)  # 何をするか：見つけた入口でペーパー運転を開始
+            except TypeError:
+                rp(cfg, args.strategy)  # 互換：旧シグネチャ（strategy_cfg未対応）の場合は従来呼び出し
         else:
-            run_live(cfg, args.strategy, dry_run=args.dry_run)  # 何をするか：従来どおりlive/dry-run
+            run_live(cfg, args.strategy, dry_run=args.dry_run, strategy_cfg=zero_reopen_cfg)  # 何をするか：従来どおりlive/dry-run
 
 
         return  # 何をするか：live 分岐ではここで終了（paper へは進まない）
@@ -83,7 +90,7 @@ def main() -> None:
 
     if cfg.env != "paper":
         logger.warning(f"env is '{cfg.env}' (expected 'paper') - 続行はします")
-    engine = PaperEngine(cfg, args.strategy)
+    engine = PaperEngine(cfg, args.strategy, strategy_cfg=zero_reopen_cfg)
     try:
         asyncio.run(engine.run_paper())
     except KeyboardInterrupt:

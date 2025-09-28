@@ -34,14 +34,16 @@ from src.core.realtime import stream_events  # 何をするか：WSのboard/exec
 from src.strategy.stall_then_strike import StallThenStrike  # 何をするか：#1 戦略
 from src.strategy.cancel_add_gate import CancelAddGate  # 何をするか：#2 戦略
 from src.strategy.age_microprice import AgeMicroprice  # 何をするか：#3 戦略
-from src.strategy.zero_reopen_pop import ZeroReopenPop  # 何をするか：ゼロ→再拡大“一拍”だけ片面+即IOC利確の戦略
+from src.strategy.zero_reopen_pop import ZeroReopenPop, zero_reopen_config_from  # 何をするか：ゼロ→再拡大“一拍”だけ片面+即IOC利確の戦略
+
+
 from src.core.logs import OrderLog, TradeLog  # 何をするか：orders/trades を Parquet＋NDJSON に記録する
 from src.core.analytics import DecisionLog  # 何をするか：戦略の意思決定ログ（Parquet＋NDJSONミラー）を扱う
 
 from src.core.exchange import BitflyerExchange, ExchangeError, ServerError, NetworkError, AuthError  # 何をするか：認証/権限エラー(AuthError)を検知して安全停止する
 
 
-def _select_strategy(name: str, cfg):
+def _select_strategy(name: str, cfg, strategy_cfg=None):
     """何をするか：戦略名から実体を生成（#1/#2/#3のいずれか）"""
     if name == "stall_then_strike":
         try: return StallThenStrike(cfg)
@@ -53,7 +55,9 @@ def _select_strategy(name: str, cfg):
         try: return AgeMicroprice(cfg)
         except TypeError: return AgeMicroprice()
     if name == "zero_reopen_pop":
-        return ZeroReopenPop()
+        zr_cfg = strategy_cfg or zero_reopen_config_from(cfg)
+        return ZeroReopenPop(cfg=zr_cfg)
+
     raise ValueError(f"unknown strategy: {name}")
 
 def _now_utc() -> datetime:
@@ -442,7 +446,7 @@ def _refresh_fills(ex: BitflyerExchange, live_orders: dict[str, dict]) -> None:
         if state == "COMPLETED" or (outstanding <= 1e-12 and executed > 0.0):
             del live_orders[acc_id]  # 何をするか：完了注文は監視から除去
 
-def run_live(cfg: Any, strategy_name: str, dry_run: bool = True) -> None:
+def run_live(cfg: Any, strategy_name: str, dry_run: bool = True, *, strategy_cfg=None) -> None:
     """
     live（本番）を起動する関数（最小版・導線）。
     - 何をするか：API鍵の取得→ exchange adapter で疎通確認（未発注）
@@ -471,7 +475,7 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True) -> None:
                 # 次ステップで：ここにイベントループ＋戦略呼び出し＋TTL取消などを実装
             # 何をするか：ここから live のイベントループ（WS→板→戦略→発注／TTL取消／ガード）を回す
                 ob = OrderBook()  # 何をするか：ローカル板（戦略の入力）を用意
-            strat = _select_strategy(strategy_name, cfg)  # 何をするか：戦略に設定（cfg）を渡す
+            strat = _select_strategy(strategy_name, cfg, strategy_cfg=strategy_cfg)  # 何をするか：戦略に設定（cfg）を渡す
             live_orders: dict[str, dict] = {}  # 何をするか：受理ID→TTLなどのメタ情報を保持
             if not bool(getattr(cfg, "cancel_all_on_start", True)):  # 何をするか：起動時に全取消しない運用なら、残っている注文を監視にシード
                 _seed_live_orders_from_active(ex, live_orders)
@@ -560,7 +564,7 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True) -> None:
 
             _hb_write(hb_path, event="start", ts=_now_utc().isoformat(), product=product_code, strategy=strategy_name)  # 何をするか：起動を記録
             ob = OrderBook()  # 何をするか：ローカル板（戦略の入力）を用意
-            strat = _select_strategy(strategy_name, cfg)  # 何をするか：選択した戦略を設定(cfg)付きで組み立てる
+            strat = _select_strategy(strategy_name, cfg, strategy_cfg=strategy_cfg)  # 何をするか：選択した戦略を設定(cfg)付きで組み立てる
 
 
             for ev in _stream_with_reconnect(product_code, hb_path):  # 何をするか：WSが切れても自動再接続しながらイベントを処理

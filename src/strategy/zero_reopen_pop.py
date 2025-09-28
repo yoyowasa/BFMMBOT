@@ -3,7 +3,9 @@
 #   当たったら即IOCで+1tick利確して退出する“イベント駆動ワンショットMM”の本体実装。
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, List, Mapping, Optional
+
+
 
 # 何をするimportか：戦略の骨組み・板の読み取り・注文生成・時刻取得（すべて既存の共通層を利用）
 from src.strategy.base import StrategyBase
@@ -22,6 +24,37 @@ class ZeroReopenConfig:
     cooloff_ms: int = 250          # 連打禁止と毒性回避のための“息継ぎ”
     seen_zero_window_ms: int = 1000  # どれだけ“ゼロ直後”を有効とみなすか
 
+
+def zero_reopen_config_from(cfg: Any) -> ZeroReopenConfig | None:
+    """【関数】設定オブジェクトから zero_reopen_pop セクションを取り出し ZeroReopenConfig に変換する"""
+
+    if cfg is None:
+        return None
+
+    features = getattr(cfg, "features", None)
+    section: Any = None
+
+    if isinstance(features, Mapping):
+        section = features.get("zero_reopen_pop")
+    elif features is not None:
+        section = getattr(features, "zero_reopen_pop", None)
+        if section is None:
+            extra = getattr(features, "model_extra", None)
+            if isinstance(extra, Mapping):
+                section = extra.get("zero_reopen_pop")
+            elif hasattr(features, "__dict__") and isinstance(features.__dict__, dict):
+                section = features.__dict__.get("zero_reopen_pop")
+
+    if not section:
+        return None
+
+    if isinstance(section, ZeroReopenConfig):
+        return section
+
+    if isinstance(section, Mapping):
+        return ZeroReopenConfig(**section)
+
+    raise TypeError("zero_reopen_pop config must be a mapping or ZeroReopenConfig instance")
 
 class ZeroReopenPop(StrategyBase):
     """
