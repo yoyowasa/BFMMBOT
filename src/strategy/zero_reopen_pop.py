@@ -3,13 +3,14 @@
 #   当たったら即IOCで+1tick利確して退出する“イベント駆動ワンショットMM”の本体実装。
 
 from dataclasses import dataclass
-from typing import Any, List, Mapping, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Mapping, Optional
 
 # 何をするimportか：戦略の骨組み・板の読み取り・注文生成・時刻取得（すべて既存の共通層を利用）
 from src.strategy.base import StrategyBase
-from src.core.orderbook import OrderbookView  # best/中値/tick/スプレッド/健全性 health_ok() を提供
-from src.core.orders import Order, TIF        # Limit/IOC と TTL/タグを付けて発注する型
-from src.core.utils import now_ms             # クールダウンや“直後”判定に使うミリ秒時刻
+from src.core.orderbook import OrderBook  # best/中値/tick/スプレッド/健全性 health_ok() を提供
+from src.core.orders import Order        # Limit/IOC と TTL/タグを付けて発注する型
+from src.core.utils import now_ms        # クールダウンや“直後”判定に使うミリ秒時刻
 
 
 @dataclass
@@ -54,6 +55,7 @@ def zero_reopen_config_from(cfg: Any) -> ZeroReopenConfig | None:
 
     raise TypeError("zero_reopen_pop config must be a mapping or ZeroReopenConfig instance")
 
+
 class ZeroReopenPop(StrategyBase):
     """
     何をする戦略か：
@@ -63,6 +65,8 @@ class ZeroReopenPop(StrategyBase):
       - ガード（health_ok 等）が悪いときは何もしない
     """
 
+    name: str = "zero_reopen_pop"
+
     def __init__(self, *, cfg: Optional[ZeroReopenConfig] = None) -> None:
         # 何をする関数か：設定と内部状態（直近ゼロ時刻／直近アクション時刻）の初期化
         super().__init__()
@@ -70,101 +74,164 @@ class ZeroReopenPop(StrategyBase):
         self._last_spread_zero_ms: int = -10**9
         self._last_action_ms: int = -10**9
         self._lock_until_ms: int = -10**9  # 何をするか：同時に複数枚を出さない“発注ロック”の期限ms（TTL中は新規禁止）
-
+        self._entry_active: bool = False   # 何をするか：現在エントリー指値が生きているかを覚えて cancel_tag を制御する
+        self._entry_tag: str = "zero_reopen"
+        self._take_tag: str = "zero_reopen_take"
 
     # -------------------------
     # 内部ヘルパ（責務を明記）
     # -------------------------
 
-    def _mark_zero(self, ob: OrderbookView, now: int) -> None:
+    def _to_ms(self, now: datetime | int | float | None) -> int:
+        """【関数】datetime/整数/None を ms(int) に正規化"""
+        if isinstance(now, datetime):
+            return int(now.timestamp() * 1000)
+        if now is None:
+            return now_ms()
+        try:
+            return int(now)
+        except Exception:
+            return now_ms()
+
+    def _mark_zero(self, ob: OrderBook, now_ms: int) -> None:
         """【関数】ゼロ記録：spread==0 を見た“時刻”を記録して、のちほど“直後”判定に使う"""
         if ob.spread_ticks() == 0:
-            self._last_spread_zero_ms = now
+            self._last_spread_zero_ms = now_ms
 
-    def _is_reopen(self, ob: OrderbookView, now: int) -> bool:
+    def _is_reopen(self, ob: OrderBook, now_ms: int) -> bool:
         """【関数】再拡大判定：“直近ゼロあり かつ 現在は≥min_spread_tick”かどうか"""
-        seen_zero_recently = (now - self._last_spread_zero_ms) <= self.cfg.seen_zero_window_ms
+        seen_zero_recently = (now_ms - self._last_spread_zero_ms) <= self.cfg.seen_zero_window_ms
         return seen_zero_recently and (ob.spread_ticks() >= self.cfg.min_spread_tick)
 
-    def _pass_gates(self, ob: OrderbookView, now: int) -> bool:
+    def _pass_gates(self, ob: OrderBook, now_ms: int) -> bool:
         """【関数】安全ゲート：標準ガード（health_ok）・クールダウン・best存在チェックをまとめて判定"""
-        if not ob.health_ok():
+        health_check = getattr(ob, "health_ok", None)
+        if callable(health_check) and not health_check():
             return False
-        if (now - self._last_action_ms) < self.cfg.cooloff_ms:
+        if (now_ms - self._last_action_ms) < self.cfg.cooloff_ms:
             return False
-        if now < self._lock_until_ms:
+        if now_ms < self._lock_until_ms:
             return False  # 何をするか：まだTTL中＝前の注文が生きているので、新しい発注をロックして1枚運用を守る
 
-        if ob.best_bid() is None or ob.best_ask() is None:
+        bid_px = getattr(getattr(ob, "best_bid", None), "price", None)
+        ask_px = getattr(getattr(ob, "best_ask", None), "price", None)
+        if bid_px is None or ask_px is None:
             return False
         return True
 
-    def _choose_side(self, ob: OrderbookView) -> str:
+    def _choose_side(self, ob: OrderBook) -> str:
         """【関数】サイド決定：ミッドからのズレが大きい側（再拡大の外側）で“逆向きに1tick待つ”"""
-        mid = ob.mid_price()
-        bid = ob.best_bid()
-        ask = ob.best_ask()
+        bid_px = getattr(getattr(ob, "best_bid", None), "price", None)
+        ask_px = getattr(getattr(ob, "best_ask", None), "price", None)
+        if bid_px is None or ask_px is None:
+            return "buy"
+        mid = (bid_px + ask_px) / 2.0
         # ask−mid が大きい＝上に開いた ⇒ 戻りBUYを mid−1tick に置く
-        if (ask - mid) >= (mid - bid):
-            return "BUY"
+        if (ask_px - mid) >= (mid - bid_px):
+            return "buy"
         # それ以外＝下に開いた ⇒ 戻りSELLを mid＋1tick に置く
-        return "SELL"
+        return "sell"
 
-    def _build_entry(self, ob: OrderbookView, side: str) -> Order:
+    def _build_entry(self, ob: OrderBook, side: str) -> Dict[str, Any]:
         """【関数】エントリー生成：片面1発の指値（GTC+TTL・最小ロット・戦略タグ付）を作る"""
-        tick = ob.tick_size()
-        mid = ob.mid_price()
-        px = mid - tick if side == "BUY" else mid + tick
-        return Order.limit(
+        tick = float(getattr(ob, "tick", 1.0))
+        bid_px = getattr(getattr(ob, "best_bid", None), "price", None)
+        ask_px = getattr(getattr(ob, "best_ask", None), "price", None)
+        if bid_px is None or ask_px is None:
+            raise ValueError("best bid/ask required for entry order")
+        mid = (bid_px + ask_px) / 2.0
+        px = mid - tick if side == "buy" else mid + tick
+        order = Order(
             side=side,
             price=px,
             size=self.cfg.size_min,
-            tif=TIF.GTC,
+            tif="GTC",
             ttl_ms=self.cfg.ttl_ms,
-            tag="zero_reopen",
+            tag=self._entry_tag,
         )
+        return {"type": "place", "order": order}
 
-    def _build_take_profit(self, ob: OrderbookView, fill) -> Order:
-        """【関数】利確生成：fillを受けたら反対側に+1tickのIOCを即時に返す（秒速撤退）"""
-        tick = ob.tick_size()
-        if fill.side == "BUY":
-            return Order.limit(
-                side="SELL",
-                price=fill.price + tick,
-                size=fill.size,
-                tif=TIF.IOC,
-                ttl_ms=200,
-                tag="zero_reopen_take",
-            )
-        return Order.limit(
-            side="BUY",
-            price=fill.price - tick,
-            size=fill.size,
-            tif=TIF.IOC,
+    def _build_take_profit(self, ob: OrderBook, fill: Any) -> Dict[str, Any]:
+        """【関数】利確生成：fillを受けたら反対側に+1tickのIOCを即返す（秒速撤退）"""
+        tick = float(getattr(ob, "tick", 1.0))
+        fill_side = getattr(fill, "side", None)
+        fill_price = getattr(fill, "price", None)
+        fill_size = getattr(fill, "size", None)
+        if isinstance(fill, Mapping):
+            fill_side = fill_side or str(fill.get("side", "")).lower()
+            if fill_price is None:
+                fill_price = fill.get("price")
+            if fill_size is None:
+                fill_size = fill.get("size")
+            order_info = fill.get("order")
+            if fill_price is None and order_info is not None:
+                fill_price = getattr(order_info, "price", None)
+            if fill_size is None and order_info is not None:
+                fill_size = getattr(order_info, "size", None)
+        else:
+            if fill_side is not None:
+                fill_side = str(fill_side).lower()
+
+        if fill_price is None or fill_size is None:
+            raise ValueError("fill price/size required for take profit")
+
+        exit_side = "sell" if str(fill_side).lower() == "buy" else "buy"
+        exit_price = (float(fill_price) + tick) if exit_side == "sell" else (float(fill_price) - tick)
+        order = Order(
+            side=exit_side,
+            price=exit_price,
+            size=float(fill_size),
+            tif="IOC",
             ttl_ms=200,
-            tag="zero_reopen_take",
+            tag=self._take_tag,
         )
+        return {"type": "place", "order": order}
+
+    def _build_cancel(self) -> Dict[str, Any]:
+        """【関数】エントリーの戦略タグを一括取消するアクション"""
+        self._entry_active = False
+        self._lock_until_ms = -10**9
+        return {"type": "cancel_tag", "tag": self._entry_tag}
 
     # -------------------------
     # ランタイム・フック
     # -------------------------
 
-    def on_board(self, ob: OrderbookView) -> List[Order]:
-        """【関数】板イベント：ゼロを記録 → “直後の再拡大 & ゲート合格”なら片面1発だけ返す"""
-        now = now_ms()
-        self._mark_zero(ob, now)
-        if self._is_reopen(ob, now) and self._pass_gates(ob, now):
-            side = self._choose_side(ob)
-            order = self._build_entry(ob, side)
-            self._last_action_ms = now
-            self._lock_until_ms = now + self.cfg.ttl_ms  # 何をするか：このTTLの間は新規発注を禁止して“同時1枚だけ”を保証する
+    def evaluate(self, ob: OrderBook, now: datetime, cfg) -> List[Dict[str, Any]]:
+        """【関数】板イベント：ゼロを記録 → “直後の再拡大 & ゲート合格”ならアクションを返す"""
+        now_ms = self._to_ms(now)
+        actions: List[Dict[str, Any]] = []
 
-            return [order]
-        # ふだんは何もしない（Idle）
-        return []
+        self._mark_zero(ob, now_ms)
 
-    def on_fill(self, ob: OrderbookView, my_fill) -> List[Order]:
+        if self._entry_active and (now_ms >= self._lock_until_ms or not self._is_reopen(ob, now_ms)):
+            actions.append(self._build_cancel())
+
+        if self._is_reopen(ob, now_ms) and self._pass_gates(ob, now_ms):
+            try:
+                side = self._choose_side(ob)
+                action = self._build_entry(ob, side)
+            except ValueError:
+                return actions
+            actions.append(action)
+            self._last_action_ms = now_ms
+            self._lock_until_ms = now_ms + self.cfg.ttl_ms
+            self._entry_active = True
+
+        return actions
+
+    def on_board(self, ob: OrderBook) -> List[Order]:
+        """【関数】後方互換：旧IF（List[Order]）向けに place アクションだけを返す"""
+        actions = self.evaluate(ob, datetime.now(timezone.utc), None)
+        return [a["order"] for a in actions if a.get("type") == "place" and "order" in a]
+
+    def on_fill(self, ob: OrderBook, my_fill: Any) -> List[Dict[str, Any]]:
         """【関数】約定イベント：+1tickのIOC利確を即返して“秒速で退出”する"""
-        self._lock_until_ms = now_ms() - 1  # 何をするか：約定で用件完了→ロックを即解除して次のチャンスを待てるようにする
+        self._entry_active = False
+        self._lock_until_ms = -10**9
 
-        return [self._build_take_profit(ob, my_fill)]
+        try:
+            action = self._build_take_profit(ob, my_fill)
+        except ValueError:
+            return []
+        return [action]
