@@ -21,6 +21,7 @@ from src.core.analytics import DecisionLog  # 【関数】意思決定ログ（P
 from src.strategy.stall_then_strike import StallThenStrike  # #1 静止→一撃（ON）:contentReference[oaicite:7]{index=7}
 from src.strategy.cancel_add_gate import CancelAddGate  # #2 キャンセル比ゲート（ON）:contentReference[oaicite:8]{index=8}
 from src.strategy.age_microprice import AgeMicroprice  # #3 エイジ×MP
+from src.strategy.zero_reopen_pop import ZeroReopenPop  # ゼロ→再拡大“一拍”だけ片面+即IOC利確
 
 def _parse_iso(ts: str) -> datetime:
     """【関数】ISO→datetime（'Z'も+00:00に正規化）"""
@@ -53,6 +54,8 @@ class PaperEngine:
             self.strat = CancelAddGate()
         elif strategy_name == "age_microprice":
             self.strat = AgeMicroprice()
+        elif strategy_name == "zero_reopen_pop":
+            self.strat = ZeroReopenPop()
         else:
             self.strat = StallThenStrike()
 
