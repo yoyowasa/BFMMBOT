@@ -5,6 +5,8 @@
 from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional
 
+
+
 # 何をするimportか：戦略の骨組み・板の読み取り・注文生成・時刻取得（すべて既存の共通層を利用）
 from src.strategy.base import StrategyBase
 from src.core.orderbook import OrderbookView  # best/中値/tick/スプレッド/健全性 health_ok() を提供
@@ -53,7 +55,6 @@ def zero_reopen_config_from(cfg: Any) -> ZeroReopenConfig | None:
         return ZeroReopenConfig(**section)
 
     raise TypeError("zero_reopen_pop config must be a mapping or ZeroReopenConfig instance")
-
 
 class ZeroReopenPop(StrategyBase):
     """
