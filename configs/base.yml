@@ -40,6 +40,12 @@ features:  # 戦略のしきい値（#1/#2 の主材料）
   tiny_prints_N: 20        # Tiny-Prints集計N（OFFの初期値）
   tiny_prints_minCount: 14 # Tiny-Prints発火閾値（OFFの初期値）
   eta_t_window_ms: 800     # Queue ETAの窓（OFFの初期値）
+  zero_reopen_pop:  # 何をする設定か：ゼロ→再拡大の“一拍だけ”出す戦略のパラメータ
+    min_spread_tick: 1         # 何をする設定か：再拡大の下限tick（1以上で発注可）
+    ttl_ms: 800                # 何をする設定か：指値の寿命ms（置きっぱなし防止）
+    size_min: 0.001            # 何をする設定か：最小ロット（取引所の最小単位に合わせる）
+    cooloff_ms: 250            # 何をする設定か：連打を防ぐ冷却時間ms
+    seen_zero_window_ms: 1000  # 何をする設定か：ゼロを“直後”とみなす時間窓ms
 
 strategies:  # まずは2本だけON（他はOFF）
   - stall_then_strike  # #1 静止→一撃

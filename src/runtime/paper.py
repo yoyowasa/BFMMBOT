@@ -133,16 +133,16 @@ def _round_to_tick(px: float, tick: float) -> float:
         return float(px)
     return float(round(float(px) / float(tick)) * float(tick))
 
-def _select_strategy(strategy_name: str, cfg):
+def _select_strategy(strategy_name: str, cfg, strategy_cfg=None):
     """何をする関数か：live側の選択ロジックを再利用して戦略インスタンスを生成する"""
     # 何をするか：関数内だけで使う遅延importで依存ループを避ける
     from src.runtime.live import _select_strategy as _select_strategy_live
-    return _select_strategy_live(strategy_name, cfg)
+    return _select_strategy_live(strategy_name, cfg, strategy_cfg=strategy_cfg)
 
 
 # ---- メイン：疑似発注ランナー ----
 
-def run_paper(cfg, strategy_name: str):
+def run_paper(cfg, strategy_name: str, *, strategy_cfg=None):
     """何をする関数か：疑似発注（place/ fill / cancel）を心拍に記録しながら回す最小ランナー"""
     product = getattr(cfg, "product_code", "FX_BTC_JPY")
     tick = float(getattr(cfg, "tick_size", 1))
@@ -161,7 +161,7 @@ def run_paper(cfg, strategy_name: str):
 
 
     ob = OrderBook()  # 何をするか：ローカル板
-    strat = _select_strategy(strategy_name, cfg)  # 何をするか：戦略インスタンス
+    strat = _select_strategy(strategy_name, cfg, strategy_cfg=strategy_cfg)  # 何をするか：戦略インスタンス
     start_at = _now_utc()
     canary_sec = int(getattr(cfg, "dry_run_max_sec", 3600))  # 何をするか：安全のため紙運転も1時間で停止（必要に応じて調整）
 
