@@ -18,6 +18,7 @@ class ZeroReopenConfig:
     """何をする設定か：最小限の外だしパラメータ（YAML上書き前提）"""
 
     min_spread_tick: int = 1       # 再拡大の下限（1tick以上に開いていること）
+    max_spread_tick: int = 2       # 何をする設定か：再拡大が広すぎる（毒性高い）ときは出さない上限tick
     ttl_ms: int = 800              # 指値の寿命（置きっぱなし防止・秒速撤退のため短め）
     size_min: float = 0.001        # 最小ロット（取引所の最小単位に合わせる）
     cooloff_ms: int = 250          # 連打禁止と毒性回避のための“息継ぎ”
@@ -101,7 +102,7 @@ class ZeroReopenPop(StrategyBase):
     def _is_reopen(self, ob: OrderBook, now_ms: int) -> bool:
         """【関数】再拡大判定：“直近ゼロあり かつ 現在は≥min_spread_tick”かどうか"""
         seen_zero_recently = (now_ms - self._last_spread_zero_ms) <= self.cfg.seen_zero_window_ms
-        return seen_zero_recently and (ob.spread_ticks() >= self.cfg.min_spread_tick)
+        return seen_zero_recently and (self.cfg.min_spread_tick <= ob.spread_ticks() <= self.cfg.max_spread_tick)  # 何をするか：1〜上限tickの“ちょうど良い開き”だけ許可
 
     def _pass_gates(self, ob: OrderBook, now_ms: int) -> bool:
         """【関数】安全ゲート：標準ガード（health_ok）・クールダウン・best存在チェックをまとめて判定"""
