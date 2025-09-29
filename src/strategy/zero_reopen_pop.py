@@ -81,6 +81,7 @@ class ZeroReopenPop(StrategyBase):
         self.cfg = cfg or ZeroReopenConfig()
         self._last_spread_zero_ms: int = -10**9
         self._last_action_ms: int = -10**9
+        self._fired_on_this_zero: bool = False  # 何をするか：同一“ゼロ”イベントにつき発注は1回だけにするフラグ
         self._lock_until_ms: int = -10**9  # 何をするか：同時に複数枚を出さない“発注ロック”の期限ms（TTL中は新規禁止）
         self._tp_pending: bool = False        # 何をするか：利確IOC待ち（まだ手仕舞えていない）かどうか
         self._tp_deadline_ms: int = -10**9    # 何をするか：この時刻を過ぎたら“フラットIOC”を出す締切
@@ -111,11 +112,12 @@ class ZeroReopenPop(StrategyBase):
         """【関数】ゼロ記録：spread==0 を見た“時刻”を記録して、のちほど“直後”判定に使う"""
         if ob.spread_ticks() == 0:
             self._last_spread_zero_ms = now_ms
+            self._fired_on_this_zero = False  # 何をするか：新しい“ゼロ”を見たので再発注可にリセット
 
     def _is_reopen(self, ob: OrderBook, now_ms: int) -> bool:
         """【関数】再拡大判定：“直近ゼロあり かつ 現在は≥min_spread_tick”かどうか"""
         seen_zero_recently = (now_ms - self._last_spread_zero_ms) <= self.cfg.seen_zero_window_ms
-        return seen_zero_recently and (self.cfg.min_spread_tick <= ob.spread_ticks() <= self.cfg.max_spread_tick)  # 何をするか：1〜上限tickの“ちょうど良い開き”だけ許可
+        return seen_zero_recently and (self.cfg.min_spread_tick <= ob.spread_ticks() <= self.cfg.max_spread_tick) and (not self._fired_on_this_zero)  # 何をするか：同一ゼロでは再発注しない
 
     def _pass_gates(self, ob: OrderBook, now_ms: int) -> bool:
         """【関数】安全ゲート：標準ガード（health_ok）・クールダウン・best存在チェックをまとめて判定"""
@@ -283,6 +285,7 @@ class ZeroReopenPop(StrategyBase):
             self._last_action_ms = now_ms
             self._lock_until_ms = now_ms + self.cfg.ttl_ms
             self._entry_active = True
+            self._fired_on_this_zero = True  # 何をするか：この“ゼロ”での発注を消費（次は新しいゼロが来るまで出さない）
 
         return actions
 
@@ -309,7 +312,6 @@ class ZeroReopenPop(StrategyBase):
             logger.info(
                 "zero_reopen closed_by=%s side=%s px=%s", tag_str, getattr(my_fill, "side", None), getattr(my_fill, "price", None)
             )  # 何をするか：手仕舞い完了を記録
-
             return []
 
         self._entry_active = False
