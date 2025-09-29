@@ -28,7 +28,6 @@ class ZeroReopenConfig:
     fee_maker_bp: float = 0.0      # 何をする設定か：メーカー手数料（bp, 例 0.0〜-1.0）。1bp=0.01%
     fee_taker_bp: float = 0.0      # 何をする設定か：テイカー手数料（bp, 例 10.0 は0.10%）
     edge_bp_min: float = 0.0       # 何をする設定か：手数料控除後に最低これだけの余裕(bps)がなければ発注しない
-
     flat_timeout_ms: int = 600         # 何をする設定か：利確IOCが通らない時の“時間でフラット”の締切ms
     ttl_ms: int = 800              # 指値の寿命（置きっぱなし防止・秒速撤退のため短め）
     size_min: float = 0.001        # 最小ロット（取引所の最小単位に合わせる）
@@ -149,12 +148,10 @@ class ZeroReopenPop(StrategyBase):
         # 記録を更新（次回の速度計算のため）
         self._last_mid_px = mid
         self._last_mid_ts_ms = now_ms
-
         # 何をするか：1tick利確の“期待エッジ（bps）”を計算し、手数料合計＋余裕未満なら危険なので発注しない
         edge_est_bp = (tick / max(mid, 1e-9)) * 10000.0 - (self.cfg.fee_maker_bp + self.cfg.fee_taker_bp)
         if edge_est_bp < self.cfg.edge_bp_min:
             return False
-
         return True
 
     def _choose_side(self, ob: OrderBook) -> str:
