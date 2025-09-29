@@ -21,6 +21,7 @@ class ZeroReopenConfig:
     max_spread_tick: int = 2       # 何をする設定か：再拡大が広すぎる（毒性高い）ときは出さない上限tick
     max_speed_ticks_per_s: float = 12.0  # 何をする設定か：midの速さ（tick/秒）がこの上限を超えたら発注しない
     flat_timeout_ms: int = 600      # 何をする設定か：利確IOCが通らない時、ここまで待って“フラットIOC”で強制手仕舞いする
+
     ttl_ms: int = 800              # 指値の寿命（置きっぱなし防止・秒速撤退のため短め）
     size_min: float = 0.001        # 最小ロット（取引所の最小単位に合わせる）
     cooloff_ms: int = 250          # 連打禁止と毒性回避のための“息継ぎ”
