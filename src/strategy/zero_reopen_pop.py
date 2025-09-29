@@ -12,6 +12,11 @@ from src.core.orderbook import OrderBook  # best/中値/tick/スプレッド/健
 from src.core.orders import Order        # Limit/IOC と TTL/タグを付けて発注する型
 from src.core.utils import now_ms        # クールダウンや“直後”判定に使うミリ秒時刻
 
+import logging  # 何をするか：この戦略の意思決定ログを出すために使う
+
+
+logger = logging.getLogger(__name__)  # 何をするか：戦略専用のロガーを用意（情報/デバッグを出す）
+
 
 @dataclass
 class ZeroReopenConfig:
@@ -301,6 +306,10 @@ class ZeroReopenPop(StrategyBase):
             self._open_size = 0.0
             self._entry_active = False
             self._lock_until_ms = now - 1
+            logger.info(
+                "zero_reopen closed_by=%s side=%s px=%s", tag_str, getattr(my_fill, "side", None), getattr(my_fill, "price", None)
+            )  # 何をするか：手仕舞い完了を記録
+
             return []
 
         self._entry_active = False
@@ -339,4 +348,9 @@ class ZeroReopenPop(StrategyBase):
                 self._open_side = None
                 self._open_size = 0.0
             return []
+        order = action.get("order") if isinstance(action, Mapping) else None
+        if order is not None:
+            logger.info(
+                "zero_reopen take_send side=%s px=%s", str(getattr(order, "side", "")).upper(), getattr(order, "price", None)
+            )  # 何をするか：利確IOCの送信を記録
         return [action]
