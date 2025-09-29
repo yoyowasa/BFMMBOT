@@ -19,6 +19,7 @@ class ZeroReopenConfig:
 
     min_spread_tick: int = 1       # 再拡大の下限（1tick以上に開いていること）
     max_spread_tick: int = 2       # 何をする設定か：再拡大が広すぎる（毒性高い）ときは出さない上限tick
+    max_speed_ticks_per_s: float = 12.0  # 何をする設定か：midの速さ（tick/秒）がこの上限を超えたら発注しない
     ttl_ms: int = 800              # 指値の寿命（置きっぱなし防止・秒速撤退のため短め）
     size_min: float = 0.001        # 最小ロット（取引所の最小単位に合わせる）
     cooloff_ms: int = 250          # 連打禁止と毒性回避のための“息継ぎ”
@@ -75,6 +76,8 @@ class ZeroReopenPop(StrategyBase):
         self._last_spread_zero_ms: int = -10**9
         self._last_action_ms: int = -10**9
         self._lock_until_ms: int = -10**9  # 何をするか：同時に複数枚を出さない“発注ロック”の期限ms（TTL中は新規禁止）
+        self._last_mid_px: float = 0.0       # 何をするか：前回のmid価格を記録して速さ（速度）を測る
+        self._last_mid_ts_ms: int = -10**9   # 何をするか：前回midの記録時刻（ms）
         self._entry_active: bool = False   # 何をするか：現在エントリー指値が生きているかを覚えて cancel_tag を制御する
         self._entry_tag: str = "zero_reopen"
         self._take_tag: str = "zero_reopen_take"
@@ -118,6 +121,18 @@ class ZeroReopenPop(StrategyBase):
         ask_px = getattr(getattr(ob, "best_ask", None), "price", None)
         if bid_px is None or ask_px is None:
             return False
+        # 何をするか：midの“速さ”（tick/秒）を計算し、上限を超えると危険なので発注を見送る
+        mid = ob.mid_price()
+        tick = ob.tick_size()
+        if self._last_mid_ts_ms > 0:
+            dt_ms = now_ms - self._last_mid_ts_ms
+            if dt_ms > 0:
+                speed_ticks_per_s = abs(mid - self._last_mid_px) / tick * (1000.0 / dt_ms)
+                if speed_ticks_per_s > self.cfg.max_speed_ticks_per_s:
+                    return False  # 速すぎる＝トレンド急進中と判断し、今回は出さない
+        # 記録を更新（次回の速度計算のため）
+        self._last_mid_px = mid
+        self._last_mid_ts_ms = now_ms
         return True
 
     def _choose_side(self, ob: OrderBook) -> str:
