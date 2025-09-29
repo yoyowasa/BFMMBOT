@@ -12,6 +12,11 @@ from src.core.orderbook import OrderBook  # best/中値/tick/スプレッド/健
 from src.core.orders import Order        # Limit/IOC と TTL/タグを付けて発注する型
 from src.core.utils import now_ms        # クールダウンや“直後”判定に使うミリ秒時刻
 
+import logging  # 何をするか：この戦略の意思決定ログを出すために使う
+
+
+logger = logging.getLogger(__name__)  # 何をするか：戦略専用のロガーを用意（情報/デバッグを出す）
+
 
 @dataclass
 class ZeroReopenConfig:
@@ -19,6 +24,8 @@ class ZeroReopenConfig:
 
     min_spread_tick: int = 1       # 再拡大の下限（1tick以上に開いていること）
     max_spread_tick: int = 2       # 何をする設定か：再拡大が広すぎる（毒性高い）ときは出さない上限tick
+    max_speed_ticks_per_s: float = 12.0  # 何をする設定か：midの速さ（tick/秒）がこの上限を超えたら発注しない
+    flat_timeout_ms: int = 600         # 何をする設定か：利確IOCが通らない時の“時間でフラット”の締切ms
     ttl_ms: int = 800              # 指値の寿命（置きっぱなし防止・秒速撤退のため短め）
     size_min: float = 0.001        # 最小ロット（取引所の最小単位に合わせる）
     cooloff_ms: int = 250          # 連打禁止と毒性回避のための“息継ぎ”
@@ -75,6 +82,12 @@ class ZeroReopenPop(StrategyBase):
         self._last_spread_zero_ms: int = -10**9
         self._last_action_ms: int = -10**9
         self._lock_until_ms: int = -10**9  # 何をするか：同時に複数枚を出さない“発注ロック”の期限ms（TTL中は新規禁止）
+        self._tp_pending: bool = False        # 何をするか：利確IOC待ち（まだ手仕舞えていない）かどうか
+        self._tp_deadline_ms: int = -10**9    # 何をするか：この時刻を過ぎたら“フラットIOC”を出す締切
+        self._open_side: Optional[str] = None # 何をするか：保有している方向（BUY/SELL）
+        self._open_size: float = 0.0          # 何をするか：保有しているサイズ
+        self._last_mid_px: float = 0.0       # 何をするか：前回のmid価格を記録して速さ（速度）を測る
+        self._last_mid_ts_ms: int = -10**9   # 何をするか：前回midの記録時刻（ms）
         self._entry_active: bool = False   # 何をするか：現在エントリー指値が生きているかを覚えて cancel_tag を制御する
         self._entry_tag: str = "zero_reopen"
         self._take_tag: str = "zero_reopen_take"
@@ -118,6 +131,18 @@ class ZeroReopenPop(StrategyBase):
         ask_px = getattr(getattr(ob, "best_ask", None), "price", None)
         if bid_px is None or ask_px is None:
             return False
+        # 何をするか：midの“速さ”（tick/秒）を計算し、上限を超えると危険なので発注を見送る
+        mid = ob.mid_price()
+        tick = ob.tick_size()
+        if self._last_mid_ts_ms > 0:
+            dt_ms = now_ms - self._last_mid_ts_ms
+            if dt_ms > 0:
+                speed_ticks_per_s = abs(mid - self._last_mid_px) / tick * (1000.0 / dt_ms)
+                if speed_ticks_per_s > self.cfg.max_speed_ticks_per_s:
+                    return False  # 速すぎる＝トレンド急進中と判断し、今回は出さない
+        # 記録を更新（次回の速度計算のため）
+        self._last_mid_px = mid
+        self._last_mid_ts_ms = now_ms
         return True
 
     def _choose_side(self, ob: OrderBook) -> str:
@@ -216,6 +241,35 @@ class ZeroReopenPop(StrategyBase):
 
         self._mark_zero(ob, now_ms)
 
+        if self._tp_pending:
+            if now_ms >= self._tp_deadline_ms:
+                best_bid_fn = getattr(ob, "best_bid", None)
+                best_ask_fn = getattr(ob, "best_ask", None)
+                best_bid = best_bid_fn() if callable(best_bid_fn) else best_bid_fn
+                best_ask = best_ask_fn() if callable(best_ask_fn) else best_ask_fn
+                bid_px = getattr(best_bid, "price", best_bid)
+                ask_px = getattr(best_ask, "price", best_ask)
+                if (
+                    bid_px is not None
+                    and ask_px is not None
+                    and self._open_side in {"BUY", "SELL"}
+                    and self._open_size > 0.0
+                ):
+                    order_side = "sell" if self._open_side == "BUY" else "buy"
+                    order_price = float(bid_px) if order_side == "sell" else float(ask_px)
+                    order = Order(
+                        side=order_side,
+                        price=order_price,
+                        size=self._open_size,
+                        tif="IOC",
+                        ttl_ms=200,
+                        tag="zero_reopen_flat",
+                    )
+                    actions.append({"type": "place", "order": order})
+                    self._tp_deadline_ms = now_ms + self.cfg.flat_timeout_ms
+                    return actions
+            return actions
+
         if self._entry_active and (now_ms >= self._lock_until_ms or not self._is_reopen(ob, now_ms)):
             actions.append(self._build_cancel())
 
@@ -239,11 +293,63 @@ class ZeroReopenPop(StrategyBase):
 
     def on_fill(self, ob: OrderBook, my_fill: Any) -> List[Dict[str, Any]]:
         """【関数】約定イベント：+1tickのIOC利確を即返して“秒速で退出”する"""
+        now = now_ms()  # 何をするか：フラット締切の計算に使う
+        tag = getattr(my_fill, "tag", "")
+        if tag is None:
+            tag = ""
+        tag_str = str(tag)
+
+        if tag_str in ("zero_reopen_take", "zero_reopen_flat"):
+            # 何をするか：利確IOC or フラットIOCが約定した＝ポジション解消、ロック解除
+            self._tp_pending = False
+            self._open_side = None
+            self._open_size = 0.0
+            self._entry_active = False
+            self._lock_until_ms = now - 1
+            logger.info(
+                "zero_reopen closed_by=%s side=%s px=%s", tag_str, getattr(my_fill, "side", None), getattr(my_fill, "price", None)
+            )  # 何をするか：手仕舞い完了を記録
+            return []
+
         self._entry_active = False
         self._lock_until_ms = -10**9
+
+        # 何をするか：エントリー約定を受けたので、利確IOCの“締切”をセットして待機フラグON
+        fill_side = getattr(my_fill, "side", None)
+        fill_size = getattr(my_fill, "size", None)
+        if isinstance(my_fill, Mapping):
+            if fill_side is None:
+                fill_side = my_fill.get("side")
+            if fill_size is None:
+                fill_size = my_fill.get("size")
+            order_info = my_fill.get("order")
+            if fill_side is None and order_info is not None:
+                fill_side = getattr(order_info, "side", None)
+            if fill_size is None and order_info is not None:
+                fill_size = getattr(order_info, "size", None)
+        side_str = str(fill_side).upper() if fill_side is not None else None
+        size_val = float(fill_size) if fill_size is not None else 0.0
+        self._open_side = side_str if side_str else None
+        self._open_size = size_val if size_val > 0.0 else 0.0
+        if self._open_side is not None and self._open_size > 0.0:
+            self._tp_pending = True
+            self._tp_deadline_ms = now + self.cfg.flat_timeout_ms
+        else:
+            self._tp_pending = False
+            self._open_side = None
+            self._open_size = 0.0
 
         try:
             action = self._build_take_profit(ob, my_fill)
         except ValueError:
+            if self._tp_pending:
+                self._tp_pending = False
+                self._open_side = None
+                self._open_size = 0.0
             return []
+        order = action.get("order") if isinstance(action, Mapping) else None
+        if order is not None:
+            logger.info(
+                "zero_reopen take_send side=%s px=%s", str(getattr(order, "side", "")).upper(), getattr(order, "price", None)
+            )  # 何をするか：利確IOCの送信を記録
         return [action]
