@@ -309,6 +309,7 @@ class ZeroReopenPop(StrategyBase):
             logger.info(
                 "zero_reopen closed_by=%s side=%s px=%s", tag_str, getattr(my_fill, "side", None), getattr(my_fill, "price", None)
             )  # 何をするか：手仕舞い完了を記録
+
             return []
 
         self._entry_active = False
