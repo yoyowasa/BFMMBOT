@@ -216,12 +216,13 @@ class ZeroReopenPop(StrategyBase):
 
     def _build_entry(self, ob: OrderBook, side: str) -> Dict[str, Any]:
         """【関数】エントリー生成：片面1発の指値（GTC+TTL・最小ロット・戦略タグ付）を作る"""
-        tick = float(getattr(ob, "tick", 1.0))
         bid_px, ask_px = self._get_best_prices(ob)
         if bid_px is None or ask_px is None:
             raise ValueError("best bid/ask required for entry order")
-        mid = (bid_px + ask_px) / 2.0
-        px = mid - tick if side == "buy" else mid + tick
+        best_bid = bid_px  # 何をするか：BUY時のメイク価格（tick整合済みのbest）
+        best_ask = ask_px  # 何をするか：SELL時のメイク価格（tick整合済みのbest）
+        side_str = str(side).upper()
+        px = best_bid if side_str == "BUY" else best_ask  # 何をするか：BUY→best_bid / SELL→best_ask に統一（ズレ防止）
         order = Order(
             side=side,
             price=px,
