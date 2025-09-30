@@ -33,6 +33,7 @@ class ZeroReopenConfig:
     size_min: float = 0.001        # 最小ロット（取引所の最小単位に合わせる）
     cooloff_ms: int = 250          # 連打禁止と毒性回避のための“息継ぎ”
     seen_zero_window_ms: int = 1000  # どれだけ“ゼロ直後”を有効とみなすか
+    loss_cooloff_ms: int = 1500   # 何をする設定か：非常口フラット後に“お休み”する時間ms（連打で再被弾を防ぐ）
 
 
 def zero_reopen_config_from(cfg: Any) -> ZeroReopenConfig | None:
@@ -86,6 +87,7 @@ class ZeroReopenPop(StrategyBase):
         self._last_action_ms: int = -10**9
         self._fired_on_this_zero: bool = False  # 何をするか：同一“ゼロ”イベントにつき発注は1回だけにするフラグ
         self._lock_until_ms: int = -10**9  # 何をするか：同時に複数枚を出さない“発注ロック”の期限ms（TTL中は新規禁止）
+        self._penalty_until_ms: int = -10**9  # 何をするか：罰ゲーム中はここまで新規発注を禁止（ロス・クールオフの期限ms）
         self._tp_pending: bool = False        # 何をするか：利確IOC待ち（まだ手仕舞えていない）かどうか
         self._tp_deadline_ms: int = -10**9    # 何をするか：この時刻を過ぎたら“フラットIOC”を出す締切
         self._open_side: Optional[str] = None # 何をするか：保有している方向（BUY/SELL）
@@ -169,6 +171,9 @@ class ZeroReopenPop(StrategyBase):
             return False  # 何をするか：まだ手仕舞い（利確/フラット）待ちの在庫があるので新規は出さない
         if now_ms < self._lock_until_ms:
             return False  # 何をするか：まだTTL中＝前の注文が生きているので、新しい発注をロックして1枚運用を守る
+        if now_ms < self._penalty_until_ms:
+            self._log_decision("skip_penalty", until=self._penalty_until_ms, now=now_ms)  # 何をするか：“罰ゲーム中なので見送り”を記録
+            return False  # 何をするか：ロス・クールオフ中は新規発注しない
 
         bid_px, ask_px = self._get_best_prices(ob)
         if bid_px is None or ask_px is None:
@@ -353,6 +358,8 @@ class ZeroReopenPop(StrategyBase):
             self._open_size = 0.0
             self._entry_active = False
             self._lock_until_ms = now - 1
+            if tag_str == "zero_reopen_flat":
+                self._penalty_until_ms = now + self.cfg.loss_cooloff_ms  # 何をするか：非常口で逃げたら“お休み時間”をセット
             logger.info(
                 "zero_reopen closed_by=%s side=%s px=%s", tag_str, getattr(my_fill, "side", None), getattr(my_fill, "price", None)
             )  # 何をするか：手仕舞い完了を記録
