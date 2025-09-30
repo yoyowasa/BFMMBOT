@@ -100,6 +100,34 @@ class ZeroReopenPop(StrategyBase):
     # 内部ヘルパ（責務を明記）
     # -------------------------
 
+    def _get_best_prices(self, ob: OrderBook) -> tuple[float | None, float | None]:
+        """【関数】best bid/ask を callable/属性/価格オブジェクトから float に正規化して返す"""
+
+        def _extract(value: Any) -> float | None:
+            if callable(value):
+                try:
+                    value = value()
+                except Exception:
+                    return None
+            if value is None:
+                return None
+            price = getattr(value, "price", value)
+            if callable(price):
+                try:
+                    price = price()
+                except Exception:
+                    return None
+            if price is None:
+                return None
+            try:
+                return float(price)
+            except (TypeError, ValueError):
+                return None
+
+        bid_px = _extract(getattr(ob, "best_bid", None))
+        ask_px = _extract(getattr(ob, "best_ask", None))
+        return bid_px, ask_px
+
     def _to_ms(self, now: datetime | int | float | None) -> int:
         """【関数】datetime/整数/None を ms(int) に正規化"""
         if isinstance(now, datetime):
@@ -132,8 +160,7 @@ class ZeroReopenPop(StrategyBase):
         if now_ms < self._lock_until_ms:
             return False  # 何をするか：まだTTL中＝前の注文が生きているので、新しい発注をロックして1枚運用を守る
 
-        bid_px = getattr(getattr(ob, "best_bid", None), "price", None)
-        ask_px = getattr(getattr(ob, "best_ask", None), "price", None)
+        bid_px, ask_px = self._get_best_prices(ob)
         if bid_px is None or ask_px is None:
             return False
         # 何をするか：midの“速さ”（tick/秒）を計算し、上限を超えると危険なので発注を見送る
@@ -156,8 +183,7 @@ class ZeroReopenPop(StrategyBase):
 
     def _choose_side(self, ob: OrderBook) -> str:
         """【関数】サイド決定：ミッドからのズレが大きい側（再拡大の外側）で“逆向きに1tick待つ”"""
-        bid_px = getattr(getattr(ob, "best_bid", None), "price", None)
-        ask_px = getattr(getattr(ob, "best_ask", None), "price", None)
+        bid_px, ask_px = self._get_best_prices(ob)
         if bid_px is None or ask_px is None:
             return "buy"
 
@@ -181,8 +207,7 @@ class ZeroReopenPop(StrategyBase):
     def _build_entry(self, ob: OrderBook, side: str) -> Dict[str, Any]:
         """【関数】エントリー生成：片面1発の指値（GTC+TTL・最小ロット・戦略タグ付）を作る"""
         tick = float(getattr(ob, "tick", 1.0))
-        bid_px = getattr(getattr(ob, "best_bid", None), "price", None)
-        ask_px = getattr(getattr(ob, "best_ask", None), "price", None)
+        bid_px, ask_px = self._get_best_prices(ob)
         if bid_px is None or ask_px is None:
             raise ValueError("best bid/ask required for entry order")
         mid = (bid_px + ask_px) / 2.0
@@ -252,12 +277,7 @@ class ZeroReopenPop(StrategyBase):
 
         if self._tp_pending:
             if now_ms >= self._tp_deadline_ms:
-                best_bid_fn = getattr(ob, "best_bid", None)
-                best_ask_fn = getattr(ob, "best_ask", None)
-                best_bid = best_bid_fn() if callable(best_bid_fn) else best_bid_fn
-                best_ask = best_ask_fn() if callable(best_ask_fn) else best_ask_fn
-                bid_px = getattr(best_bid, "price", best_bid)
-                ask_px = getattr(best_ask, "price", best_ask)
+                bid_px, ask_px = self._get_best_prices(ob)
                 if (
                     bid_px is not None
                     and ask_px is not None
