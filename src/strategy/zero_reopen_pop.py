@@ -33,6 +33,7 @@ class ZeroReopenConfig:
     size_min: float = 0.001        # 最小ロット（取引所の最小単位に合わせる）
     cooloff_ms: int = 250          # 連打禁止と毒性回避のための“息継ぎ”
     seen_zero_window_ms: int = 1000  # どれだけ“ゼロ直後”を有効とみなすか
+    loss_cooloff_ms: int = 1500   # 何をする設定か：非常口フラット後に“お休み”する時間ms（連打で再被弾を防ぐ）
 
 
 def zero_reopen_config_from(cfg: Any) -> ZeroReopenConfig | None:
@@ -86,6 +87,7 @@ class ZeroReopenPop(StrategyBase):
         self._last_action_ms: int = -10**9
         self._fired_on_this_zero: bool = False  # 何をするか：同一“ゼロ”イベントにつき発注は1回だけにするフラグ
         self._lock_until_ms: int = -10**9  # 何をするか：同時に複数枚を出さない“発注ロック”の期限ms（TTL中は新規禁止）
+        self._penalty_until_ms: int = -10**9  # 何をするか：罰ゲーム中はここまで新規発注を禁止（ロス・クールオフの期限ms）
         self._tp_pending: bool = False        # 何をするか：利確IOC待ち（まだ手仕舞えていない）かどうか
         self._tp_deadline_ms: int = -10**9    # 何をするか：この時刻を過ぎたら“フラットIOC”を出す締切
         self._open_side: Optional[str] = None # 何をするか：保有している方向（BUY/SELL）
@@ -99,6 +101,14 @@ class ZeroReopenPop(StrategyBase):
     # -------------------------
     # 内部ヘルパ（責務を明記）
     # -------------------------
+
+    def _log_decision(self, reason: str, **fields) -> None:
+        """【関数】意思決定ログ：何をするか：判断理由と主要パラメータを1行で記録する"""
+        try:
+            payload = " ".join(f"{k}={v}" for k, v in fields.items())
+            logger.info("zr_decision reason=%s %s", reason, payload)
+        except Exception:
+            logger.exception("zr_decision_log_error")
 
     def _get_best_prices(self, ob: OrderBook) -> tuple[float | None, float | None]:
         """【関数】best bid/ask を callable/属性/価格オブジェクトから float に正規化して返す"""
@@ -157,8 +167,13 @@ class ZeroReopenPop(StrategyBase):
             return False
         if (now_ms - self._last_action_ms) < self.cfg.cooloff_ms:
             return False
+        if self._tp_pending:
+            return False  # 何をするか：まだ手仕舞い（利確/フラット）待ちの在庫があるので新規は出さない
         if now_ms < self._lock_until_ms:
             return False  # 何をするか：まだTTL中＝前の注文が生きているので、新しい発注をロックして1枚運用を守る
+        if now_ms < self._penalty_until_ms:
+            self._log_decision("skip_penalty", until=self._penalty_until_ms, now=now_ms)  # 何をするか：“罰ゲーム中なので見送り”を記録
+            return False  # 何をするか：ロス・クールオフ中は新規発注しない
 
         bid_px, ask_px = self._get_best_prices(ob)
         if bid_px is None or ask_px is None:
@@ -171,6 +186,7 @@ class ZeroReopenPop(StrategyBase):
             if dt_ms > 0:
                 speed_ticks_per_s = abs(mid - self._last_mid_px) / tick * (1000.0 / dt_ms)
                 if speed_ticks_per_s > self.cfg.max_speed_ticks_per_s:
+                    self._log_decision("skip_speed", speed=f"{speed_ticks_per_s:.2f}", limit=self.cfg.max_speed_ticks_per_s)  # 何をするか：速すぎて見送りの理由を記録
                     return False  # 速すぎる＝トレンド急進中と判断し、今回は出さない
         # 記録を更新（次回の速度計算のため）
         self._last_mid_px = mid
@@ -178,6 +194,7 @@ class ZeroReopenPop(StrategyBase):
         # 何をするか：1tick利確の“期待エッジ（bps）”を計算し、手数料合計＋余裕未満なら危険なので発注しない
         edge_est_bp = (tick / max(mid, 1e-9)) * 10000.0 - (self.cfg.fee_maker_bp + self.cfg.fee_taker_bp)
         if edge_est_bp < self.cfg.edge_bp_min:
+            self._log_decision("skip_edge", edge_bp=f"{edge_est_bp:.2f}", min_bp=self.cfg.edge_bp_min)  # 何をするか：採算不足で見送りの理由を記録
             return False
         return True
 
@@ -206,12 +223,13 @@ class ZeroReopenPop(StrategyBase):
 
     def _build_entry(self, ob: OrderBook, side: str) -> Dict[str, Any]:
         """【関数】エントリー生成：片面1発の指値（GTC+TTL・最小ロット・戦略タグ付）を作る"""
-        tick = float(getattr(ob, "tick", 1.0))
         bid_px, ask_px = self._get_best_prices(ob)
         if bid_px is None or ask_px is None:
             raise ValueError("best bid/ask required for entry order")
-        mid = (bid_px + ask_px) / 2.0
-        px = mid - tick if side == "buy" else mid + tick
+        best_bid = bid_px  # 何をするか：BUY時のメイク価格（tick整合済みのbest）
+        best_ask = ask_px  # 何をするか：SELL時のメイク価格（tick整合済みのbest）
+        side_str = str(side).upper()
+        px = best_bid if side_str == "BUY" else best_ask  # 何をするか：BUY→best_bid / SELL→best_ask に統一（ズレ防止）
         order = Order(
             side=side,
             price=px,
@@ -284,6 +302,7 @@ class ZeroReopenPop(StrategyBase):
                     and self._open_side in {"BUY", "SELL"}
                     and self._open_size > 0.0
                 ):
+                    self._log_decision("flat_timeout", side=self._open_side, size=self._open_size)  # 何をするか：締切超過で非常口フラットを記録
                     order_side = "sell" if self._open_side == "BUY" else "buy"
                     order_price = float(bid_px) if order_side == "sell" else float(ask_px)
                     order = Order(
@@ -308,6 +327,9 @@ class ZeroReopenPop(StrategyBase):
                 action = self._build_entry(ob, side)
             except ValueError:
                 return actions
+            order = action.get("order")
+            order_px = getattr(order, "price", None) if order is not None else None
+            self._log_decision("entry", spread=ob.spread_ticks(), side=side, px=order_px, ttl=self.cfg.ttl_ms)  # 何をするか：エントリー実行を記録
             actions.append(action)
             self._last_action_ms = now_ms
             self._lock_until_ms = now_ms + self.cfg.ttl_ms
@@ -336,6 +358,8 @@ class ZeroReopenPop(StrategyBase):
             self._open_size = 0.0
             self._entry_active = False
             self._lock_until_ms = now - 1
+            if tag_str == "zero_reopen_flat":
+                self._penalty_until_ms = now + self.cfg.loss_cooloff_ms  # 何をするか：非常口で逃げたら“お休み時間”をセット
             logger.info(
                 "zero_reopen closed_by=%s side=%s px=%s", tag_str, getattr(my_fill, "side", None), getattr(my_fill, "price", None)
             )  # 何をするか：手仕舞い完了を記録
