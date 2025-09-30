@@ -165,6 +165,8 @@ class ZeroReopenPop(StrategyBase):
             return False
         if (now_ms - self._last_action_ms) < self.cfg.cooloff_ms:
             return False
+        if self._tp_pending:
+            return False  # 何をするか：まだ手仕舞い（利確/フラット）待ちの在庫があるので新規は出さない
         if now_ms < self._lock_until_ms:
             return False  # 何をするか：まだTTL中＝前の注文が生きているので、新しい発注をロックして1枚運用を守る
 
