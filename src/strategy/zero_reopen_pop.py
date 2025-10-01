@@ -35,6 +35,8 @@ class ZeroReopenConfig:
     seen_zero_window_ms: int = 1000  # どれだけ“ゼロ直後”を有効とみなすか
     loss_cooloff_ms: int = 1500   # 何をする設定か：非常口フラット後に“お休み”する時間ms（連打で再被弾を防ぐ）
     reopen_stable_ms: int = 50   # 何をする設定か：再拡大してから“この時間だけ継続”したら発注を許可（瞬間ノイズで出さない）
+    min_best_age_ms: int = 200   # 何をする設定か：Bestがこの時間（ms）以上変わらず“落ち着いて”いたら発注を許可
+
 
 
 def zero_reopen_config_from(cfg: Any) -> ZeroReopenConfig | None:
@@ -90,6 +92,9 @@ class ZeroReopenPop(StrategyBase):
         self._lock_until_ms: int = -10**9  # 何をするか：同時に複数枚を出さない“発注ロック”の期限ms（TTL中は新規禁止）
         self._penalty_until_ms: int = -10**9  # 何をするか：罰ゲーム中はここまで新規発注を禁止（ロス・クールオフの期限ms）
         self._reopen_since_ms: int = -10**9  # 何をするか：再拡大が始まった“時刻”を記録して安定時間を測る
+        self._last_best_change_ms: int = -10**9  # 何をするか：Bestが最後に変わった時刻（ms）を記録
+        self._last_best_bid: Optional[float] = None  # 何をするか：前回のbest bid価格
+        self._last_best_ask: Optional[float] = None  # 何をするか：前回のbest ask価格
         self._tp_pending: bool = False        # 何をするか：利確IOC待ち（まだ手仕舞えていない）かどうか
         self._tp_deadline_ms: int = -10**9    # 何をするか：この時刻を過ぎたら“フラットIOC”を出す締切
         self._open_side: Optional[str] = None # 何をするか：保有している方向（BUY/SELL）
@@ -184,9 +189,27 @@ class ZeroReopenPop(StrategyBase):
             self._log_decision("skip_penalty", until=self._penalty_until_ms, now=now_ms)  # 何をするか：“罰ゲーム中なので見送り”を記録
             return False  # 何をするか：ロス・クールオフ中は新規発注しない
 
-        bid_px, ask_px = self._get_best_prices(ob)
-        if bid_px is None or ask_px is None:
-            return False
+
+        best_bid = ob.best_bid()  # 何をするか：現在のbest bidを取得
+        best_ask = ob.best_ask()  # 何をするか：現在のbest askを取得
+        if best_bid is None or best_ask is None:
+            return False  # 何をするか：どちらか欠けていたら発注不可
+
+        if (
+            self._last_best_bid is None
+            or self._last_best_ask is None
+            or self._last_best_bid != best_bid
+            or self._last_best_ask != best_ask
+        ):
+            self._last_best_change_ms = now_ms  # 何をするか：Bestが変わったら“変化時刻”を更新して年齢リセット
+            self._last_best_bid = best_bid
+            self._last_best_ask = best_ask
+
+        best_age_ms = now_ms - self._last_best_change_ms  # 何をするか：Bestが同じ値で続いている時間を計算
+        if best_age_ms < self.cfg.min_best_age_ms:
+            self._log_decision("skip_best_age", age_ms=best_age_ms, min_ms=self.cfg.min_best_age_ms)  # 何をするか：若すぎて見送りを記録
+            return False  # 何をするか：Bestがまだ落ち着いていないので発注しない
+
         # 何をするか：midの“速さ”（tick/秒）を計算し、上限を超えると危険なので発注を見送る
         mid = ob.mid_price()
         tick = ob.tick_size()
