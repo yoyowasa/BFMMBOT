@@ -34,6 +34,7 @@ class ZeroReopenConfig:
     cooloff_ms: int = 250          # 連打禁止と毒性回避のための“息継ぎ”
     seen_zero_window_ms: int = 1000  # どれだけ“ゼロ直後”を有効とみなすか
     loss_cooloff_ms: int = 1500   # 何をする設定か：非常口フラット後に“お休み”する時間ms（連打で再被弾を防ぐ）
+    reopen_stable_ms: int = 50   # 何をする設定か：再拡大してから“この時間だけ継続”したら発注を許可（瞬間ノイズで出さない）
 
 
 def zero_reopen_config_from(cfg: Any) -> ZeroReopenConfig | None:
@@ -88,6 +89,8 @@ class ZeroReopenPop(StrategyBase):
         self._fired_on_this_zero: bool = False  # 何をするか：同一“ゼロ”イベントにつき発注は1回だけにするフラグ
         self._lock_until_ms: int = -10**9  # 何をするか：同時に複数枚を出さない“発注ロック”の期限ms（TTL中は新規禁止）
         self._penalty_until_ms: int = -10**9  # 何をするか：罰ゲーム中はここまで新規発注を禁止（ロス・クールオフの期限ms）
+        self._reopen_since_ms: int = -10**9  # 何をするか：再拡大が始まった“時刻”を記録して安定時間を測る
+
         self._tp_pending: bool = False        # 何をするか：利確IOC待ち（まだ手仕舞えていない）かどうか
         self._tp_deadline_ms: int = -10**9    # 何をするか：この時刻を過ぎたら“フラットIOC”を出す締切
         self._open_side: Optional[str] = None # 何をするか：保有している方向（BUY/SELL）
@@ -154,11 +157,18 @@ class ZeroReopenPop(StrategyBase):
         if ob.spread_ticks() == 0:
             self._last_spread_zero_ms = now_ms
             self._fired_on_this_zero = False  # 何をするか：新しい“ゼロ”を見たので再発注可にリセット
+            self._reopen_since_ms = -10**9  # 何をするか：新しい“ゼロ”を見たので再拡大の起点をリセット
 
     def _is_reopen(self, ob: OrderBook, now_ms: int) -> bool:
         """【関数】再拡大判定：“直近ゼロあり かつ 現在は≥min_spread_tick”かどうか"""
         seen_zero_recently = (now_ms - self._last_spread_zero_ms) <= self.cfg.seen_zero_window_ms
-        return seen_zero_recently and (self.cfg.min_spread_tick <= ob.spread_ticks() <= self.cfg.max_spread_tick) and (not self._fired_on_this_zero)  # 何をするか：同一ゼロでは再発注しない
+        spread_ok = (self.cfg.min_spread_tick <= ob.spread_ticks() <= self.cfg.max_spread_tick)  # 何をするか：再拡大が“ちょうど良い幅”か
+        if spread_ok and self._reopen_since_ms < 0:
+            self._reopen_since_ms = now_ms  # 何をするか：再拡大を初めて確認した時刻を刻む
+        if not spread_ok:
+            self._reopen_since_ms = -10**9  # 何をするか：幅が外れたら起点を破棄（やり直し）
+        stable_ok = spread_ok and (now_ms - self._reopen_since_ms) >= self.cfg.reopen_stable_ms  # 何をするか：十分“開いたまま”続いたか
+        return seen_zero_recently and stable_ok and (not self._fired_on_this_zero)  # 何をするか：ゼロ直後×幅OK×安定×未発射のときだけ許可
 
     def _pass_gates(self, ob: OrderBook, now_ms: int) -> bool:
         """【関数】安全ゲート：標準ガード（health_ok）・クールダウン・best存在チェックをまとめて判定"""
