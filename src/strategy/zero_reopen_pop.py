@@ -90,7 +90,6 @@ class ZeroReopenPop(StrategyBase):
         self._lock_until_ms: int = -10**9  # 何をするか：同時に複数枚を出さない“発注ロック”の期限ms（TTL中は新規禁止）
         self._penalty_until_ms: int = -10**9  # 何をするか：罰ゲーム中はここまで新規発注を禁止（ロス・クールオフの期限ms）
         self._reopen_since_ms: int = -10**9  # 何をするか：再拡大が始まった“時刻”を記録して安定時間を測る
-
         self._tp_pending: bool = False        # 何をするか：利確IOC待ち（まだ手仕舞えていない）かどうか
         self._tp_deadline_ms: int = -10**9    # 何をするか：この時刻を過ぎたら“フラットIOC”を出す締切
         self._open_side: Optional[str] = None # 何をするか：保有している方向（BUY/SELL）
