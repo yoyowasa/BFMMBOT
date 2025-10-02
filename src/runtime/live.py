@@ -233,6 +233,25 @@ def _side_norm(v: str | int | None) -> str:
         return "SELL"
     return "BUY"  # 何をするか：未知値はBUYへフォールバック（必要なら後続のガードで弾く）
 
+def _would_reduce_inventory(current_inventory: float, side, request_qty: float) -> bool:
+    """何をする関数か：この注文が在庫|Q|を減らす（決済）ならTrueを返す"""
+    if side is None:
+        return False
+    try:
+        side_norm = str(side).strip().lower()
+    except Exception:
+        return False
+    if side_norm not in ("buy", "sell"):
+        return False
+    try:
+        qty = float(request_qty)
+    except (TypeError, ValueError):
+        return False
+    if qty <= 0.0:
+        return False
+    delta = qty if side_norm == "buy" else -qty
+    return abs(current_inventory + delta) <= abs(current_inventory)
+
 def _normalize_px_sz(cfg, px: float, sz: float) -> tuple[float | None, float | None]:
     """何をする関数か：価格をtick、サイズをstepへ丸め、最小サイズ未満は(None, None)を返して発注を止める"""
     tick = getattr(cfg, "tick_size", None)
@@ -735,17 +754,25 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True, *, strategy_cfg
                     continue  # 何をするか：次のイベントまで待つ
 
                 # 何をするか：在庫上限ガード（建玉 |Q| が上限以上なら新規を止める）
+
+                close_only_mode = False
+
                 if eff_inv_limit is not None:
                     try:
                         Q = _net_inventory_btc(ex)  # 何をするか：現在の建玉（BTC）を取得して合算
                     except NameError:
                         Q = 0.0  # 何をするか：ヘルパ未追加でも落ちないように0扱い
-                    if abs(Q) >= eff_inv_limit:
+
+                    if abs(Q) >= eff_inv_limit or abs(pnl_state["pos"]) >= eff_inv_limit:
+                        close_only_mode = True
+
                         if live_orders:
                             ex.cancel_all_child_orders()
                             live_orders.clear()
                         logger.debug(f"pause inventory_guard: |Q|={abs(Q)} ≥ {eff_inv_limit}")
+
                         continue
+
 
                 # 何をするか：TTL 超過の注文を自動キャンセル（レート制限中は呼ばない）
                 if not throttled:
@@ -921,12 +948,22 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True, *, strategy_cfg
                             continue  # 何をするか：この周回は発注を行わない
 
                         side_norm = _side_norm(_act(o, "side"))  # 何をするか：sideを'BUY'/'SELL'に正規化
+                        current_pos = pnl_state["pos"]
+                        reduce_only = bool(_act(o, "reduce_only", False))
                         if eff_inv_limit is not None:  # 何をするか：在庫上限ガード
-                            pos_after = pnl_state["pos"] + (sz if side_norm == "BUY" else -sz)  # 何をするか：この発注が通った後の建玉を試算
+                            pos_after = current_pos + (sz if side_norm == "BUY" else -sz)  # 何をするか：この発注が通った後の建玉を試算
                             if abs(pos_after) > eff_inv_limit:
-                                logger.debug("pause: inventory_guard")  # 何をするか：上限超過のため止める
-                                _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="inventory_guard", pos_before=pnl_state["pos"], pos_after=pos_after, limit=eff_inv_limit, side=side_norm, sz=sz)  # 何をするか：心拍に理由を記録
-                                continue  # 何をするか：このアクションは見送り
+                                if reduce_only or _would_reduce_inventory(current_pos, side_norm, sz):
+                                    pass  # 何をするか：在庫を減らす注文なので通す
+                                else:
+                                    logger.debug("pause: inventory_guard")  # 何をするか：上限超過のため止める
+                                    _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="inventory_guard", pos_before=current_pos, pos_after=pos_after, limit=eff_inv_limit, side=side_norm, sz=sz)  # 何をするか：心拍に理由を記録
+                                    continue  # 何をするか：このアクションは見送り
+                            elif close_only_mode and not (reduce_only or _would_reduce_inventory(current_pos, side_norm, sz)):
+                                logger.debug("pause: inventory_guard_close_only")
+                                _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="inventory_guard", pos_before=current_pos, pos_after=pos_after, limit=eff_inv_limit, side=side_norm, sz=sz)
+                                continue
+
 
                         acc = ex.send_child_order(
                             side=side_norm, size=sz, price=px, time_in_force=_act(o, "tif", "GTC")

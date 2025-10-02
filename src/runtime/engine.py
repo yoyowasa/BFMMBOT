@@ -86,6 +86,32 @@ class PaperEngine:
             return None
         limit = float(self.max_inv) - float(self.inventory_eps)
         return max(0.0, limit)
+    def _normalize_side(self, side: str | None) -> str | None:
+        """【関数】side表現を "buy" / "sell" に正規化（それ以外はNone）"""
+        if side is None:
+            return None
+        try:
+            s = str(side).strip().lower()
+        except Exception:
+            return None
+        if s in ("buy", "sell"):
+            return s
+        return None
+
+    def would_reduce_inventory(self, current_inventory: float, side: str | None, request_qty: float) -> bool:
+        """【関数】注文が在庫|Q|を縮める（=決済）か判定し、縮めるならTrue"""
+        side_norm = self._normalize_side(side)
+        if side_norm not in ("buy", "sell"):
+            return False
+        try:
+            qty = float(request_qty)
+        except (TypeError, ValueError):
+            return False
+        if qty <= 0.0:
+            return False
+        delta = qty if side_norm == "buy" else -qty
+        return abs(current_inventory + delta) <= abs(current_inventory)
+
 
     # ─────────────────────────────────────────────────────────────
     def _guard_midmove_bp(self, now: datetime) -> bool:
@@ -385,12 +411,13 @@ class PaperEngine:
                             self._heartbeat(now, "pause", reason="midmove_guard")  # 直近イベントを要約（ミッド変化ガードで停止）
                         continue  # 新規は出さない
                     
-
-
                     # 戦略評価→意思決定ログ→アクション適用
-                    # 在庫上限ガード：|Q| が上限以上なら新規は出さず、同タグの未約定を一括Cancel（理由は "risk"）
+                    # 在庫上限ガード：|Q| が上限以上なら新規はClose-Onlyに切り替え、既存の指値は整理
                     eff_limit = self.effective_inventory_limit()
+                    close_only_mode = False
                     if eff_limit is not None and abs(self.Q) >= eff_limit:
+                        close_only_mode = True
+
                         for o in self.sim.cancel_by_tag("stall"):
                             self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
                                             px=o.price, sz=o.remaining, reason="risk")  # 何を/なぜ記録したか（在庫上限）
@@ -399,8 +426,7 @@ class PaperEngine:
                                             px=o.price, sz=o.remaining, reason="risk")  # 何を/なぜ記録したか（在庫上限）
                         logger.warning(f"risk guard: |Q|>={eff_limit} → new orders paused")  # 画面でも分かるように一言
                         self._heartbeat(now, "pause", reason="inventory_guard")  # ハートビート：在庫上限で停止
-                        continue  # このboardイベントでは新規Placeを行わない
-                   
+
 
                     actions = self.strat.evaluate(self.ob, now, self.cfg)
                     self._record_decision(now, actions)
@@ -411,12 +437,22 @@ class PaperEngine:
                                 continue
                             o = act["order"]
                             eff_limit = self.effective_inventory_limit()
+                            req_qty = float(getattr(o, "size", 0.0) or 0.0)
+                            side_val = getattr(o, "side", None)
+                            reduce_only = bool(getattr(o, "reduce_only", False))
                             if eff_limit is not None:
-                                req_qty = float(getattr(o, "size", 0.0) or 0.0)
                                 if abs(self.Q) + req_qty > eff_limit:
-                                    logger.debug(
-                                        f"skip place: |Q|+req={abs(self.Q) + req_qty:.6f} > eff_limit={eff_limit:.6f}"
-                                    )
+                                    if reduce_only or self.would_reduce_inventory(self.Q, side_val, req_qty):
+                                        pass  # 決済方向なのでClose-Only中でも許可
+                                    else:
+                                        logger.debug(
+                                            f"skip place: |Q|+req={abs(self.Q) + req_qty:.6f} > eff_limit={eff_limit:.6f}"
+                                        )
+                                        self._heartbeat(now, "pause", reason="inventory_guard")
+                                        continue
+                                elif close_only_mode and not (reduce_only or self.would_reduce_inventory(self.Q, side_val, req_qty)):
+                                    logger.debug("skip place: close_only_mode (inventory_guard)")
+
                                     self._heartbeat(now, "pause", reason="inventory_guard")
                                     continue
                             self.sim.place(o, now)
