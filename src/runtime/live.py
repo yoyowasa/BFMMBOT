@@ -764,13 +764,13 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True, *, strategy_cfg
                         Q = 0.0  # 何をするか：ヘルパ未追加でも落ちないように0扱い
                     if abs(Q) >= eff_inv_limit or abs(pnl_state["pos"]) >= eff_inv_limit:
                         close_only_mode = True
-
                         if live_orders:
                             ex.cancel_all_child_orders()
                             live_orders.clear()
                         logger.debug(f"pause inventory_guard: |Q|={abs(Q)} ≥ {eff_inv_limit}")
 
                         continue
+
 
 
 
@@ -963,7 +963,6 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True, *, strategy_cfg
                                 logger.debug("pause: inventory_guard_close_only")
                                 _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="inventory_guard", pos_before=current_pos, pos_after=pos_after, limit=eff_inv_limit, side=side_norm, sz=sz)
                                 continue
-
 
                         acc = ex.send_child_order(
                             side=side_norm, size=sz, price=px, time_in_force=_act(o, "tif", "GTC")

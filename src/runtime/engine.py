@@ -449,7 +449,6 @@ class PaperEngine:
                                         continue
                                 elif close_only_mode and not (reduce_only or self.would_reduce_inventory(self.Q, side_val, req_qty)):
                                     logger.debug("skip place: close_only_mode (inventory_guard)")
-
                                     self._heartbeat(now, "pause", reason="inventory_guard")
                                     continue
                             self.sim.place(o, now)

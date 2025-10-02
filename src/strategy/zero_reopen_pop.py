@@ -17,7 +17,6 @@ import random  # 何をするか：TTLに±ゆらぎ（jitter）を与えるた�
 from collections import deque  # 何をするか：レート制限用に“時刻のキュー”を使う
 
 
-
 logger = logging.getLogger(__name__)  # 何をするか：戦略専用のロガーを用意（情報/デバッグを出す）
 
 
