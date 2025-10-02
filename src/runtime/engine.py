@@ -111,8 +111,6 @@ class PaperEngine:
             return False
         delta = qty if side_norm == "buy" else -qty
         return abs(current_inventory + delta) <= abs(current_inventory)
-
-
     # ─────────────────────────────────────────────────────────────
     def _guard_midmove_bp(self, now: datetime) -> bool:
         """【関数】30sのミッド変化(bps)を監視：閾値超ならTrue（新規停止＋全取消）
@@ -417,7 +415,6 @@ class PaperEngine:
                     close_only_mode = False
                     if eff_limit is not None and abs(self.Q) >= eff_limit:
                         close_only_mode = True
-
                         for o in self.sim.cancel_by_tag("stall"):
                             self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
                                             px=o.price, sz=o.remaining, reason="risk")  # 何を/なぜ記録したか（在庫上限）

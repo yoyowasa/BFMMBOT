@@ -762,7 +762,6 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True, *, strategy_cfg
                         Q = _net_inventory_btc(ex)  # 何をするか：現在の建玉（BTC）を取得して合算
                     except NameError:
                         Q = 0.0  # 何をするか：ヘルパ未追加でも落ちないように0扱い
-
                     if abs(Q) >= eff_inv_limit or abs(pnl_state["pos"]) >= eff_inv_limit:
                         close_only_mode = True
 
@@ -772,6 +771,7 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True, *, strategy_cfg
                         logger.debug(f"pause inventory_guard: |Q|={abs(Q)} ≥ {eff_inv_limit}")
 
                         continue
+
 
 
                 # 何をするか：TTL 超過の注文を自動キャンセル（レート制限中は呼ばない）

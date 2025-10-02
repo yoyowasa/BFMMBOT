@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Deque, Dict, List, Mapping, Optional
 
 # 何をするimportか：戦略の骨組み・板の読み取り・注文生成・時刻取得（すべて既存の共通層を利用）
 from src.strategy.base import StrategyBase
@@ -14,6 +14,8 @@ from src.core.utils import now_ms        # クールダウンや“直後”判�
 
 import logging  # 何をするか：この戦略の意思決定ログを出すために使う
 import random  # 何をするか：TTLに±ゆらぎ（jitter）を与えるための乱数を使う
+from collections import deque  # 何をするか：レート制限用に“時刻のキュー”を使う
+
 
 
 logger = logging.getLogger(__name__)  # 何をするか：戦略専用のロガーを用意（情報/デバッグを出す）
@@ -36,6 +38,8 @@ class ZeroReopenConfig:
     seen_zero_window_ms: int = 1000  # どれだけ“ゼロ直後”を有効とみなすか
     loss_cooloff_ms: int = 1500   # 何をする設定か：非常口フラット後に“お休み”する時間ms（連打で再被弾を防ぐ）
     stop_adverse_ticks: int = 2    # 何をする設定か：エントリーVWAPから不利にこのtick以上動いたら即フラットIOCで逃げる
+    entries_window_ms: int = 10000   # 何をする設定か：この時間窓（ms）内のエントリー回数を数える
+    max_entries_in_window: int = 6   # 何をする設定か：時間窓内に許可する最大エントリー回数
     ttl_jitter_ms: int = 80      # 何をする設定か：TTLに与える±ゆらぎ幅（ms）。同時発注の衝突を避ける
     reopen_stable_ms: int = 50   # 何をする設定か：再拡大してから“この時間だけ継続”したら発注を許可（瞬間ノイズで出さない）
     min_best_age_ms: int = 200   # 何をする設定か：Bestがこの時間（ms）以上変わらず“落ち着いて”いたら発注を許
@@ -90,6 +94,7 @@ class ZeroReopenPop(StrategyBase):
         self._last_spread_zero_ms: int = -10**9
         self._last_action_ms: int = -10**9
         self._last_entry_ttl_ms: int = self.cfg.ttl_ms  # 何をするか：直近エントリーの実TTL（jitter反映）を記録し、ロック時間と合わせる
+        self._entry_ts_ms: Deque[int] = deque()  # 何をするか：最近のエントリー時刻を入れておく（レート制限判定に使用）
         self._fired_on_this_zero: bool = False  # 何をするか：同一“ゼロ”イベントにつき発注は1回だけにするフラグ
         self._lock_until_ms: int = -10**9  # 何をするか：同時に複数枚を出さない“発注ロック”の期限ms（TTL中は新規禁止）
         self._penalty_until_ms: int = -10**9  # 何をするか：罰ゲーム中はここまで新規発注を禁止（ロス・クールオフの期限ms）
@@ -237,6 +242,17 @@ class ZeroReopenPop(StrategyBase):
         if edge_est_bp < self.cfg.edge_bp_min:
             self._log_decision("skip_edge", edge_bp=f"{edge_est_bp:.2f}", min_bp=self.cfg.edge_bp_min)  # 何をするか：採算不足で見送りの理由を記録
             return False
+
+        if self.cfg.entries_window_ms > 0 and self.cfg.max_entries_in_window > 0:
+            while self._entry_ts_ms and (now_ms - self._entry_ts_ms[0]) > self.cfg.entries_window_ms:
+                self._entry_ts_ms.popleft()  # 何をするか：窓からはみ出た古い記録を捨てる
+            if len(self._entry_ts_ms) >= self.cfg.max_entries_in_window:
+                self._log_decision(
+                    "skip_rate",
+                    n=len(self._entry_ts_ms),
+                    max=self.cfg.max_entries_in_window,
+                )  # 何をするか：レート制限により見送りを記録
+                return False
         return True
 
     def _choose_side(self, ob: OrderBook) -> str:
@@ -442,6 +458,7 @@ class ZeroReopenPop(StrategyBase):
             actions.append(action)
             self._last_action_ms = now_ms
             self._lock_until_ms = now_ms + self._last_entry_ttl_ms  # 何をするか：ロックは“実際に使ったTTL分だけ”かける
+            self._entry_ts_ms.append(now_ms)  # 何をするか：このエントリーの時刻を記録（レート制限判定で使用）
             self._entry_active = True
             self._fired_on_this_zero = True  # 何をするか：この“ゼロ”での発注を消費（次は新しいゼロが来るまで出さない）
 
