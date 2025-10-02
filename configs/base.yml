@@ -56,6 +56,7 @@ features:  # 戦略のしきい値（#1/#2 の主材料）
     stop_adverse_ticks: 2       # 何をする設定か：エントリーVWAPから不利にこのtick以上動いたら即フラットIOCで逃げる
     entries_window_ms: 10000    # 何をする設定か：この時間窓(ms)内のエントリー回数を数える
     max_entries_in_window: 6     # 何をする設定か：時間窓内に許可する最大エントリー回数
+
     size_min: 0.001            # 何をする設定か：最小ロット（取引所の最小単位に合わせる）
     cooloff_ms: 250            # 何をする設定か：連打を防ぐ冷却時間ms
     seen_zero_window_ms: 1000  # 何をする設定か：ゼロを“直後”とみなす時間窓ms

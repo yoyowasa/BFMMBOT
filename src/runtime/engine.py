@@ -86,7 +86,6 @@ class PaperEngine:
             return None
         limit = float(self.max_inv) - float(self.inventory_eps)
         return max(0.0, limit)
-
     def _normalize_side(self, side: str | None) -> str | None:
         """【関数】side表現を "buy" / "sell" に正規化（それ以外はNone）"""
         if side is None:
@@ -112,7 +111,6 @@ class PaperEngine:
             return False
         delta = qty if side_norm == "buy" else -qty
         return abs(current_inventory + delta) <= abs(current_inventory)
-
     # ─────────────────────────────────────────────────────────────
     def _guard_midmove_bp(self, now: datetime) -> bool:
         """【関数】30sのミッド変化(bps)を監視：閾値超ならTrue（新規停止＋全取消）
@@ -411,8 +409,6 @@ class PaperEngine:
                             self._heartbeat(now, "pause", reason="midmove_guard")  # 直近イベントを要約（ミッド変化ガードで停止）
                         continue  # 新規は出さない
                     
-
-
                     # 戦略評価→意思決定ログ→アクション適用
                     # 在庫上限ガード：|Q| が上限以上なら新規はClose-Onlyに切り替え、既存の指値は整理
                     eff_limit = self.effective_inventory_limit()

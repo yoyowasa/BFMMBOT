@@ -754,7 +754,9 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True, *, strategy_cfg
                     continue  # 何をするか：次のイベントまで待つ
 
                 # 何をするか：在庫上限ガード（建玉 |Q| が上限以上なら新規を止める）
+
                 close_only_mode = False
+
                 if eff_inv_limit is not None:
                     try:
                         Q = _net_inventory_btc(ex)  # 何をするか：現在の建玉（BTC）を取得して合算
@@ -766,6 +768,11 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True, *, strategy_cfg
                             ex.cancel_all_child_orders()
                             live_orders.clear()
                         logger.debug(f"pause inventory_guard: |Q|={abs(Q)} ≥ {eff_inv_limit}")
+
+                        continue
+
+
+
 
                 # 何をするか：TTL 超過の注文を自動キャンセル（レート制限中は呼ばない）
                 if not throttled:
