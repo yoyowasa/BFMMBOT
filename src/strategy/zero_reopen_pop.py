@@ -35,7 +35,7 @@ class ZeroReopenConfig:
     seen_zero_window_ms: int = 1000  # どれだけ“ゼロ直後”を有効とみなすか
     loss_cooloff_ms: int = 1500   # 何をする設定か：非常口フラット後に“お休み”する時間ms（連打で再被弾を防ぐ）
     reopen_stable_ms: int = 50   # 何をする設定か：再拡大してから“この時間だけ継続”したら発注を許可（瞬間ノイズで出さない）
-    min_best_age_ms: int = 200   # 何をする設定か：Bestがこの時間（ms）以上変わらず“落ち着いて”いたら発注を許可
+    min_best_age_ms: int = 200   # 何をする設定か：Bestがこの時間（ms）以上変わらず“落ち着いて”いたら発注を許
 
 def zero_reopen_config_from(cfg: Any) -> ZeroReopenConfig | None:
     """【関数】設定オブジェクトから zero_reopen_pop セクションを取り出し ZeroReopenConfig に変換する"""
@@ -380,18 +380,35 @@ class ZeroReopenPop(StrategyBase):
         tag_str = str(tag)
 
         if tag_str in ("zero_reopen_take", "zero_reopen_flat"):
-            # 何をするか：利確IOC or フラットIOCが約定した＝ポジション解消、ロック解除
-            self._tp_pending = False
-            self._open_side = None
-            self._open_size = 0.0
+            # 何をするか：決済で埋まった分だけ在庫を“差し引き”、ゼロになったら完了扱い
+            fill_size = getattr(my_fill, "size", None)
+            if isinstance(my_fill, Mapping) and fill_size is None:
+                fill_size = my_fill.get("size")
+            if fill_size is None:
+                order_info = getattr(my_fill, "order", None)
+                if order_info is not None:
+                    fill_size = getattr(order_info, "size", None)
+            size_val = float(fill_size) if fill_size is not None else 0.0
             self._entry_active = False
-            self._lock_until_ms = now - 1
+            self._open_size = max(0.0, self._open_size - size_val)
+            if self._open_size <= 1e-12:
+                self._open_size = 0.0
+                self._tp_pending = False
+                self._open_side = None
+                self._lock_until_ms = now - 1
+            else:
+                self._tp_pending = True
+
             if tag_str == "zero_reopen_flat":
                 self._penalty_until_ms = now + self.cfg.loss_cooloff_ms  # 何をするか：非常口で逃げたら“お休み時間”をセット
             logger.info(
-                "zero_reopen closed_by=%s side=%s px=%s", tag_str, getattr(my_fill, "side", None), getattr(my_fill, "price", None)
-            )  # 何をするか：手仕舞い完了を記録
-            return []
+                "zero_reopen closed_by=%s side=%s px=%s remain=%s",
+                tag_str,
+                getattr(my_fill, "side", None),
+                getattr(my_fill, "price", None),
+                self._open_size,
+            )  # 何をするか：残り在庫も記録
+            return []  # 何をするか：決済側の約定時は新規注文を出さない（自己再送防止）
 
         self._entry_active = False
         self._lock_until_ms = -10**9
@@ -411,12 +428,14 @@ class ZeroReopenPop(StrategyBase):
                 fill_size = getattr(order_info, "size", None)
         side_str = str(fill_side).upper() if fill_side is not None else None
         size_val = float(fill_size) if fill_size is not None else 0.0
-        self._open_side = side_str if side_str else None
-        self._open_size = size_val if size_val > 0.0 else 0.0
-        if self._open_side is not None and self._open_size > 0.0:
-            self._tp_pending = True
-            self._tp_deadline_ms = now + self.cfg.flat_timeout_ms
-        else:
+        if size_val <= 0.0:
+            size_val = 0.0
+        self._tp_pending = True
+        self._tp_deadline_ms = now + self.cfg.flat_timeout_ms
+        if self._open_side is None and side_str:
+            self._open_side = side_str
+        self._open_size += size_val
+        if self._open_size <= 1e-12:
             self._tp_pending = False
             self._open_side = None
             self._open_size = 0.0
