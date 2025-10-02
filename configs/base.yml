@@ -30,6 +30,10 @@ latency:  # まずは固定遅延のモデル（実測に置換予定）
   rx_ms: 20  # 受信遅延の仮定
   tx_ms: 20  # 送信遅延の仮定
 
+health:
+  stale_sec_warn: 3      # 何をする行か：Bestが3秒無更新なら Caution（新規を絞る/停止準備）
+  stale_sec_halt: 10     # 何をする行か：Bestが10秒無更新なら Halted（新規NG・決済のみ許可）
+
 features:  # 戦略のしきい値（#1/#2 の主材料）
   stall_T_ms: 250          # #1 静止→一撃：BestがTms静止
   ca_ratio_win_ms: 500     # #2 C/Aゲート：集計窓（ms）
