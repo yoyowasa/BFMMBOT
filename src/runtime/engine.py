@@ -36,15 +36,15 @@ class PaperEngine:
         self.cfg = cfg
         self.product = getattr(cfg, "product_code", "FX_BTC_JPY") or "FX_BTC_JPY"
         self.tick = float(getattr(cfg, "tick_size", 1.0))
+        self.max_inv = getattr(getattr(cfg, "risk", None), "max_inventory", None)
+        inv_eps_default = 0.0 if self.max_inv is None else max(0.0, float(self.max_inv) * 0.01)
+        self.inventory_eps = float(getattr(getattr(cfg, "risk", None), "inventory_eps", inv_eps_default))
         self.guard_bp = None
         if getattr(cfg, "guard", None) is not None:
             self.guard_bp = getattr(cfg.guard, "max_mid_move_bp_30s", None)
             self.kill_daily = getattr(getattr(getattr(cfg, "risk", None), "kill", None), "daily_pnl_jpy", None)  # 【関数】Kill: 日次PnL閾値
             self.kill_dd = getattr(getattr(getattr(cfg, "risk", None), "kill", None), "max_dd_jpy", None)        # 【関数】Kill: 日次DD閾値
             self.halted = False  # 【関数】Kill発火後は停止
-
-            self.max_inv = getattr(getattr(cfg, "risk", None), "max_inventory", None)  # 【関数】在庫上限ガードの設定読み込み：±BTCの上限
-
 
         # 戦略（#1/#2/#3）を選択
         self.strat = build_strategy(strategy_name, cfg, strategy_cfg=strategy_cfg)
@@ -79,6 +79,39 @@ class PaperEngine:
 
         # 30秒ミッド履歴（ガード用）：(epoch_sec, mid)
         self._midwin: Deque[Tuple[float, float]] = deque()
+
+    def effective_inventory_limit(self) -> float | None:
+        """【関数】新規発注の可否判定に使う実効在庫上限（上限−安全マージン）を返す"""
+        if self.max_inv is None:
+            return None
+        limit = float(self.max_inv) - float(self.inventory_eps)
+        return max(0.0, limit)
+
+    def _normalize_side(self, side: str | None) -> str | None:
+        """【関数】side表現を "buy" / "sell" に正規化（それ以外はNone）"""
+        if side is None:
+            return None
+        try:
+            s = str(side).strip().lower()
+        except Exception:
+            return None
+        if s in ("buy", "sell"):
+            return s
+        return None
+
+    def would_reduce_inventory(self, current_inventory: float, side: str | None, request_qty: float) -> bool:
+        """【関数】注文が在庫|Q|を縮める（=決済）か判定し、縮めるならTrue"""
+        side_norm = self._normalize_side(side)
+        if side_norm not in ("buy", "sell"):
+            return False
+        try:
+            qty = float(request_qty)
+        except (TypeError, ValueError):
+            return False
+        if qty <= 0.0:
+            return False
+        delta = qty if side_norm == "buy" else -qty
+        return abs(current_inventory + delta) <= abs(current_inventory)
 
     # ─────────────────────────────────────────────────────────────
     def _guard_midmove_bp(self, now: datetime) -> bool:
@@ -214,7 +247,7 @@ class PaperEngine:
             "R": self.R,              # 累計実現PnL
             "R_day": self._daily_R,   # 日次実現PnL
             "guard": {                # ガードのON/OFF（Trueで“新規停止中”）
-                "inventory": (self.max_inv is not None and abs(self.Q) >= float(self.max_inv)),
+                "inventory": (self.effective_inventory_limit() is not None and abs(self.Q) >= float(self.effective_inventory_limit())),
                 "midmove": self._midguard_paused,
             },
             "window": {
@@ -381,18 +414,20 @@ class PaperEngine:
 
 
                     # 戦略評価→意思決定ログ→アクション適用
-                    # 在庫上限ガード：|Q| が上限以上なら新規は出さず、同タグの未約定を一括Cancel（理由は "risk"）
-                    if self.max_inv is not None and abs(self.Q) >= float(self.max_inv):
+                    # 在庫上限ガード：|Q| が上限以上なら新規はClose-Onlyに切り替え、既存の指値は整理
+                    eff_limit = self.effective_inventory_limit()
+                    close_only_mode = False
+                    if eff_limit is not None and abs(self.Q) >= eff_limit:
+                        close_only_mode = True
                         for o in self.sim.cancel_by_tag("stall"):
                             self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
                                             px=o.price, sz=o.remaining, reason="risk")  # 何を/なぜ記録したか（在庫上限）
                         for o in self.sim.cancel_by_tag("ca_gate"):
                             self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
                                             px=o.price, sz=o.remaining, reason="risk")  # 何を/なぜ記録したか（在庫上限）
-                        logger.warning(f"risk guard: |Q|>={self.max_inv} → new orders paused")  # 画面でも分かるように一言
+                        logger.warning(f"risk guard: |Q|>={eff_limit} → new orders paused")  # 画面でも分かるように一言
                         self._heartbeat(now, "pause", reason="inventory_guard")  # ハートビート：在庫上限で停止
-                        continue  # このboardイベントでは新規Placeを行わない
-                   
+
 
                     actions = self.strat.evaluate(self.ob, now, self.cfg)
                     self._record_decision(now, actions)
@@ -401,8 +436,26 @@ class PaperEngine:
                             # 同タグの重複を最小抑止
                             if self.sim.has_open_tag(act["order"].tag):
                                 continue
-                            self.sim.place(act["order"], now)
                             o = act["order"]
+                            eff_limit = self.effective_inventory_limit()
+                            req_qty = float(getattr(o, "size", 0.0) or 0.0)
+                            side_val = getattr(o, "side", None)
+                            reduce_only = bool(getattr(o, "reduce_only", False))
+                            if eff_limit is not None:
+                                if abs(self.Q) + req_qty > eff_limit:
+                                    if reduce_only or self.would_reduce_inventory(self.Q, side_val, req_qty):
+                                        pass  # 決済方向なのでClose-Only中でも許可
+                                    else:
+                                        logger.debug(
+                                            f"skip place: |Q|+req={abs(self.Q) + req_qty:.6f} > eff_limit={eff_limit:.6f}"
+                                        )
+                                        self._heartbeat(now, "pause", reason="inventory_guard")
+                                        continue
+                                elif close_only_mode and not (reduce_only or self.would_reduce_inventory(self.Q, side_val, req_qty)):
+                                    logger.debug("skip place: close_only_mode (inventory_guard)")
+                                    self._heartbeat(now, "pause", reason="inventory_guard")
+                                    continue
+                            self.sim.place(o, now)
                             self.order_log.add(ts=now.isoformat(), action="place", tif=o.tif, ttl_ms=o.ttl_ms, px=o.price, sz=o.size, reason=o.tag)  # placeでも“注文タグ”（stall / ca_gate）を記録する
 
                             self._heartbeat(now, "place", reason=o.tag)  # ハートビート：発注を要約
