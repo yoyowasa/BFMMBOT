@@ -38,6 +38,7 @@ class ZeroReopenConfig:
     loss_cooloff_ms: int = 1500   # 何をする設定か：非常口フラット後に“お休み”する時間ms（連打で再被弾を防ぐ）
     stop_adverse_ticks: int = 2    # 何をする設定か：エントリーVWAPから不利にこのtick以上動いたら即フラットIOCで逃げる
     exact_one_tick_only: bool = True  # 何をする設定か：スプレッドが“ちょうど1tick”のときだけ出す（+1tick利確がその場で当たる）
+
     entries_window_ms: int = 10000   # 何をする設定か：この時間窓（ms）内のエントリー回数を数える
     max_entries_in_window: int = 6   # 何をする設定か：時間窓内に許可する最大エントリー回数
     ttl_jitter_ms: int = 80      # 何をする設定か：TTLに与える±ゆらぎ幅（ms）。同時発注の衝突を避ける
