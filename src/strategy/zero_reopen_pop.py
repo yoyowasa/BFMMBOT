@@ -171,8 +171,9 @@ class ZeroReopenPop(StrategyBase):
         spread_ok = (self.cfg.min_spread_tick <= ob.spread_ticks() <= self.cfg.max_spread_tick)  # 何をするか：再拡大が“ちょうど良い幅”か
         if spread_ok and self._reopen_since_ms < 0:
             self._reopen_since_ms = now_ms  # 何をするか：再拡大を初めて確認した時刻を刻む
-            self._reopen_start_bid = ob.best_bid()  # 何をするか：再拡大の起点となるbest bidを保存
-            self._reopen_start_ask = ob.best_ask()  # 何をするか：再拡大の起点となるbest askを保存
+            bid_px, ask_px = self._get_best_prices(ob)
+            self._reopen_start_bid = bid_px  # 何をするか：再拡大の起点となるbest bidを保存
+            self._reopen_start_ask = ask_px  # 何をするか：再拡大の起点となるbest askを保存
         if not spread_ok:
             self._reopen_since_ms = -10**9  # 何をするか：幅が外れたら起点を破棄（やり直し）
             self._reopen_start_bid = None  # 何をするか：幅条件が外れたので起点bestを破棄（やり直し）
@@ -194,20 +195,19 @@ class ZeroReopenPop(StrategyBase):
         if now_ms < self._penalty_until_ms:
             self._log_decision("skip_penalty", until=self._penalty_until_ms, now=now_ms)  # 何をするか：“罰ゲーム中なので見送り”を記録
             return False  # 何をするか：ロス・クールオフ中は新規発注しない
-        best_bid = ob.best_bid()  # 何をするか：現在のbest bidを取得
-        best_ask = ob.best_ask()  # 何をするか：現在のbest askを取得
-        if best_bid is None or best_ask is None:
+        bid_px, ask_px = self._get_best_prices(ob)
+        if bid_px is None or ask_px is None:
             return False  # 何をするか：どちらか欠けていたら発注不可
 
         if (
             self._last_best_bid is None
             or self._last_best_ask is None
-            or self._last_best_bid != best_bid
-            or self._last_best_ask != best_ask
+            or self._last_best_bid != bid_px
+            or self._last_best_ask != ask_px
         ):
             self._last_best_change_ms = now_ms  # 何をするか：Bestが変わったら“変化時刻”を更新して年齢リセット
-            self._last_best_bid = best_bid
-            self._last_best_ask = best_ask
+            self._last_best_bid = bid_px
+            self._last_best_ask = ask_px
 
         best_age_ms = now_ms - self._last_best_change_ms  # 何をするか：Bestが同じ値で続いている時間を計算
         if best_age_ms < self.cfg.min_best_age_ms:
@@ -235,24 +235,31 @@ class ZeroReopenPop(StrategyBase):
         return True
 
     def _choose_side(self, ob: OrderBook) -> str:
-        """【関数】サイド決定：再拡大の“起点best”からの開き量で方向を判定""""
-        bid = ob.best_bid()
-        ask = ob.best_ask()
-        if bid is None or ask is None:
-            return "BUY"
+        """【関数】サイド決定：再拡大の“起点best”からの開き量で方向を判定"""
+        bid_px, ask_px = self._get_best_prices(ob)
+        if bid_px is None or ask_px is None:
+            return "buy"
 
-        if (
-            self._reopen_start_bid is not None
-            and self._reopen_start_ask is not None
-        ):
-            delta_ask = max(0.0, float(ask) - float(self._reopen_start_ask))  # 何をするか：上方向に開いた量
-            delta_bid = max(0.0, float(self._reopen_start_bid) - float(bid))  # 何をするか：下方向に開いた量
-            side = "BUY" if delta_ask >= delta_bid else "SELL"  # 何をするか：上に開いた方が大きければBUY/下ならSELL
+        start_bid = self._reopen_start_bid
+        start_ask = self._reopen_start_ask
+        try:
+            start_bid_f = float(start_bid) if start_bid is not None else None
+        except (TypeError, ValueError):
+            start_bid_f = None
+        try:
+            start_ask_f = float(start_ask) if start_ask is not None else None
+        except (TypeError, ValueError):
+            start_ask_f = None
+
+        if start_bid_f is not None and start_ask_f is not None:
+            delta_ask = max(0.0, float(ask_px) - start_ask_f)  # 何をするか：上方向に開いた量
+            delta_bid = max(0.0, start_bid_f - float(bid_px))  # 何をするか：下方向に開いた量
+            side = "buy" if delta_ask >= delta_bid else "sell"  # 何をするか：上に開いた方が大きければBUY/下ならSELL
             self._log_decision(
                 "choose_side",
                 delta_ask=f"{delta_ask:.1f}",
                 delta_bid=f"{delta_bid:.1f}",
-                side=side,
+                side=side.upper(),
             )
             return side
 
@@ -264,16 +271,16 @@ class ZeroReopenPop(StrategyBase):
             except Exception:
                 mid = None
         if mid is None:
-            mid = (float(bid) + float(ask)) / 2.0
+            mid = (bid_px + ask_px) / 2.0
 
-        bid_offset = abs(float(mid) - float(bid))
-        ask_offset = abs(float(ask) - float(mid))
+        bid_offset = abs(float(mid) - float(bid_px))
+        ask_offset = abs(float(ask_px) - float(mid))
 
-        if ask_offset >= bid_offset:
-            self._log_decision("choose_side_fallback", rule="mid_distance", side="BUY")
-            return "BUY"
-        self._log_decision("choose_side_fallback", rule="mid_distance", side="SELL")
-        return "SELL"
+        if ask_offset > bid_offset:
+            self._log_decision("choose_side_fallback", rule="mid_distance", side="SELL")
+            return "sell"
+        self._log_decision("choose_side_fallback", rule="mid_distance", side="BUY")
+        return "buy"
 
     def _build_entry(self, ob: OrderBook, side: str) -> Dict[str, Any]:
         """【関数】エントリー生成：片面1発の指値（GTC+TTL・最小ロット・戦略タグ付）を作る"""
