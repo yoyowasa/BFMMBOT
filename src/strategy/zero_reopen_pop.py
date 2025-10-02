@@ -37,8 +37,6 @@ class ZeroReopenConfig:
     reopen_stable_ms: int = 50   # 何をする設定か：再拡大してから“この時間だけ継続”したら発注を許可（瞬間ノイズで出さない）
     min_best_age_ms: int = 200   # 何をする設定か：Bestがこの時間（ms）以上変わらず“落ち着いて”いたら発注を許可
 
-
-
 def zero_reopen_config_from(cfg: Any) -> ZeroReopenConfig | None:
     """【関数】設定オブジェクトから zero_reopen_pop セクションを取り出し ZeroReopenConfig に変換する"""
 
@@ -188,8 +186,6 @@ class ZeroReopenPop(StrategyBase):
         if now_ms < self._penalty_until_ms:
             self._log_decision("skip_penalty", until=self._penalty_until_ms, now=now_ms)  # 何をするか：“罰ゲーム中なので見送り”を記録
             return False  # 何をするか：ロス・クールオフ中は新規発注しない
-
-
         best_bid = ob.best_bid()  # 何をするか：現在のbest bidを取得
         best_ask = ob.best_ask()  # 何をするか：現在のbest askを取得
         if best_bid is None or best_ask is None:
