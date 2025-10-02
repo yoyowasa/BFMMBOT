@@ -111,6 +111,7 @@ class PaperEngine:
             return False
         delta = qty if side_norm == "buy" else -qty
         return abs(current_inventory + delta) <= abs(current_inventory)
+
     # ─────────────────────────────────────────────────────────────
     def _guard_midmove_bp(self, now: datetime) -> bool:
         """【関数】30sのミッド変化(bps)を監視：閾値超ならTrue（新規停止＋全取消）

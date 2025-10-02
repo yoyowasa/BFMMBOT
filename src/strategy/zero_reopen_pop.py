@@ -37,6 +37,8 @@ class ZeroReopenConfig:
     seen_zero_window_ms: int = 1000  # どれだけ“ゼロ直後”を有効とみなすか
     loss_cooloff_ms: int = 1500   # 何をする設定か：非常口フラット後に“お休み”する時間ms（連打で再被弾を防ぐ）
     stop_adverse_ticks: int = 2    # 何をする設定か：エントリーVWAPから不利にこのtick以上動いたら即フラットIOCで逃げる
+    exact_one_tick_only: bool = True  # 何をする設定か：スプレッドが“ちょうど1tick”のときだけ出す（+1tick利確がその場で当たる）
+
     entries_window_ms: int = 10000   # 何をする設定か：この時間窓（ms）内のエントリー回数を数える
     max_entries_in_window: int = 6   # 何をする設定か：時間窓内に許可する最大エントリー回数
     ttl_jitter_ms: int = 80      # 何をする設定か：TTLに与える±ゆらぎ幅（ms）。同時発注の衝突を避ける
@@ -177,7 +179,11 @@ class ZeroReopenPop(StrategyBase):
     def _is_reopen(self, ob: OrderBook, now_ms: int) -> bool:
         """【関数】再拡大判定：“直近ゼロあり かつ 現在は≥min_spread_tick”かどうか"""
         seen_zero_recently = (now_ms - self._last_spread_zero_ms) <= self.cfg.seen_zero_window_ms
-        spread_ok = (self.cfg.min_spread_tick <= ob.spread_ticks() <= self.cfg.max_spread_tick)  # 何をするか：再拡大が“ちょうど良い幅”か
+        spread = ob.spread_ticks()  # 何をするか：現在のスプレッドtickを1回だけ読み取る
+        if self.cfg.exact_one_tick_only:
+            spread_ok = (spread == 1)  # 何をするか：1tickちょうどの時だけOK（+1tick利確IOCが即マッチ）
+        else:
+            spread_ok = (self.cfg.min_spread_tick <= spread <= self.cfg.max_spread_tick)  # 何をするか：通常の幅チェック
         if spread_ok and self._reopen_since_ms < 0:
             self._reopen_since_ms = now_ms  # 何をするか：再拡大を初めて確認した時刻を刻む
             bid_px, ask_px = self._get_best_prices(ob)

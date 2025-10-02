@@ -757,6 +757,7 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True, *, strategy_cfg
 
                 close_only_mode = False
 
+
                 if eff_inv_limit is not None:
                     try:
                         Q = _net_inventory_btc(ex)  # 何をするか：現在の建玉（BTC）を取得して合算
@@ -770,6 +771,7 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True, *, strategy_cfg
                         logger.debug(f"pause inventory_guard: |Q|={abs(Q)} ≥ {eff_inv_limit}")
 
                         continue
+
 
 
 
