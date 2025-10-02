@@ -8,6 +8,7 @@ import os  # 実行ディレクトリの判定や環境変数利用
 import copy  # 辞書のディープコピーで安全に合成
 import yaml  # YAML読取（pyyaml）
 from pydantic import BaseModel, Field  # 型検査モデル（v2）
+import time  # 現在のUNIX時刻(ミリ秒)を取得するために使用
 
 # ─────────────────────────────────────────────────────────────
 # Pydanticモデル定義（文書の設定キーを最小構成で網羅：env/size/risk/guard/窓/遅延/特徴/戦略/ログ/BT専用）
@@ -130,3 +131,8 @@ def load_config(config_path: str | os.PathLike[str]) -> Config:
     override = _read_yaml(cfg_path)
     merged = deep_merge(base, override)
     return Config.model_validate(merged)
+
+
+def now_ms() -> int:
+    # 何をする関数か：現在のUNIX時刻(エポック)をミリ秒で返す（ログ/TTL/クールダウン判定に使用）
+    return time.time_ns() // 1_000_000
