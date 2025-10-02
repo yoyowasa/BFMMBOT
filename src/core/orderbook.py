@@ -12,6 +12,7 @@ from dataclasses import dataclass  # Best側の状態を1まとまりにする
 from typing import Dict, Any, Deque, Tuple, Iterable  # 型ヒント
 from collections import deque  # C/Aイベントのスライディング窓
 from datetime import datetime, timezone  # ISO→datetime と経過ms計算
+import time  # Bestの滞留時間(ms)を単調時計で測るために使用
 from loguru import logger  # ログ（必要時）
 
 # ─────────────────────────────────────────────────────────────
@@ -44,6 +45,10 @@ class OrderBook:
         # C/A計測用： (時刻, side, kind, qty_abs) を貯める（kind: "add" | "cancel"）
         self.ca_events: Deque[Tuple[datetime, str, str, float]] = deque()
         self._last_ts: datetime | None = None  # 最後に適用したイベントの時刻
+        self._last_best_bid_px = None  # Best Bidの直近価格（Ageリセット判定用）
+        self._last_best_ask_px = None  # Best Askの直近価格（Ageリセット判定用）
+        self._last_best_update_mono = time.monotonic()  # Age起点（単調時計）
+        self._best_age_ms = 0.0  # Bestの滞留時間（ms）— 外部へ提供する指標
 
     # ── 【関数】イベント受信→適用（boardチャンネルのみ拾う）
     def update_from_event(self, ev: Dict[str, Any]) -> None:
@@ -61,6 +66,16 @@ class OrderBook:
         self._apply_side("ask", now, message.get("asks") or [])
         self._refresh_best("bid", now)
         self._refresh_best("ask", now)
+        bid_px = self.best_bid.price  # 現在のBest Bid価格（Ageリセット判定）
+        ask_px = self.best_ask.price  # 現在のBest Ask価格（Ageリセット判定）
+        current_mono = time.monotonic()  # 今回適用時点の単調時計を取得
+        if self._last_best_bid_px is None or self._last_best_ask_px is None:
+            self._last_best_update_mono = current_mono  # 初回は現在時刻を起点にする
+        elif bid_px != self._last_best_bid_px or ask_px != self._last_best_ask_px:
+            self._last_best_update_mono = current_mono  # どちらかのBest価格変化でAgeをリセット
+        self._best_age_ms = (current_mono - self._last_best_update_mono) * 1000.0  # 単調時計差分から最新の滞留時間(ms)を算出
+        self._last_best_bid_px = bid_px  # 次回比較に向けてBest Bid価格を保存
+        self._last_best_ask_px = ask_px  # 次回比較に向けてBest Ask価格を保存
 
     # ── 側ごとの差分適用（Best層のC/Aイベントもここで採集）
     def _apply_side(self, side: str, now: datetime, levels: Iterable[Dict[str, Any]]) -> None:
@@ -114,13 +129,8 @@ class OrderBook:
 
     # ── 【関数】Best静止時間（ms）：両側のうち短い方（=より厳しい定義）を返す
     def best_age_ms(self, now: datetime | None = None) -> int:
-        now = now or self._last_ts or datetime.now(timezone.utc)
-        ages = []
-        if self.best_bid.since:
-            ages.append(_age_ms(self.best_bid.since, now))
-        if self.best_ask.since:
-            ages.append(_age_ms(self.best_ask.since, now))
-        return min(ages) if ages else 0
+        _ = now  # シグネチャ互換用（単調時計で管理するため未使用）
+        return int(self._best_age_ms)  # 単調時計で算出した滞留時間(ms)を整数で返す
 
     # ── 【関数】スプレッド（tick単位）
     def spread_ticks(self) -> int:
