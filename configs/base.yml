@@ -41,14 +41,12 @@ features:  # 戦略のしきい値（#1/#2 の主材料）
   tiny_prints_minCount: 14 # Tiny-Prints発火閾値（OFFの初期値）
   eta_t_window_ms: 800     # Queue ETAの窓（OFFの初期値）
   zero_reopen_pop:  # 何をする設定か：ゼロ→再拡大の“一拍だけ”出す戦略のパラメータ
-
     min_best_age_ms: 200        # 何をする設定か：Bestがこの時間（ms）以上変わらず“落ち着いて”いたら発注を許可
     reopen_stable_ms: 50        # 何をする設定か：再拡大がこの時間（ms）続いたら発注を許可（瞬間ノイズはスルー）
     loss_cooloff_ms: 1500      # 何をする設定か：非常口フラット後に“お休み”する時間ms（連続被弾を防ぐ）
     fee_maker_bp: 0.0        # 何をする設定か：メーカー手数料（bp）。例：-2.0 は -0.02% のリベート、+2.0 は +0.02% の費用
     fee_taker_bp: 0.0        # 何をする設定か：テイカー手数料（bp）。例：10.0 は 0.10%
     edge_bp_min: 0.0         # 何をする設定か：手数料控除後に最低これだけ余裕(bps)がないと発注しない（まずは0.0で様子見）
-
     max_speed_ticks_per_s: 12.0     # 何をする設定か：midの速さ（tick/秒）がこの上限を超えたら発注しない
     min_spread_tick: 1         # 何をする設定か：再拡大の下限tick（1以上で発注可）
     max_spread_tick: 2         # 何をする設定か：再拡大が広すぎるときは出さない上限tick
