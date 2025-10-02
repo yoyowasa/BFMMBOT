@@ -13,6 +13,7 @@ from src.core.orders import Order        # Limit/IOC と TTL/タグを付けて�
 from src.core.utils import now_ms        # クールダウンや“直後”判定に使うミリ秒時刻
 
 import logging  # 何をするか：この戦略の意思決定ログを出すために使う
+import random  # 何をするか：TTLに±ゆらぎ（jitter）を与えるための乱数を使う
 
 
 logger = logging.getLogger(__name__)  # 何をするか：戦略専用のロガーを用意（情報/デバッグを出す）
@@ -34,6 +35,8 @@ class ZeroReopenConfig:
     cooloff_ms: int = 250          # 連打禁止と毒性回避のための“息継ぎ”
     seen_zero_window_ms: int = 1000  # どれだけ“ゼロ直後”を有効とみなすか
     loss_cooloff_ms: int = 1500   # 何をする設定か：非常口フラット後に“お休み”する時間ms（連打で再被弾を防ぐ）
+    stop_adverse_ticks: int = 2    # 何をする設定か：エントリーVWAPから不利にこのtick以上動いたら即フラットIOCで逃げる
+    ttl_jitter_ms: int = 80      # 何をする設定か：TTLに与える±ゆらぎ幅（ms）。同時発注の衝突を避ける
     reopen_stable_ms: int = 50   # 何をする設定か：再拡大してから“この時間だけ継続”したら発注を許可（瞬間ノイズで出さない）
     min_best_age_ms: int = 200   # 何をする設定か：Bestがこの時間（ms）以上変わらず“落ち着いて”いたら発注を許
 
@@ -86,6 +89,7 @@ class ZeroReopenPop(StrategyBase):
         self.cfg = cfg or ZeroReopenConfig()
         self._last_spread_zero_ms: int = -10**9
         self._last_action_ms: int = -10**9
+        self._last_entry_ttl_ms: int = self.cfg.ttl_ms  # 何をするか：直近エントリーの実TTL（jitter反映）を記録し、ロック時間と合わせる
         self._fired_on_this_zero: bool = False  # 何をするか：同一“ゼロ”イベントにつき発注は1回だけにするフラグ
         self._lock_until_ms: int = -10**9  # 何をするか：同時に複数枚を出さない“発注ロック”の期限ms（TTL中は新規禁止）
         self._penalty_until_ms: int = -10**9  # 何をするか：罰ゲーム中はここまで新規発注を禁止（ロス・クールオフの期限ms）
@@ -98,6 +102,7 @@ class ZeroReopenPop(StrategyBase):
         self._tp_pending: bool = False        # 何をするか：利確IOC待ち（まだ手仕舞えていない）かどうか
         self._tp_deadline_ms: int = -10**9    # 何をするか：この時刻を過ぎたら“フラットIOC”を出す締切
         self._open_side: Optional[str] = None # 何をするか：保有している方向（BUY/SELL）
+        self._open_vwap_px: float = 0.0  # 何をするか：保有ポジションの平均価格（VWAP）を記録（部分約定に対応）
         self._open_size: float = 0.0          # 何をするか：保有しているサイズ
         self._last_mid_px: float = 0.0       # 何をするか：前回のmid価格を記録して速さ（速度）を測る
         self._last_mid_ts_ms: int = -10**9   # 何をするか：前回midの記録時刻（ms）
@@ -291,12 +296,14 @@ class ZeroReopenPop(StrategyBase):
         best_ask = ask_px  # 何をするか：SELL時のメイク価格（tick整合済みのbest）
         side_str = str(side).upper()
         px = best_bid if side_str == "BUY" else best_ask  # 何をするか：BUY→best_bid / SELL→best_ask に統一（ズレ防止）
+        ttl = max(0, int(self.cfg.ttl_ms + random.randint(-self.cfg.ttl_jitter_ms, self.cfg.ttl_jitter_ms)))  # 何をするか：TTLに±ゆらぎを与える
+        self._last_entry_ttl_ms = ttl  # 何をするか：この発注に使う実TTLを記録（のちのロック解除に使う）
         order = Order(
             side=side,
             price=px,
             size=self.cfg.size_min,
             tif="GTC",
-            ttl_ms=self.cfg.ttl_ms,
+            ttl_ms=self._last_entry_ttl_ms,
             tag=self._entry_tag,
         )
         return {"type": "place", "order": order}
@@ -379,6 +386,47 @@ class ZeroReopenPop(StrategyBase):
                     return actions
             return actions
 
+        # 何をするか：逆行が規定tickを超えたら、時間を待たずに即フラットIOCで逃げる
+        if self._tp_pending and self._open_size > 0.0 and self.cfg.stop_adverse_ticks > 0:
+            best_bid, best_ask = self._get_best_prices(ob)
+            if best_bid is not None and best_ask is not None and self._open_vwap_px > 0.0:
+                try:
+                    tick = float(ob.tick_size())
+                except Exception:
+                    tick = 0.0
+                tick = max(tick, 1e-12)
+                adverse_ticks = 0.0
+                if self._open_side == "BUY":
+                    adverse_ticks = max(0.0, (self._open_vwap_px - float(best_bid)) / tick)
+                elif self._open_side == "SELL":
+                    adverse_ticks = max(0.0, (float(best_ask) - self._open_vwap_px) / tick)
+                if adverse_ticks >= self.cfg.stop_adverse_ticks:
+                    self._log_decision(
+                        "flat_adverse",
+                        side=self._open_side,
+                        adv_ticks=f"{adverse_ticks:.1f}",
+                        stop=self.cfg.stop_adverse_ticks,
+                    )
+                    if self._open_side == "BUY":
+                        order = Order(
+                            side="sell",
+                            price=float(best_bid),
+                            size=self._open_size,
+                            tif="IOC",
+                            ttl_ms=200,
+                            tag="zero_reopen_flat",
+                        )
+                    else:
+                        order = Order(
+                            side="buy",
+                            price=float(best_ask),
+                            size=self._open_size,
+                            tif="IOC",
+                            ttl_ms=200,
+                            tag="zero_reopen_flat",
+                        )
+                    return [{"type": "place", "order": order}]
+
         if self._entry_active and (now_ms >= self._lock_until_ms or not self._is_reopen(ob, now_ms)):
             actions.append(self._build_cancel())
 
@@ -393,7 +441,7 @@ class ZeroReopenPop(StrategyBase):
             self._log_decision("entry", spread=ob.spread_ticks(), side=side, px=order_px, ttl=self.cfg.ttl_ms)  # 何をするか：エントリー実行を記録
             actions.append(action)
             self._last_action_ms = now_ms
-            self._lock_until_ms = now_ms + self.cfg.ttl_ms
+            self._lock_until_ms = now_ms + self._last_entry_ttl_ms  # 何をするか：ロックは“実際に使ったTTL分だけ”かける
             self._entry_active = True
             self._fired_on_this_zero = True  # 何をするか：この“ゼロ”での発注を消費（次は新しいゼロが来るまで出さない）
 
@@ -428,6 +476,7 @@ class ZeroReopenPop(StrategyBase):
                 self._open_size = 0.0
                 self._tp_pending = False
                 self._open_side = None
+                self._open_vwap_px = 0.0  # 何をするか：在庫がゼロになったのでVWAPをリセット
                 self._lock_until_ms = now - 1
             else:
                 self._tp_pending = True
@@ -449,29 +498,48 @@ class ZeroReopenPop(StrategyBase):
         # 何をするか：エントリー約定を受けたので、利確IOCの“締切”をセットして待機フラグON
         fill_side = getattr(my_fill, "side", None)
         fill_size = getattr(my_fill, "size", None)
+        fill_price = getattr(my_fill, "price", None)
         if isinstance(my_fill, Mapping):
             if fill_side is None:
                 fill_side = my_fill.get("side")
             if fill_size is None:
                 fill_size = my_fill.get("size")
+            if fill_price is None:
+                fill_price = my_fill.get("price")
             order_info = my_fill.get("order")
-            if fill_side is None and order_info is not None:
-                fill_side = getattr(order_info, "side", None)
-            if fill_size is None and order_info is not None:
-                fill_size = getattr(order_info, "size", None)
+            if order_info is not None:
+                if fill_side is None:
+                    fill_side = getattr(order_info, "side", None)
+                if fill_size is None:
+                    fill_size = getattr(order_info, "size", None)
+                if fill_price is None:
+                    fill_price = getattr(order_info, "price", None)
         side_str = str(fill_side).upper() if fill_side is not None else None
         size_val = float(fill_size) if fill_size is not None else 0.0
         if size_val <= 0.0:
             size_val = 0.0
+        price_val = float(fill_price) if fill_price is not None else None
         self._tp_pending = True
         self._tp_deadline_ms = now + self.cfg.flat_timeout_ms
-        if self._open_side is None and side_str:
-            self._open_side = side_str
-        self._open_size += size_val
+        if self._open_side is None:
+            if side_str:
+                self._open_side = side_str
+            self._open_size = size_val
+            self._open_vwap_px = price_val if price_val is not None else 0.0
+        else:
+            if size_val > 0.0:
+                new_size = self._open_size + size_val
+                if price_val is not None:
+                    self._open_vwap_px = (
+                        (self._open_vwap_px * self._open_size + price_val * size_val)
+                        / max(new_size, 1e-12)
+                    )
+                self._open_size = new_size
         if self._open_size <= 1e-12:
             self._tp_pending = False
             self._open_side = None
             self._open_size = 0.0
+            self._open_vwap_px = 0.0
 
         try:
             action = self._build_take_profit(ob, my_fill)
