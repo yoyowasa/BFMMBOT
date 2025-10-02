@@ -754,18 +754,25 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True, *, strategy_cfg
                     continue  # 何をするか：次のイベントまで待つ
 
                 # 何をするか：在庫上限ガード（建玉 |Q| が上限以上なら新規を止める）
+
                 close_only_mode = False
+
                 if eff_inv_limit is not None:
                     try:
                         Q = _net_inventory_btc(ex)  # 何をするか：現在の建玉（BTC）を取得して合算
                     except NameError:
                         Q = 0.0  # 何をするか：ヘルパ未追加でも落ちないように0扱い
+
                     if abs(Q) >= eff_inv_limit or abs(pnl_state["pos"]) >= eff_inv_limit:
                         close_only_mode = True
+
                         if live_orders:
                             ex.cancel_all_child_orders()
                             live_orders.clear()
                         logger.debug(f"pause inventory_guard: |Q|={abs(Q)} ≥ {eff_inv_limit}")
+
+                        continue
+
 
                 # 何をするか：TTL 超過の注文を自動キャンセル（レート制限中は呼ばない）
                 if not throttled:
@@ -956,6 +963,7 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True, *, strategy_cfg
                                 logger.debug("pause: inventory_guard_close_only")
                                 _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="inventory_guard", pos_before=current_pos, pos_after=pos_after, limit=eff_inv_limit, side=side_norm, sz=sz)
                                 continue
+
 
                         acc = ex.send_child_order(
                             side=side_norm, size=sz, price=px, time_in_force=_act(o, "tif", "GTC")
