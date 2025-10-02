@@ -13,6 +13,7 @@ size:  # 取引サイズの下限と既定値
 
 risk:  # リスク上限と非常停止（Kill-Switch）
   max_inventory: 0.2  # 在庫の絶対上限（BTC）
+  inventory_eps: 0.002  # 上限の手前に置く安全マージン（単位=ベース通貨）。この分だけ手前で新規をブロックする
   kill:
     daily_pnl_jpy: -30000  # 日次損益がこの値を下回ったら停止
     max_dd_jpy: -20000     # ドローダウンがこの値を下回ったら停止
@@ -41,6 +42,7 @@ features:  # 戦略のしきい値（#1/#2 の主材料）
   tiny_prints_minCount: 14 # Tiny-Prints発火閾値（OFFの初期値）
   eta_t_window_ms: 800     # Queue ETAの窓（OFFの初期値）
   zero_reopen_pop:  # 何をする設定か：ゼロ→再拡大の“一拍だけ”出す戦略のパラメータ
+    ttl_jitter_ms: 80          # 何をする設定か：TTLに与える±ゆらぎ幅(ms)。同時剥がれの衝突を避ける
     min_best_age_ms: 200        # 何をする設定か：Bestがこの時間（ms）以上変わらず“落ち着いて”いたら発注を許可
     reopen_stable_ms: 50        # 何をする設定か：再拡大がこの時間（ms）続いたら発注を許可（瞬間ノイズはスルー）
     loss_cooloff_ms: 1500      # 何をする設定か：非常口フラット後に“お休み”する時間ms（連続被弾を防ぐ）
@@ -51,6 +53,7 @@ features:  # 戦略のしきい値（#1/#2 の主材料）
     min_spread_tick: 1         # 何をする設定か：再拡大の下限tick（1以上で発注可）
     max_spread_tick: 2         # 何をする設定か：再拡大が広すぎるときは出さない上限tick
     ttl_ms: 800                # 何をする設定か：指値の寿命ms（置きっぱなし防止）
+    stop_adverse_ticks: 2       # 何をする設定か：エントリーVWAPから不利にこのtick以上動いたら即フラットIOCで逃げる
     size_min: 0.001            # 何をする設定か：最小ロット（取引所の最小単位に合わせる）
     cooloff_ms: 250            # 何をする設定か：連打を防ぐ冷却時間ms
     seen_zero_window_ms: 1000  # 何をする設定か：ゼロを“直後”とみなす時間窓ms
