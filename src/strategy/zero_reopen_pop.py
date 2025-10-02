@@ -13,6 +13,7 @@ from src.core.orders import Order        # Limit/IOC と TTL/タグを付けて�
 from src.core.utils import now_ms        # クールダウンや“直後”判定に使うミリ秒時刻
 
 import logging  # 何をするか：この戦略の意思決定ログを出すために使う
+import random  # 何をするか：TTLに±ゆらぎ（jitter）を与えるための乱数を使う
 
 
 logger = logging.getLogger(__name__)  # 何をするか：戦略専用のロガーを用意（情報/デバッグを出す）
@@ -35,6 +36,7 @@ class ZeroReopenConfig:
     seen_zero_window_ms: int = 1000  # どれだけ“ゼロ直後”を有効とみなすか
     loss_cooloff_ms: int = 1500   # 何をする設定か：非常口フラット後に“お休み”する時間ms（連打で再被弾を防ぐ）
     stop_adverse_ticks: int = 2    # 何をする設定か：エントリーVWAPから不利にこのtick以上動いたら即フラットIOCで逃げる
+    ttl_jitter_ms: int = 80      # 何をする設定か：TTLに与える±ゆらぎ幅（ms）。同時発注の衝突を避ける
     reopen_stable_ms: int = 50   # 何をする設定か：再拡大してから“この時間だけ継続”したら発注を許可（瞬間ノイズで出さない）
     min_best_age_ms: int = 200   # 何をする設定か：Bestがこの時間（ms）以上変わらず“落ち着いて”いたら発注を許
 
@@ -87,6 +89,7 @@ class ZeroReopenPop(StrategyBase):
         self.cfg = cfg or ZeroReopenConfig()
         self._last_spread_zero_ms: int = -10**9
         self._last_action_ms: int = -10**9
+        self._last_entry_ttl_ms: int = self.cfg.ttl_ms  # 何をするか：直近エントリーの実TTL（jitter反映）を記録し、ロック時間と合わせる
         self._fired_on_this_zero: bool = False  # 何をするか：同一“ゼロ”イベントにつき発注は1回だけにするフラグ
         self._lock_until_ms: int = -10**9  # 何をするか：同時に複数枚を出さない“発注ロック”の期限ms（TTL中は新規禁止）
         self._penalty_until_ms: int = -10**9  # 何をするか：罰ゲーム中はここまで新規発注を禁止（ロス・クールオフの期限ms）
@@ -293,12 +296,14 @@ class ZeroReopenPop(StrategyBase):
         best_ask = ask_px  # 何をするか：SELL時のメイク価格（tick整合済みのbest）
         side_str = str(side).upper()
         px = best_bid if side_str == "BUY" else best_ask  # 何をするか：BUY→best_bid / SELL→best_ask に統一（ズレ防止）
+        ttl = max(0, int(self.cfg.ttl_ms + random.randint(-self.cfg.ttl_jitter_ms, self.cfg.ttl_jitter_ms)))  # 何をするか：TTLに±ゆらぎを与える
+        self._last_entry_ttl_ms = ttl  # 何をするか：この発注に使う実TTLを記録（のちのロック解除に使う）
         order = Order(
             side=side,
             price=px,
             size=self.cfg.size_min,
             tif="GTC",
-            ttl_ms=self.cfg.ttl_ms,
+            ttl_ms=self._last_entry_ttl_ms,
             tag=self._entry_tag,
         )
         return {"type": "place", "order": order}
@@ -436,7 +441,7 @@ class ZeroReopenPop(StrategyBase):
             self._log_decision("entry", spread=ob.spread_ticks(), side=side, px=order_px, ttl=self.cfg.ttl_ms)  # 何をするか：エントリー実行を記録
             actions.append(action)
             self._last_action_ms = now_ms
-            self._lock_until_ms = now_ms + self.cfg.ttl_ms
+            self._lock_until_ms = now_ms + self._last_entry_ttl_ms  # 何をするか：ロックは“実際に使ったTTL分だけ”かける
             self._entry_active = True
             self._fired_on_this_zero = True  # 何をするか：この“ゼロ”での発注を消費（次は新しいゼロが来るまで出さない）
 
