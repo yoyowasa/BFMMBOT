@@ -8,8 +8,9 @@ from __future__ import annotations
 import asyncio  # 非同期ループ/キャンセル
 from collections import deque  # 30sミッド履歴でガード
 from datetime import datetime, timezone, timedelta  # ts解析と現在時刻 JST日付の境界計算にtimedeltaを使う
-from typing import Deque, Tuple  # 型ヒント
+from typing import Deque, Optional, Tuple  # 型ヒント
 import csv  # 役割：窓イベントをCSVに1行追記するために使用
+import time  # 何をするか：現在時刻(ms)を取得してHB間隔を測る
 from loguru import logger  # 実行ログ
 from pathlib import Path  # ハートビートNDJSONのファイル出力に使用
 import orjson  # 1行JSON化（高速）
@@ -20,6 +21,48 @@ from src.core.logs import OrderLog, TradeLog  # 【関数】発注/約定ログ�
 from src.core.analytics import DecisionLog  # 【関数】意思決定ログ（Parquet）:contentReference[oaicite:6]{index=6}
 from src.strategy import build_strategy  # 何をするか：戦略生成を中央ファクトリに委譲する
 from src.core.risk import RiskGate  # 何をするか：在庫ゲート（市場モードでClose-Onlyを切り替える）
+
+
+def _eval_feed_health(cfg: dict | object,
+                      best_age_ms: Optional[float],
+                      hb_gap_sec: Optional[float]) -> Tuple[str, str]:
+    """何をするか：板エイジ/ハートビート間隔から 'healthy' / 'caution' / 'halted' を決めて理由を返す"""
+
+    def _get(node, key: str):
+        if node is None:
+            return None
+        if isinstance(node, dict):
+            return node.get(key)
+        return getattr(node, key, None)
+
+    guard = _get(cfg, "guard") or {}
+    fh = _get(guard, "feed_health") or {}
+
+    age_cfg = _get(fh, "age_ms") or {}
+    gap_cfg = _get(fh, "heartbeat_gap_sec") or {}
+
+    age_caution = _get(age_cfg, "caution")
+    age_halted = _get(age_cfg, "halted")
+    gap_caution = _get(gap_cfg, "caution")
+    gap_halted = _get(gap_cfg, "halted")
+
+    age_caution = float(age_caution) if age_caution is not None else 3000.0
+    age_halted = float(age_halted) if age_halted is not None else 10000.0
+    gap_caution = float(gap_caution) if gap_caution is not None else 3.0
+    gap_halted = float(gap_halted) if gap_halted is not None else 10.0
+
+    if best_age_ms is not None and best_age_ms >= age_halted:
+        return "halted", f"age_ms={int(best_age_ms)}>= {int(age_halted)}"
+    if hb_gap_sec is not None and hb_gap_sec >= gap_halted:
+        return "halted", f"hb_gap_sec={round(hb_gap_sec, 3)}>= {gap_halted}"
+
+    if best_age_ms is not None and best_age_ms >= age_caution:
+        return "caution", f"age_ms={int(best_age_ms)}>= {int(age_caution)}"
+    if hb_gap_sec is not None and hb_gap_sec >= gap_caution:
+        return "caution", f"hb_gap_sec={round(hb_gap_sec, 3)}>= {gap_caution}"
+
+    return "healthy", "ok"
+
 
 def _parse_iso(ts: str) -> datetime:
     """【関数】ISO→datetime（'Z'も+00:00に正規化）"""
@@ -63,6 +106,13 @@ class PaperEngine:
         # ローカル板・シミュ・ログ器
         self.ob = OrderBook(tick_size=self.tick)
         self.sim = MiniSimulator()
+        self._feed_mode = "healthy"          # 何をするか：現在のフィード状態（healthy/caution/halted）を保持
+        self._last_feed_reason = "init"      # 何をするか：直近の判定理由（ログや監視で参照）
+        self._last_heartbeat_ms: int | None = None  # 何をするか：ハートビート/board受信時刻(ms)を保持
+        self._orig_place = None               # 何をするか：元のplace関数を保存してラップ後に呼び戻す
+        if hasattr(self, "sim") and hasattr(self.sim, "place"):
+            self._orig_place = self.sim.place
+            self.sim.place = self._place_with_feed_guard  # 何をするか：発注時にフィード健全性を確認するラップ関数へ差し替え
         self.order_log = OrderLog("logs/orders/order_log.parquet", mirror_ndjson="logs/orders/order_log.ndjson")  # NDJSONミラー有効化
         self.trade_log = TradeLog("logs/trades/trade_log.parquet", mirror_ndjson="logs/trades/trade_log.ndjson")  # NDJSONミラー有効化
         self.decision_log = DecisionLog("logs/analytics/decision_log.parquet", mirror_ndjson="logs/analytics/decision_log.ndjson")  # NDJSONミラー有効化
@@ -96,6 +146,57 @@ class PaperEngine:
             return None
         limit = float(self.max_inv) - float(self.inventory_eps)
         return max(0.0, limit)
+
+    def _place_with_feed_guard(self, *args, **kwargs):
+        """何をするか：発注直前にフィード健全性を判定し、Haltedでは新規をブロック（決済のみ許可）する"""
+        now_ms = int(time.time() * 1000)
+
+        best_age_ms: float | None = None
+        hb_gap_sec: float | None = None
+
+        ob = getattr(self, "ob", None)
+        last_rx_dt = None
+        if ob is not None:
+            ba_attr = getattr(ob, "best_age_ms", None)
+            if callable(ba_attr):
+                try:
+                    best_age_ms = float(ba_attr())
+                except Exception:
+                    best_age_ms = None
+            elif isinstance(ba_attr, (int, float)):
+                best_age_ms = float(ba_attr)
+            last_rx_dt = getattr(ob, "_last_ts", None)
+
+        if last_rx_dt is not None:
+            try:
+                hb_gap_sec = max(0.0, (datetime.now(timezone.utc) - last_rx_dt).total_seconds())
+            except Exception:
+                hb_gap_sec = None
+        elif isinstance(self._last_heartbeat_ms, (int, float)):
+            hb_gap_sec = max(0.0, (now_ms - float(self._last_heartbeat_ms)) / 1000.0)
+
+        cfg_obj = getattr(self, "cfg", {})
+        mode, reason = _eval_feed_health(cfg_obj, best_age_ms, hb_gap_sec)
+        self._feed_mode = mode
+        self._last_feed_reason = reason
+        if hasattr(self, "risk") and hasattr(self.risk, "set_market_mode"):
+            try:
+                self.risk.set_market_mode(mode)
+            except Exception:
+                pass
+
+        is_reduce = bool(kwargs.get("reduce_only"))
+        if not is_reduce and args:
+            first = args[0]
+            is_reduce = getattr(first, "reduce_only", False) or getattr(first, "close_only", False)
+
+        if mode == "halted" and not is_reduce:
+            logger.warning(f"guard:block_new_order mode=halted reason={reason}")
+            return None
+
+        if self._orig_place is None:
+            return None
+        return self._orig_place(*args, **kwargs)
     def _normalize_side(self, side: str | None) -> str | None:
         """【関数】side表現を "buy" / "sell" に正規化（それ以外はNone）"""
         if side is None:
@@ -352,6 +453,7 @@ class PaperEngine:
 
                 if ch.startswith("lightning_board_"):
                     # ローカル板更新
+                    self._last_heartbeat_ms = int(now.timestamp() * 1000)  # 何をするか：最新board受信時刻を記録しHB間隔を測る
                     # 日次境界（JST）を跨いだら R_day/HWM をリセット
                     self._roll_daily(now)
 
