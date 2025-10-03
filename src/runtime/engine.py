@@ -36,6 +36,7 @@ def _eval_feed_health(cfg: dict | object,
         extra = getattr(node, "model_extra", None)
         if isinstance(extra, dict) and key in extra:
             return extra[key]
+
         return getattr(node, key, None)
 
     guard = _get(cfg, "guard") or {}
@@ -111,7 +112,9 @@ class PaperEngine:
         self._feed_mode = "healthy"          # 何をするか：現在のフィード状態（healthy/caution/halted）を保持
         self._last_feed_reason = "init"      # 何をするか：直近の判定理由（ログや監視で参照）
         self._last_heartbeat_ms: int | None = None  # 何をするか：ハートビート/board受信時刻(ms)を保持
+
         self._last_place_ts_ms = 0       # 何をするか：直近の新規発注時刻（Cautionの発注レート制御に使う）
+
         self._orig_place = None               # 何をするか：元のplace関数を保存してラップ後に呼び戻す
         if hasattr(self, "sim") and hasattr(self.sim, "place"):
             self._orig_place = self.sim.place
@@ -266,6 +269,7 @@ class PaperEngine:
             return None
         if not is_reduce:
             self._last_place_ts_ms = now_ms  # 何をするか：新規発注が通る直前に“最後に出した時刻”を更新（Cautionのレート制御に使う）
+
         return self._orig_place(*args, **kwargs)
     def _normalize_side(self, side: str | None) -> str | None:
         """【関数】side表現を "buy" / "sell" に正規化（それ以外はNone）"""
