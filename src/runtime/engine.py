@@ -111,7 +111,6 @@ class PaperEngine:
         self._feed_mode = "healthy"          # 何をするか：現在のフィード状態（healthy/caution/halted）を保持
         self._last_feed_reason = "init"      # 何をするか：直近の判定理由（ログや監視で参照）
         self._last_heartbeat_ms: int | None = None  # 何をするか：ハートビート/board受信時刻(ms)を保持
-
         self._last_gate_status = {"mode": "healthy", "reason": "init", "limits": {}, "ts_ms": None}  # 何をするか：直近のゲート状態（戦略から参照するため）
         self._last_place_ts_ms = 0       # 何をするか：直近の新規発注時刻（Cautionの発注レート制御に使う）
 
@@ -157,8 +156,6 @@ class PaperEngine:
         """何をするか：発注直前にフィード健全性を判定し、Haltedでは新規をブロック（決済のみ許可）する"""
         now_ms = int(time.time() * 1000)
         prev_mode = getattr(self, "_feed_mode", "healthy")  # 何をするか：モード変更の検知（ログを増やしすぎない）
-
-
         best_age_ms: float | None = None
         hb_gap_sec: float | None = None
 
@@ -187,12 +184,11 @@ class PaperEngine:
         mode, reason = _eval_feed_health(cfg_obj, best_age_ms, hb_gap_sec)
         self._feed_mode = mode
         self._last_feed_reason = reason
-
         if mode in ("healthy", "halted"):  # 何をするか：制限の無い2モードはここで一括更新（limitsは空）
             self._last_gate_status = {"mode": mode, "reason": reason, "limits": {}, "ts_ms": now_ms}
             if prev_mode != mode:
                 logger.info(f"guard:mode_change {prev_mode}->{mode} reason={reason} limits={{}}")  # 何をするか：モード変化を1行で記録
-
+n
         if hasattr(self, "risk") and hasattr(self.risk, "set_market_mode"):
             try:
                 self.risk.set_market_mode(mode)
@@ -210,6 +206,7 @@ class PaperEngine:
 
 
         if mode == "caution" and not is_reduce:
+
 
 
             def _cfg_get(node, key):
