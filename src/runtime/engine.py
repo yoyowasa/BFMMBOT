@@ -19,6 +19,7 @@ from src.core.simulator import MiniSimulator  # 【関数】最小約定シミ�
 from src.core.logs import OrderLog, TradeLog  # 【関数】発注/約定ログ（Parquet）:contentReference[oaicite:5]{index=5}
 from src.core.analytics import DecisionLog  # 【関数】意思決定ログ（Parquet）:contentReference[oaicite:6]{index=6}
 from src.strategy import build_strategy  # 何をするか：戦略生成を中央ファクトリに委譲する
+from src.core.risk import RiskGate  # 何をするか：在庫ゲート（市場モードでClose-Onlyを切り替える）
 
 def _parse_iso(ts: str) -> datetime:
     """【関数】ISO→datetime（'Z'も+00:00に正規化）"""
@@ -45,6 +46,15 @@ class PaperEngine:
             self.kill_daily = getattr(getattr(getattr(cfg, "risk", None), "kill", None), "daily_pnl_jpy", None)  # 【関数】Kill: 日次PnL閾値
             self.kill_dd = getattr(getattr(getattr(cfg, "risk", None), "kill", None), "max_dd_jpy", None)        # 【関数】Kill: 日次DD閾値
             self.halted = False  # 【関数】Kill発火後は停止
+        self.risk = RiskGate(cfg)  # 何をする行か：設定を元に在庫ゲートを構築（市場モード連携の受け皿）
+        health_cfg = getattr(cfg, "health", None)  # 何をする行か：Best静止しきい値（healthセクション）を安全に取得
+        self._stale_warn_ms = None  # 何をする行か：Best静止でCautionへ入る閾値(ms)
+        self._stale_halt_ms = None  # 何をする行か：Best静止でHaltedへ入る閾値(ms)
+        if health_cfg is not None:  # 何をする行か：healthセクションが定義されているときのみ閾値を読み込む
+            warn_sec = getattr(health_cfg, "stale_sec_warn", None)  # 何をする行か：Cautionへ入る秒数を読む
+            halt_sec = getattr(health_cfg, "stale_sec_halt", None)  # 何をする行か：Haltedへ入る秒数を読む
+            self._stale_warn_ms = float(warn_sec) * 1000.0 if warn_sec is not None else None  # 何をする行か：秒→ms換算
+            self._stale_halt_ms = float(halt_sec) * 1000.0 if halt_sec is not None else None  # 何をする行か：秒→ms換算
 
         # 戦略（#1/#2/#3）を選択
         self.strat = build_strategy(strategy_name, cfg, strategy_cfg=strategy_cfg)
@@ -199,11 +209,11 @@ class PaperEngine:
         return False, None, daily_R, dd
 
     # ─────────────────────────────────────────────────────────────
-    def _record_decision(self, now: datetime, actions) -> None:
+    def _record_decision(self, now: datetime, actions, features: dict | None = None) -> None:
         """【関数】意思決定ログへ記録（featuresと結論の一行）"""
         # 特徴量を収集
         feats_win = getattr(getattr(self.cfg, "features", None), "ca_ratio_win_ms", 500)
-        feats = {
+        feats = features if isinstance(features, dict) else {
             "best_age_ms": self.ob.best_age_ms(now),
             "ca_ratio": self.ob.ca_ratio(now, window_ms=feats_win),
             "spread_tick": self.ob.spread_ticks(),
@@ -427,17 +437,50 @@ class PaperEngine:
 
 
                     actions = self.strat.evaluate(self.ob, now, self.cfg)
-                    self._record_decision(now, actions)
+                    feats_win = getattr(getattr(self.cfg, "features", None), "ca_ratio_win_ms", 500)  # 何をする行か：CA比率集計窓(ms)を取得
+                    features = {
+                        "best_age_ms": self.ob.best_age_ms(now),  # 何をする行か：Best静止時間(ms)を記録
+                        "ca_ratio": self.ob.ca_ratio(now, window_ms=feats_win),  # 何をする行か：C/A比率を記録
+                        "spread_tick": self.ob.spread_ticks(),  # 何をする行か：現在スプレッド(tick)を記録
+                    }
+                    self._record_decision(now, actions, features=features)
                     for act in actions:
                         if act.get("type") == "place":
                             # 同タグの重複を最小抑止
                             if self.sim.has_open_tag(act["order"].tag):
                                 continue
                             o = act["order"]
+                            age = None  # 何をする行か：best_age_msをfeatures/decisionから拾う準備
+                            if isinstance(locals().get("features"), dict):  # 何をする行か：戦略特徴量が存在する場合
+                                age = features.get("best_age_ms")
+                            elif isinstance(locals().get("decision"), dict):  # 何をする行か：決定ペイロードに含まれる場合
+                                age = decision.get("best_age_ms")
+                            if isinstance(age, (int, float)):
+                                if self._stale_halt_ms is not None and age >= self._stale_halt_ms:
+                                    self.risk.set_market_mode("halted")  # 何をする行か：Best静止が閾値超→Haltedに切替
+                                elif self._stale_warn_ms is not None and age >= self._stale_warn_ms:
+                                    self.risk.set_market_mode("caution")  # 何をする行か：Best静止が注意閾値超→Cautionに切替
+                                else:
+                                    self.risk.set_market_mode("healthy")  # 何をする行か：静止時間が短いので通常モード
+                            else:
+                                self.risk.set_market_mode("healthy")  # 何をする行か：best_ageが無ければ通常モードに戻す
+                            if self.risk.market_mode in ("caution", "halted"):
+                                close_only_mode = True  # 何をする行か：市場モードが注意/停止ならClose-Only扱いにする
                             eff_limit = self.effective_inventory_limit()
                             req_qty = float(getattr(o, "size", 0.0) or 0.0)
                             side_val = getattr(o, "side", None)
                             reduce_only = bool(getattr(o, "reduce_only", False))
+                            allow_place = self.risk.can_place(
+                                self.Q,
+                                req_qty,
+                                side=side_val,
+                                reduce_only=reduce_only,
+                                best_age_ms=age,
+                            )  # 何をする行か：市場モードと在庫から発注可否を判定
+                            if not allow_place and self.risk.market_mode in ("caution", "halted"):
+                                logger.debug(f"skip place: market_mode={self.risk.market_mode}")  # 何をする行か：静止検知で新規停止を記録
+                                self._heartbeat(now, "pause", reason="market_mode")  # 何をする行か：ハートビートに市場停止を記録
+                                continue
                             if eff_limit is not None:
                                 if abs(self.Q) + req_qty > eff_limit:
                                     if reduce_only or self.would_reduce_inventory(self.Q, side_val, req_qty):
