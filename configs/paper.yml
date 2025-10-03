@@ -15,6 +15,5 @@ guard:
   caution:            # 何をするか：Caution時のスロットル（新規を“小さく＆ゆっくり”にする）
     max_order_size: 0.003        # 何をするか：新規の最大ロット（reduce_onlyは対象外）—最小ロット×3を初期目安
     max_order_rate_per_sec: 2     # 何をするか：新規の上限レート（1秒あたりの件数）
-
 logging:
   level: DEBUG             # 【関数】詳細ログ：判断材料を多く残す

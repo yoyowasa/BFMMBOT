@@ -209,7 +209,7 @@ class ZeroReopenPop(StrategyBase):
 
     def _mark_zero(self, ob: OrderBook, now_ms: int) -> None:
         """【関数】ゼロ記録：spread==0 を見た“時刻”を記録して、のちほど“直後”判定に使う"""
-        if ob.spread_ticks() == 0:
+        if ob.spread_ticks() <= 0:  # 何をするか：スプレッドが“0以下”（ロック/クロス）もゼロ扱いにして合図を取りこぼさない
             self._last_spread_zero_ms = now_ms
             self._fired_on_this_zero = False  # 何をするか：新しい“ゼロ”を見たので再発注可にリセット
             self._reopen_since_ms = -10**9  # 何をするか：新しい“ゼロ”を見たので再拡大の起点をリセット
