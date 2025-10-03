@@ -34,6 +34,11 @@ class RiskGate:
             default_eps = max(0.0, float(self.max_inventory) * 0.01)
         eps_raw = risk_section.get("inventory_eps") if isinstance(risk_section, Mapping) else None
         self.inventory_eps = float(eps_raw) if eps_raw is not None else default_eps
+        self.market_mode = "healthy"  # 何をする行か：板の健康状態（healthy/caution/halted）を覚える
+
+    def set_market_mode(self, mode: str):
+        # 【関数】市場モードを受け取り、ゲートの振る舞いを切り替える（healthy/caution/halted）
+        self.market_mode = mode
 
     def effective_inventory_limit(self) -> float | None:
         """【関数】新規発注の実効上限（max_inventory − inventory_eps）を返す"""
@@ -67,9 +72,15 @@ class RiskGate:
         request_qty: float,
         side: str | None = None,
         reduce_only: bool = False,
+        best_age_ms: float | None = None,
         **kwargs,
     ) -> bool:
-        """【関数】在庫ゲート：新規発注を許可するかを判定"""
+        """【関数】新規発注の許可/不許可を判定する（在庫・安全装置の入口）。best_age_msは任意で健康判定に利用。"""
+        if self.market_mode in ("caution", "halted"):  # 何をする行か：市場モードが注意/停止ならClose-Onlyを適用
+            if reduce_only or (side and self.would_reduce_inventory(current_inventory, side, float(request_qty))):
+                return True   # 何をする行か：在庫を減らす（決済）なら常に許可
+            return False      # 何をする行か：在庫が増える方向の新規はブロック
+
         try:
             qty = abs(float(request_qty))
         except (TypeError, ValueError):
