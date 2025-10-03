@@ -63,6 +63,7 @@ def _eval_feed_health(cfg: dict | object,
 
     return "healthy", "ok"
 
+
 def _parse_iso(ts: str) -> datetime:
     """【関数】ISO→datetime（'Z'も+00:00に正規化）"""
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
