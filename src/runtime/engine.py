@@ -208,7 +208,9 @@ class PaperEngine:
             logger.warning(f"guard:block_new_order mode=halted reason={reason}")
             return None
 
+
         if mode == "caution" and not is_reduce:
+
 
             def _cfg_get(node, key):
                 if node is None:

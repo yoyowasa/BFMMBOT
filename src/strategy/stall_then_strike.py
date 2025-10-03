@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import List, Dict, Any  # 返り値の型
 from datetime import datetime  # 戦略判断時刻
 
+from loguru import logger  # 何をするか：ゲート理由を戦略ログに1行で出す
+
 from src.core.orderbook import OrderBook  # Best/Spreadを参照
 from src.core.orders import Order  # 置く指値の表現
 from src.strategy.base import StrategyBase  # 共通IF
@@ -14,6 +16,12 @@ class StallThenStrike(StrategyBase):
     name: str = "stall_then_strike"
 
     def evaluate(self, ob: OrderBook, now: datetime, cfg) -> List[Dict[str, Any]]:
+        engine = locals().get("engine", getattr(self, "engine", None))  # 何をするか：エンジン参照（引数or属性）
+        gate = engine.gate_status() if (engine and hasattr(engine, "gate_status")) else {"mode": "healthy", "reason": "na", "limits": {}, "ts_ms": None}  # 何をするか：ゲート状態を取得
+        if gate["mode"] == "halted":  # 何をするか：停止中は新規注文を作らず早期リターン（決済は別系で通す）
+            logger.info(f"strategy:skip_new_orders mode=halted reason={gate.get('reason')}")  # 何をするか：スキップ理由を1行で記録
+            return []  # 何をするか：このイベントでは何も出さない（新規ブロック）
+
         # 設定の読み出し（無ければ文書の最小値）:contentReference[oaicite:4]{index=4} :contentReference[oaicite:5]{index=5}
         feats = cfg.features
         stall_T = getattr(feats, "stall_T_ms", 250)

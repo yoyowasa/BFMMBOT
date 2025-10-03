@@ -33,6 +33,7 @@ class ZeroReopenConfig:
     flat_timeout_ms: int = 600         # 何をする設定か：利確IOCが通らない時の“時間でフラット”の締切ms
     ttl_ms: int = 800              # 指値の寿命（置きっぱなし防止・秒速撤退のため短め）
     size_min: float = 0.001        # 最小ロット（取引所の最小単位に合わせる）
+    min_take_qty: float = 0.0    # 何をする設定か：+1tick利確の相手側Bestに最低この数量が無いと発注しない（0で無効）
     cooloff_ms: int = 250          # 連打禁止と毒性回避のための“息継ぎ”
     seen_zero_window_ms: int = 1000  # どれだけ“ゼロ直後”を有効とみなすか
     loss_cooloff_ms: int = 1500   # 何をする設定か：非常口フラット後に“お休み”する時間ms（連打で再被弾を防ぐ）
@@ -494,6 +495,13 @@ class ZeroReopenPop(StrategyBase):
         if self._is_reopen(ob, now_ms) and self._pass_gates(ob, now_ms):
             try:
                 side = self._choose_side(ob)
+                # 何をするか：+1tick利確が通りやすいよう、相手側Bestの板厚が足りなければ今回は出さない
+                if self.cfg.min_take_qty > 0:
+                    size_reader = getattr(ob, "best_ask_size", None) if side == "BUY" else getattr(ob, "best_bid_size", None)
+                    take_sz = size_reader() if callable(size_reader) else None  # 何をするか：OrderbookViewにsize参照APIがあれば使う（無ければNone）
+                    if (take_sz is not None) and (take_sz < self.cfg.min_take_qty):
+                        self._log_decision("skip_take_liq", need=self.cfg.min_take_qty, have=take_sz, side=side)  # 何をするか：見送り理由を記録
+                        return []
                 action = self._build_entry(ob, side)
             except ValueError:
                 return actions
