@@ -2,7 +2,7 @@
 #   「スプレッドが一瞬0になった直後、1tick以上に再拡大した“その一拍”だけ」片面で最小ロットを置き、
 #   当たったら即IOCで+1tick利確して退出する“イベント駆動ワンショットMM”の本体実装。
 
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict  # 何をするか：設定の正規化結果をログ出力するため asdict を使う
 from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Mapping, Optional
 
@@ -92,6 +92,7 @@ class ZeroReopenPop(StrategyBase):
         # 何をする関数か：設定と内部状態（直近ゼロ時刻／直近アクション時刻）の初期化
         super().__init__()
         self.cfg = cfg or ZeroReopenConfig()
+        self._validate_config()  # 何をするか：設定値を安全な範囲に正規化し、矛盾を解消する
         self._last_spread_zero_ms: int = -10**9
         self._last_action_ms: int = -10**9
         self._last_entry_ttl_ms: int = self.cfg.ttl_ms  # 何をするか：直近エントリーの実TTL（jitter反映）を記録し、ロック時間と合わせる
@@ -119,6 +120,45 @@ class ZeroReopenPop(StrategyBase):
     # -------------------------
     # 内部ヘルパ（責務を明記）
     # -------------------------
+
+    def _validate_config(self) -> None:
+        """【関数】設定の正規化：何をするか：危険/矛盾のある値を安全な範囲に丸め、運用で困らない形に整える"""
+        c = self.cfg
+
+        # 時間系の最小値を確保
+        if c.ttl_ms < 1: c.ttl_ms = 1
+        if c.ttl_jitter_ms < 0: c.ttl_jitter_ms = 0
+        if c.ttl_jitter_ms > c.ttl_ms: c.ttl_jitter_ms = c.ttl_ms
+        if c.seen_zero_window_ms < 1: c.seen_zero_window_ms = 1
+        if c.reopen_stable_ms < 0: c.reopen_stable_ms = 0
+        if c.min_best_age_ms < 0: c.min_best_age_ms = 0
+        if c.cooloff_ms < 0: c.cooloff_ms = 0
+        if c.entries_window_ms < 1: c.entries_window_ms = 1
+        if c.flat_timeout_ms < 1: c.flat_timeout_ms = 1
+        if c.loss_cooloff_ms < 0: c.loss_cooloff_ms = 0
+
+        # 量/カウントの下限
+        if c.size_min <= 0: c.size_min = 0.001
+        if c.max_entries_in_window < 1: c.max_entries_in_window = 1
+
+        # 幅（tick）の整合
+        if c.min_spread_tick < 1: c.min_spread_tick = 1
+        if c.max_spread_tick < c.min_spread_tick: c.max_spread_tick = c.min_spread_tick
+        if c.exact_one_tick_only:
+            c.min_spread_tick = 1
+            c.max_spread_tick = 1  # 何をするか：1tick限定モードでは幅を自動固定
+
+        # 速度・撤退の下限
+        if c.max_speed_ticks_per_s < 0: c.max_speed_ticks_per_s = 0.0
+        if c.stop_adverse_ticks < 0: c.stop_adverse_ticks = 0
+
+        # 参考：手数料/期待エッジ（bp）は負値も運用上あり得るため丸めない
+
+        # 正規化結果をログへ
+        try:
+            logger.info("zr_cfg_normalized %s", asdict(c))  # 何をするか：最終的に使う設定を1行で記録
+        except Exception:
+            logger.exception("zr_cfg_log_error")  # 何をするか：ログ化に失敗しても戦略は継続
 
     def _log_decision(self, reason: str, **fields) -> None:
         """【関数】意思決定ログ：何をするか：判断理由と主要パラメータを1行で記録する"""
@@ -169,7 +209,7 @@ class ZeroReopenPop(StrategyBase):
 
     def _mark_zero(self, ob: OrderBook, now_ms: int) -> None:
         """【関数】ゼロ記録：spread==0 を見た“時刻”を記録して、のちほど“直後”判定に使う"""
-        if ob.spread_ticks() == 0:
+        if ob.spread_ticks() <= 0:  # 何をするか：スプレッドが“0以下”（ロック/クロス）もゼロ扱いにして合図を取りこぼさない
             self._last_spread_zero_ms = now_ms
             self._fired_on_this_zero = False  # 何をするか：新しい“ゼロ”を見たので再発注可にリセット
             self._reopen_since_ms = -10**9  # 何をするか：新しい“ゼロ”を見たので再拡大の起点をリセット
