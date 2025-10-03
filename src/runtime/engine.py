@@ -33,6 +33,10 @@ def _eval_feed_health(cfg: dict | object,
             return None
         if isinstance(node, dict):
             return node.get(key)
+        extra = getattr(node, "model_extra", None)
+        if isinstance(extra, dict) and key in extra:
+            return extra[key]
+
         return getattr(node, key, None)
 
     guard = _get(cfg, "guard") or {}
@@ -108,6 +112,9 @@ class PaperEngine:
         self._feed_mode = "healthy"          # 何をするか：現在のフィード状態（healthy/caution/halted）を保持
         self._last_feed_reason = "init"      # 何をするか：直近の判定理由（ログや監視で参照）
         self._last_heartbeat_ms: int | None = None  # 何をするか：ハートビート/board受信時刻(ms)を保持
+
+        self._last_place_ts_ms = 0       # 何をするか：直近の新規発注時刻（Cautionの発注レート制御に使う）
+
         self._orig_place = None               # 何をするか：元のplace関数を保存してラップ後に呼び戻す
         if hasattr(self, "sim") and hasattr(self.sim, "place"):
             self._orig_place = self.sim.place
@@ -193,8 +200,76 @@ class PaperEngine:
             logger.warning(f"guard:block_new_order mode=halted reason={reason}")
             return None
 
+        if mode == "caution" and not is_reduce:
+            def _cfg_get(node, key):
+                if node is None:
+                    return None
+                if isinstance(node, dict):
+                    return node.get(key)
+                extra = getattr(node, "model_extra", None)
+                if isinstance(extra, dict) and key in extra:
+                    return extra[key]
+                return getattr(node, key, None)
+
+            guard_cfg = _cfg_get(cfg_obj, "guard") or {}
+            caution_cfg = _cfg_get(guard_cfg, "caution") or {}
+
+            size_cfg = _cfg_get(cfg_obj, "size") or {}
+            if isinstance(size_cfg, dict):
+                sz_min_val = size_cfg.get("min")
+            else:
+                sz_min_val = getattr(size_cfg, "min", None)
+            try:
+                sz_min = float(sz_min_val)
+                if sz_min <= 0:
+                    raise ValueError
+            except Exception:
+                sz_min = 0.001
+
+            max_sz_raw = _cfg_get(caution_cfg, "max_order_size")
+            try:
+                max_sz = float(max_sz_raw if max_sz_raw is not None else 3 * sz_min)
+            except Exception:
+                max_sz = 3 * sz_min
+            if max_sz <= 0:
+                max_sz = 3 * sz_min
+
+            rate_raw = _cfg_get(caution_cfg, "max_order_rate_per_sec")
+            try:
+                rate = float(rate_raw if rate_raw is not None else 2.0)
+            except Exception:
+                rate = 2.0
+            if rate <= 0:
+                rate = 2.0
+            min_interval_ms = 1000.0 / max(0.001, rate)
+
+            if now_ms - self._last_place_ts_ms < min_interval_ms:
+                limit_rate = 0.0
+                if min_interval_ms > 0:
+                    limit_rate = round(1000.0 / min_interval_ms, 3)
+                logger.warning(f"guard:throttle_new_order mode=caution reason=rate_limit {limit_rate}req/s")
+                return None
+
+            if args:
+                first = args[0]
+                if hasattr(first, "size") and isinstance(getattr(first, "size"), (int, float)) and first.size > max_sz:
+                    logger.warning(f"guard:shrink_size mode=caution from={first.size} to={max_sz}")
+                    first.size = max_sz
+                elif hasattr(first, "sz") and isinstance(getattr(first, "sz"), (int, float)) and first.sz > max_sz:
+                    logger.warning(f"guard:shrink_size mode=caution from={first.sz} to={max_sz}")
+                    first.sz = max_sz
+            if "size" in kwargs and isinstance(kwargs["size"], (int, float)) and kwargs["size"] > max_sz:
+                logger.warning(f"guard:shrink_size mode=caution from={kwargs['size']} to={max_sz}")
+                kwargs["size"] = max_sz
+            if "sz" in kwargs and isinstance(kwargs["sz"], (int, float)) and kwargs["sz"] > max_sz:
+                logger.warning(f"guard:shrink_size mode=caution from={kwargs['sz']} to={max_sz}")
+                kwargs["sz"] = max_sz
+
         if self._orig_place is None:
             return None
+        if not is_reduce:
+            self._last_place_ts_ms = now_ms  # 何をするか：新規発注が通る直前に“最後に出した時刻”を更新（Cautionのレート制御に使う）
+
         return self._orig_place(*args, **kwargs)
     def _normalize_side(self, side: str | None) -> str | None:
         """【関数】side表現を "buy" / "sell" に正規化（それ以外はNone）"""
