@@ -111,11 +111,9 @@ class PaperEngine:
         self._feed_mode = "healthy"          # 何をするか：現在のフィード状態（healthy/caution/halted）を保持
         self._last_feed_reason = "init"      # 何をするか：直近の判定理由（ログや監視で参照）
         self._last_heartbeat_ms: int | None = None  # 何をするか：ハートビート/board受信時刻(ms)を保持
+
+        self._last_gate_status = {"mode": "healthy", "reason": "init", "limits": {}, "ts_ms": None}  # 何をするか：直近のゲート状態（戦略から参照するため）
         self._last_place_ts_ms = 0       # 何をするか：直近の新規発注時刻（Cautionの発注レート制御に使う）
-
-
-  # 何をするか：直近の新規発注時刻（Cautionの発注レート制御に使う）
-
 
         self._orig_place = None               # 何をするか：元のplace関数を保存してラップ後に呼び戻す
         if hasattr(self, "sim") and hasattr(self.sim, "place"):
@@ -158,6 +156,8 @@ class PaperEngine:
     def _place_with_feed_guard(self, *args, **kwargs):
         """何をするか：発注直前にフィード健全性を判定し、Haltedでは新規をブロック（決済のみ許可）する"""
         now_ms = int(time.time() * 1000)
+        prev_mode = getattr(self, "_feed_mode", "healthy")  # 何をするか：モード変更の検知（ログを増やしすぎない）
+
 
         best_age_ms: float | None = None
         hb_gap_sec: float | None = None
@@ -187,6 +187,12 @@ class PaperEngine:
         mode, reason = _eval_feed_health(cfg_obj, best_age_ms, hb_gap_sec)
         self._feed_mode = mode
         self._last_feed_reason = reason
+
+        if mode in ("healthy", "halted"):  # 何をするか：制限の無い2モードはここで一括更新（limitsは空）
+            self._last_gate_status = {"mode": mode, "reason": reason, "limits": {}, "ts_ms": now_ms}
+            if prev_mode != mode:
+                logger.info(f"guard:mode_change {prev_mode}->{mode} reason={reason} limits={{}}")  # 何をするか：モード変化を1行で記録
+
         if hasattr(self, "risk") and hasattr(self.risk, "set_market_mode"):
             try:
                 self.risk.set_market_mode(mode)
@@ -203,6 +209,7 @@ class PaperEngine:
             return None
 
         if mode == "caution" and not is_reduce:
+
             def _cfg_get(node, key):
                 if node is None:
                     return None
@@ -245,33 +252,45 @@ class PaperEngine:
                 rate = 2.0
             min_interval_ms = 1000.0 / max(0.001, rate)
 
-            if now_ms - self._last_place_ts_ms < min_interval_ms:
-                limit_rate = 0.0
-                if min_interval_ms > 0:
-                    limit_rate = round(1000.0 / min_interval_ms, 3)
-                logger.warning(f"guard:throttle_new_order mode=caution reason=rate_limit {limit_rate}req/s")
-                return None
+            limits = {"max_order_size": max_sz, "max_order_rate_per_sec": rate}  # 何をするか：Caution時の制限（戦略へ伝える数字）
+            self._last_gate_status = {"mode": "caution", "reason": reason, "limits": limits, "ts_ms": now_ms}  # 何をするか：最新ゲート情報を更新
+            if prev_mode != "caution":
+                logger.info(f"guard:mode_change {prev_mode}->caution reason={reason} limits={limits}")  # 何をするか：モード変化を1行で記録
 
-            if args:
-                first = args[0]
-                if hasattr(first, "size") and isinstance(getattr(first, "size"), (int, float)) and first.size > max_sz:
-                    logger.warning(f"guard:shrink_size mode=caution from={first.size} to={max_sz}")
-                    first.size = max_sz
-                elif hasattr(first, "sz") and isinstance(getattr(first, "sz"), (int, float)) and first.sz > max_sz:
-                    logger.warning(f"guard:shrink_size mode=caution from={first.sz} to={max_sz}")
-                    first.sz = max_sz
-            if "size" in kwargs and isinstance(kwargs["size"], (int, float)) and kwargs["size"] > max_sz:
-                logger.warning(f"guard:shrink_size mode=caution from={kwargs['size']} to={max_sz}")
-                kwargs["size"] = max_sz
-            if "sz" in kwargs and isinstance(kwargs["sz"], (int, float)) and kwargs["sz"] > max_sz:
-                logger.warning(f"guard:shrink_size mode=caution from={kwargs['sz']} to={max_sz}")
-                kwargs["sz"] = max_sz
+            if not is_reduce:
+                if now_ms - self._last_place_ts_ms < min_interval_ms:
+                    limit_rate = 0.0
+                    if min_interval_ms > 0:
+                        limit_rate = round(1000.0 / min_interval_ms, 3)
+                    logger.warning(f"guard:throttle_new_order mode=caution reason=rate_limit {limit_rate}req/s")
+                    return None
+
+                if args:
+                    first = args[0]
+                    if hasattr(first, "size") and isinstance(getattr(first, "size"), (int, float)) and first.size > max_sz:
+                        logger.warning(f"guard:shrink_size mode=caution from={first.size} to={max_sz}")
+                        first.size = max_sz
+                    elif hasattr(first, "sz") and isinstance(getattr(first, "sz"), (int, float)) and first.sz > max_sz:
+                        logger.warning(f"guard:shrink_size mode=caution from={first.sz} to={max_sz}")
+                        first.sz = max_sz
+                if "size" in kwargs and isinstance(kwargs["size"], (int, float)) and kwargs["size"] > max_sz:
+                    logger.warning(f"guard:shrink_size mode=caution from={kwargs['size']} to={max_sz}")
+                    kwargs["size"] = max_sz
+                if "sz" in kwargs and isinstance(kwargs["sz"], (int, float)) and kwargs["sz"] > max_sz:
+                    logger.warning(f"guard:shrink_size mode=caution from={kwargs['sz']} to={max_sz}")
+                    kwargs["sz"] = max_sz
+
 
         if self._orig_place is None:
             return None
         if not is_reduce:
             self._last_place_ts_ms = now_ms  # 何をするか：新規発注が通る直前に“最後に出した時刻”を更新（Cautionのレート制御に使う）
         return self._orig_place(*args, **kwargs)
+
+    def gate_status(self):
+        """何をするか：戦略が今のゲート状態（mode/理由/制限）を取得するためのアクセサ"""
+        return getattr(self, "_last_gate_status", {"mode": "healthy", "reason": "na", "limits": {}, "ts_ms": None})
+
     def _normalize_side(self, side: str | None) -> str | None:
         """【関数】side表現を "buy" / "sell" に正規化（それ以外はNone）"""
         if side is None:
