@@ -188,12 +188,13 @@ class PaperEngine:
             self._last_gate_status = {"mode": mode, "reason": reason, "limits": {}, "ts_ms": now_ms}
             if prev_mode != mode:
                 logger.info(f"guard:mode_change {prev_mode}->{mode} reason={reason} limits={{}}")  # 何をするか：モード変化を1行で記録
-n
+
+        # 何をするか：ゲート判定のモード（healthy/caution/halted）を risk へ同期して在庫・Killの方針と連携する
         if hasattr(self, "risk") and hasattr(self.risk, "set_market_mode"):
             try:
-                self.risk.set_market_mode(mode)
-            except Exception:
-                pass
+                self.risk.set_market_mode(mode)  # 何をするか：risk側のマーケットモードを更新（安全装置の契約に沿う）
+            except Exception as e:
+                logger.warning(f"risk.set_market_mode failed: {e}")  # 何をするか：失敗しても主処理は続行し、理由を監査に残す
 
         is_reduce = bool(kwargs.get("reduce_only"))
         if not is_reduce and args:
