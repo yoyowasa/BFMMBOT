@@ -47,6 +47,7 @@ features:  # 戦略のしきい値（#1/#2 の主材料）
   eta_t_window_ms: 800     # Queue ETAの窓（OFFの初期値）
   zero_reopen_pop:  # 何をする設定か：ゼロ→再拡大の“一拍だけ”出す戦略のパラメータ
     min_take_qty: 0.0           # 何をする設定か：利確IOCが当たる相手側Bestの最小数量（0で無効・例 0.01 などに設定）
+    max_join_qty: 0.0           # 何をする設定か：自分が並ぶ側Bestの数量がこの値を超えたら見送り（0で無効・例 0.05 など）
     exact_one_tick_only: true    # 何をする設定か：スプレッドが“1tickちょうど”の時だけ出す（+1tick利確が即時一致）
     ttl_jitter_ms: 80          # 何をする設定か：TTLに与える±ゆらぎ幅(ms)。同時剥がれの衝突を避ける
     min_best_age_ms: 200        # 何をする設定か：Bestがこの時間（ms）以上変わらず“落ち着いて”いたら発注を許可
