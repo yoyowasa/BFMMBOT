@@ -112,6 +112,11 @@ class PaperEngine:
         self._last_feed_reason = "init"      # 何をするか：直近の判定理由（ログや監視で参照）
         self._last_heartbeat_ms: int | None = None  # 何をするか：ハートビート/board受信時刻(ms)を保持
         self._last_place_ts_ms = 0       # 何をするか：直近の新規発注時刻（Cautionの発注レート制御に使う）
+
+
+  # 何をするか：直近の新規発注時刻（Cautionの発注レート制御に使う）
+
+
         self._orig_place = None               # 何をするか：元のplace関数を保存してラップ後に呼び戻す
         if hasattr(self, "sim") and hasattr(self.sim, "place"):
             self._orig_place = self.sim.place
