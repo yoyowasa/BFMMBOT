@@ -1,0 +1,40 @@
+# 何をする設定か：Zero→Reopen Pop（スプレッド=0直後→再拡大の“一拍だけ”で+1tick逃げ）の紙トレ用サンプル
+# 使い方：
+#   1) このファイルを configs/paper.yml に追記するか、該当の features セクションにコピーしてください
+#   2) --strategy zero_reopen_pop で起動（READMEのワンコマンド参照）
+
+features:
+  zero_reopen_pop:  # 何をする設定か：この戦略の“つまみ”全部（紙トレ向けの控えめな初期値）
+    # 幅の条件
+    exact_one_tick_only: true   # 1tickちょうどのときだけ出す（+1tick利確が即時一致）
+    min_spread_tick: 1          # 上のスイッチをfalseにする場合に有効（下限tick）
+    max_spread_tick: 2          # 上のスイッチをfalseにする場合に有効（上限tick）
+
+    # 発注の寿命とサイズ
+    ttl_ms: 900                 # 指値の寿命ms（紙トレは少し長めに）
+    ttl_jitter_ms: 80           # TTLにプラスマイナスのゆらぎ（群衆衝突の回避）
+    size_min: 0.001             # 最小ロット（紙トレでも本番と同じ最小を推奨）
+
+    # タイミングと安定性
+    seen_zero_window_ms: 1000   # “ゼロ直後”とみなす時間窓
+    reopen_stable_ms: 60        # 再拡大がこの時間続いたらOK（紙トレはやや慎重に）
+    min_best_age_ms: 220        # Bestがこの時間変わらず“落ち着いたら”OK
+    cooloff_ms: 300             # 連打禁止の冷却
+
+    # レート制限
+    entries_window_ms: 10000    # 時間窓
+    max_entries_in_window: 5    # 窓内の最大エントリー回数（紙トレは少なめ）
+
+    # 相場の速さと撤退
+    max_speed_ticks_per_s: 10.0 # midがこれより速いと見送り（紙トレはやや厳しめ）
+    flat_timeout_ms: 700        # 利確IOCが通らない時の“時間でフラット”締切（紙トレは長め）
+    stop_adverse_ticks: 2       # 不利にこのtick超で即フラットIOC
+    loss_cooloff_ms: 1500       # 非常口フラット後はお休み
+
+    # 手数料と採算
+    fee_maker_bp: 0.0           # メーカー手数料（bp）例：-2.0 は -0.02%、+2.0 は +0.02%
+    fee_taker_bp: 0.0           # テイカー手数料（bp）例：10.0 は 0.10%
+    edge_bp_min: 0.0            # 手数料控除後、最低これだけ余裕(bps)がなければ出さない
+
+
+起動例（紙トレ）：poetry run python -m src.cli.trade --config configs/paper.yml --strategy zero_reopen_pop

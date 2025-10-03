@@ -30,6 +30,10 @@ latency:  # まずは固定遅延のモデル（実測に置換予定）
   rx_ms: 20  # 受信遅延の仮定
   tx_ms: 20  # 送信遅延の仮定
 
+health:
+  stale_sec_warn: 3      # 何をする行か：Bestが3秒無更新なら Caution（新規を絞る/停止準備）
+  stale_sec_halt: 10     # 何をする行か：Bestが10秒無更新なら Halted（新規NG・決済のみ許可）
+
 features:  # 戦略のしきい値（#1/#2 の主材料）
   stall_T_ms: 250          # #1 静止→一撃：BestがTms静止
   ca_ratio_win_ms: 500     # #2 C/Aゲート：集計窓（ms）
@@ -42,6 +46,8 @@ features:  # 戦略のしきい値（#1/#2 の主材料）
   tiny_prints_minCount: 14 # Tiny-Prints発火閾値（OFFの初期値）
   eta_t_window_ms: 800     # Queue ETAの窓（OFFの初期値）
   zero_reopen_pop:  # 何をする設定か：ゼロ→再拡大の“一拍だけ”出す戦略のパラメータ
+    min_take_qty: 0.0           # 何をする設定か：利確IOCが当たる相手側Bestの最小数量（0で無効・例 0.01 などに設定）
+    exact_one_tick_only: true    # 何をする設定か：スプレッドが“1tickちょうど”の時だけ出す（+1tick利確が即時一致）
     ttl_jitter_ms: 80          # 何をする設定か：TTLに与える±ゆらぎ幅(ms)。同時剥がれの衝突を避ける
     min_best_age_ms: 200        # 何をする設定か：Bestがこの時間（ms）以上変わらず“落ち着いて”いたら発注を許可
     reopen_stable_ms: 50        # 何をする設定か：再拡大がこの時間（ms）続いたら発注を許可（瞬間ノイズはスルー）
