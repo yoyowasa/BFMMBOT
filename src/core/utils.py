@@ -29,6 +29,10 @@ class RiskCfg(BaseModel):
 class GuardCfg(BaseModel):
     max_mid_move_bp_30s: float | int | None = None
 
+class HealthCfg(BaseModel):
+    stale_sec_warn: float | int | None = None  # 何をする行か：Best静止の注意閾値（秒）
+    stale_sec_halt: float | int | None = None  # 何をする行か：Best静止の停止閾値（秒）
+
 class MaintWindowCfg(BaseModel):
     start: str
     end: str
@@ -74,6 +78,7 @@ class Config(BaseModel):
     size: SizeCfg | None = None
     risk: RiskCfg | None = None
     guard: GuardCfg | None = None
+    health: HealthCfg | None = None  # 何をする行か：市場ヘルス（Best静止しきい値）
     mode_switch: ModeSwitchCfg | None = None
     latency: LatencyCfg | None = None
     features: FeaturesCfg | None = None
