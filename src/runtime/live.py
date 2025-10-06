@@ -338,9 +338,9 @@ def _act(o, key, default=None):
     """何をする関数か：oがdictでも属性でも同じ書き方で値を取り出す"""
     return (o.get(key, default) if isinstance(o, dict) else getattr(o, key, default))
 
-def _pull_fill_deltas(ex: BitflyerExchange, live_orders: dict[str, dict]) -> list[tuple[str, float, float, str, bool]]:  # 何をするか：“増分約定”に finalかどうかの旗(done)を追加で返す
-    """何をするか：受理IDごとに“今回ぶんの増分約定”だけを取り出して (side, price, size, tag) のリストで返す"""
-    fills: list[tuple[str, float, float, str]] = []
+def _pull_fill_deltas(ex: BitflyerExchange, live_orders: dict[str, dict]) -> list[dict[str, Any]]:  # 何をするか：“増分約定”に finalかどうかの旗(done)や元注文を添える
+    """何をするか：受理IDごとに“今回ぶんの増分約定”だけを取り出して属性付き辞書で返す"""
+    fills: list[dict[str, Any]] = []
     for acc_id, meta in list(live_orders.items()):
         try:
             info_list = ex.get_child_order_by_acceptance_id(acc_id)  # 何をするか：受理IDで照会
@@ -363,7 +363,17 @@ def _pull_fill_deltas(ex: BitflyerExchange, live_orders: dict[str, dict]) -> lis
                 px = (avg_new * executed - prev_avg * prev_exec) / delta
             except ZeroDivisionError:
                 px = avg_new or meta["order"].price
-            fills.append((_act(meta["order"], "side"), float(px), float(delta), _act(meta["order"], "tag", ""), state == "COMPLETED" or (outstanding <= 1e-12 and executed > 0.0)))  # 何をするか：dict/属性両対応でside/tagを取得する
+            fills.append(
+                {
+                    "side": _side_norm(_act(meta["order"], "side")),
+                    "price": float(px),
+                    "size": float(delta),
+                    "tag": str(_act(meta["order"], "tag", "")),
+                    "done": state == "COMPLETED" or (outstanding <= 1e-12 and executed > 0.0),
+                    "order": meta.get("order"),
+                    "acceptance_id": acc_id,
+                }
+            )  # 何をするか：dict/属性両対応でside/tagを取得する
 
 
         # 何をするか：ローカル状態を更新（次回差分計算のため）
@@ -793,6 +803,7 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True, *, strategy_cfg
                             order_log.add(ts=now.isoformat(), action="cancel", tif=getattr(o, "tif", "GTC"), ttl_ms=getattr(o, "ttl_ms", None), px=getattr(o, "price", None), sz=getattr(o, "size", None), reason="ttl")  # 何をするか：ordersログにTTL取消を記録
                             _hb_write(hb_path, event="cancel", ts=now.isoformat(), acc=acc_id, reason="ttl", px=getattr(o, "price", None), sz=getattr(o, "size", None))  # 何をするか：ハートビートにもTTL取消を1行記録
 
+                fill_actions: list[dict[str, Any]] = []
                 try:
                     fills = [] if throttled else _pull_fill_deltas(ex, live_orders)  # 何をするか：レート制限中はRESTを呼ばない
                 except RateLimitError as e:
@@ -801,7 +812,12 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True, *, strategy_cfg
                     throttled = True
                     _hb_write(hb_path, event="pause", ts=_now_utc().isoformat(), reason="throttle")  # 何をするか：心拍に“throttle”を記録
                     continue  # 何をするか：haltせず次周回へ
-                for side, px, sz, tag, done in fills:  # 何をするか：done=True なら完了（fill）、False なら部分約定（partial）
+                for fill in fills:  # 何をするか：done=True なら完了（fill）、False なら部分約定（partial）
+                    side = str(fill.get("side", "BUY")).upper()
+                    px = float(fill.get("price", 0.0))
+                    sz = float(fill.get("size", 0.0))
+                    tag = str(fill.get("tag", ""))
+                    done = bool(fill.get("done", False))
                     realized = _apply_fill_and_pnl(pnl_state, side, px, sz)  # 何をするか：建玉を更新し実現PnLを積算
                     fee = px * sz * (fee_bps / 10000.0)  # 何をするか：約定金額×bpsで手数料（正=コスト/負=リベート）
                     realized -= fee  # 何をするか：PnLは手数料込み（ネット）で積算する
@@ -826,53 +842,75 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True, *, strategy_cfg
                         if float(_meta.get("executed", 0.0)) >= float(getattr(_o, "size", 0.0)) - 1e-12:
                             del live_orders[_acc_id]  # 何をするか：完了注文を片付ける
 
+                    if hasattr(strat, "on_fill") and fills:
+                        for fill in fills:
+                            fill_event = SimpleNamespace(
+                                side=fill.get("side"),
+                                price=fill.get("price"),
+                                size=fill.get("size"),
+                                tag=fill.get("tag"),
+                                done=fill.get("done"),
+                                order=fill.get("order"),
+                                acceptance_id=fill.get("acceptance_id"),
+                            )
+                            try:
+                                new_actions = strat.on_fill(ob, fill_event)
+                            except Exception as e:
+                                logger.exception(f"strategy on_fill error: {e}")
+                                _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="strategy_on_fill_error")
+                                continue
+                            for act in new_actions or []:
+                                if act:
+                                    fill_actions.append(act)
 
 
 
-                # 何をするか：戦略を評価して、必要なら注文（Order）を発行
+
+                actions_to_process: list[dict[str, Any]] = list(fill_actions)
+                skip_new_orders = False
+                evaluate_actions: list[dict[str, Any]] = []
+
                 try:
                     inv_paused = (eff_inv_limit is not None) and (abs(float(pnl_state.get("pos", 0.0))) >= eff_inv_limit)  # 何をするか：在庫上限に達しているかを判定
-                    if inv_paused:  # 何をするか：在庫が上限以上なら今回は新規を出さない
+                    if inv_paused:
                         logger.debug(f"pause: inventory guard |Q|={abs(pnl_state.get('pos', 0.0)):.3f} >= {eff_inv_limit}")  # 何をするか：理由をrun.logに記録
                         _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="inventory_guard")  # 何をするか：ハートビートに停止を記録
-                        continue  # 何をするか：このループでは新規発注パートへ進まない
-
-                    if _in_maintenance(now, cfg):  # 何をするか：メンテ窓中は新規発注を止める
+                        skip_new_orders = True
+                    elif _in_maintenance(now, cfg):
                         logger.debug("pause: maintenance window")  # 何をするか：理由をrun.logに記録
                         _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="maintenance")  # 何をするか：心拍に停止を記録
-                        continue  # 何をするか：この周回は新規発注パートへ進まない
-
-                    if _in_funding_calc(now, cfg) or _in_funding_transfer(now, cfg):  # 何をするか：Funding計算/授受の窓中は新規発注を止める
+                        skip_new_orders = True
+                    elif _in_funding_calc(now, cfg) or _in_funding_transfer(now, cfg):
                         logger.debug("pause: funding window")  # 何をするか：理由をrun.logに記録
                         _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="funding")  # 何をするか：心拍に停止を記録
-                        continue  # 何をするか：この周回は新規発注パートへ進まない
-                                        
-                    if (max_active is not None) and (len(live_orders) >= int(max_active)):  # 何をするか：アクティブ注文が上限以上なら新規を止める
+                        skip_new_orders = True
+                    elif (max_active is not None) and (len(live_orders) >= int(max_active)):
                         logger.debug(f"pause: active_guard A={len(live_orders)} ≥ {int(max_active)}")  # 何をするか：理由をrun.logに記録
                         _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="active_guard", A=len(live_orders))  # 何をするか：心拍にも停止を記録
-                        continue  # 何をするか：この周回は新規発注パートに進まない
-
-                    try:
-                        t0 = time.perf_counter()  # 何をするか：戦略評価の開始時刻（ms測定）
-                        actions = strat.evaluate(ob, now, cfg)  # 何をするか：戦略の実シグネチャ(ob, now, cfg)に合わせて呼び出す
-                    except Exception as e:
-                        logger.exception(f"strategy error: {e}")  # 何をするか：原因をrun.logに記録（スタック付き）
-                        _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="strategy_error")  # 何をするか：心拍に“戦略エラー”を記録
-                        decision_log.add(ts=now.isoformat(), strategy=strategy_name, decision="error", features={}, expected_edge_bp=None, eta_ms=int((time.perf_counter() - t0) * 1000), ca_ratio=None, best_age_ms=None, spread_state=None)  # 何をするか：必須のKW引数をすべて埋めて“error”を記録
-
-                        continue  # 何をするか：今回は新規発注パートへ進まない（安全に次の周回へ）
-
-                    decision_log.add(ts=now.isoformat(), strategy=strategy_name, decision=("place" if actions else "hold"), features={}, expected_edge_bp=None, eta_ms=int((time.perf_counter() - t0) * 1000), ca_ratio=None, best_age_ms=None, spread_state=None)  # 何をするか：必須のKW引数をすべて埋めて“place/hold”を記録
+                        skip_new_orders = True
+                    else:
+                        try:
+                            t0 = time.perf_counter()  # 何をするか：戦略評価の開始時刻（ms測定）
+                            evaluate_actions = strat.evaluate(ob, now, cfg) or []  # 何をするか：None安全化
+                        except Exception as e:
+                            logger.exception(f"strategy error: {e}")  # 何をするか：原因をrun.logに記録（スタック付き）
+                            _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="strategy_error")  # 何をするか：心拍に“戦略エラー”を記録
+                            decision_log.add(ts=now.isoformat(), strategy=strategy_name, decision="error", features={}, expected_edge_bp=None, eta_ms=int((time.perf_counter() - t0) * 1000), ca_ratio=None, best_age_ms=None, spread_state=None)  # 何をするか：必須のKW引数をすべて埋めて“error”を記録
+                            skip_new_orders = True
+                        else:
+                            decision_log.add(ts=now.isoformat(), strategy=strategy_name, decision=("place" if evaluate_actions else "hold"), features={}, expected_edge_bp=None, eta_ms=int((time.perf_counter() - t0) * 1000), ca_ratio=None, best_age_ms=None, spread_state=None)  # 何をするか：必須のKW引数をすべて埋めて“place/hold”を記録
 
                 except Exception as e:
                     logger.error(f"strategy evaluate failed: {e}")
-                    continue
+                    skip_new_orders = True
 
+                if not skip_new_orders and evaluate_actions:
+                    actions_to_process.extend(evaluate_actions)
 
                 if throttled:
                     continue
 
-                for o in actions or []:
+                for o in actions_to_process or []:
                     sz = float(_act(o, "size", getattr(getattr(cfg, "size", None), "default", 0.0)) or 0.0)  # 何をするか：dict/object両対応でサイズ取得（未指定ならconfigのdefault）
                     if sz <= 0.0:  # 何をするか：サイズが無い/0のときは発注しない
                         logger.debug("pause: size_missing_or_zero")  # 何をするか：理由をrun.logに残す
