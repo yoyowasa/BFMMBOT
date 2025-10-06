@@ -10,6 +10,7 @@ from loguru import logger  # 何をするか：ゲート理由を戦略ログに
 from src.core.orderbook import OrderBook  # Best/Spreadを参照
 from src.core.orders import Order  # 置く指値の表現
 from src.strategy.base import StrategyBase  # 共通IF
+from src.core.utils import coerce_ms  # 追加：時間値をmsに正規化するユーティリティ
 
 class StallThenStrike(StrategyBase):
     """【関数】#1 静止→一撃の最小実装（文書のトリガ/撤退に準拠）"""
@@ -35,11 +36,11 @@ class StallThenStrike(StrategyBase):
             return []
 
         # 現在の指標を取得（BestAge/Spread）:contentReference[oaicite:6]{index=6}
-        age_ms = ob.best_age_ms(now)
+        age_ms = coerce_ms(ob.best_age_ms(now))
         sp_tick = ob.spread_ticks()
 
         # トリガ成立：ミッド±1tick に最小ロット両面
-        if age_ms >= stall_T and sp_tick >= min_sp:
+        if age_ms is not None and age_ms >= stall_T and sp_tick >= min_sp:
             mid = (ob.best_bid.price + ob.best_ask.price) / 2.0
             return [
                 {"type": "place", "order": Order(side="buy",  price=mid - 1 * tick, size=lot, tif="GTC", ttl_ms=ttl_ms, tag="stall")},

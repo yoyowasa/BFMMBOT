@@ -9,6 +9,7 @@ import copy  # 辞書のディープコピーで安全に合成
 import yaml  # YAML読取（pyyaml）
 from pydantic import BaseModel, Field  # 型検査モデル（v2）
 import time  # 現在のUNIX時刻(ミリ秒)を取得するために使用
+import math  # 単位推定にlog10などを使うため
 
 # ─────────────────────────────────────────────────────────────
 # Pydanticモデル定義（文書の設定キーを最小構成で網羅：env/size/risk/guard/窓/遅延/特徴/戦略/ログ/BT専用）
@@ -139,5 +140,35 @@ def load_config(config_path: str | os.PathLike[str]) -> Config:
 
 
 def now_ms() -> int:
-    # 何をする関数か：現在のUNIX時刻(エポック)をミリ秒で返す（ログ/TTL/クールダウン判定に使用）
-    return time.time_ns() // 1_000_000
+    """【関数】現在のUNIX時刻をミリ秒で返す（戦略のTTLやログ時刻用）。"""
+    return int(time.time() * 1000)
+
+
+def monotonic_ms() -> int:
+    """【関数】単調増加の経過時間(ms)。相対時間の測定に使う（NTPずれの影響を避ける）。"""
+    return int(time.perf_counter_ns() // 1_000_000)
+
+
+def coerce_ms(v) -> float | None:
+    """【関数】秒/ミリ秒/マイクロ秒/ナノ秒の“っぽい数字”を安全にmsへ正規化。
+    - 例: 0.25(秒)→250ms, 250(たぶんms)→250ms, 250000(µs)→250ms, 250000000(ns)→250ms
+    - Noneや不正値は None を返して呼び元で無視できるようにする。
+    """
+    if v is None:
+        return None
+    try:
+        x = float(v)
+    except Exception:
+        return None
+    if not math.isfinite(x):
+        return None
+    if x < 0:
+        x = 0.0
+    abs_x = abs(x)
+    if abs_x < 1.0:  # 小さな値は秒として解釈
+        return x * 1_000.0
+    if abs_x < 100_000.0:  # 0.1s未満～100s未満はそのままmsとみなす
+        return x
+    if abs_x < 100_000_000.0:  # 100s以上1e5ms超級はµs想定で1/1000
+        return x / 1_000.0
+    return x / 1_000_000.0  # それより大きければns（もしくはそれ以上）とみなして1/1e6
