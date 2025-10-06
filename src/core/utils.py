@@ -9,6 +9,7 @@ import copy  # 辞書のディープコピーで安全に合成
 import yaml  # YAML読取（pyyaml）
 from pydantic import BaseModel, Field  # 型検査モデル（v2）
 import time  # 現在のUNIX時刻(ミリ秒)を取得するために使用
+import math  # 単位推定にlog10などを使うため
 
 # ─────────────────────────────────────────────────────────────
 # Pydanticモデル定義（文書の設定キーを最小構成で網羅：env/size/risk/guard/窓/遅延/特徴/戦略/ログ/BT専用）
@@ -159,15 +160,17 @@ def coerce_ms(v) -> float | None:
         x = float(v)
     except Exception:
         return None
+
+    if not math.isfinite(x):
+        return None
     if x < 0:
         x = 0.0
-    # 桁から推定（経験則）：ns>=1e13, µs>=1e10, ms>=1e6, s<=1e3 あたりを目安に分岐
-    if x >= 1e13:  # ns
-        return x / 1e6
-    if x >= 1e10:  # µs
-        return x / 1e3
-    if x >= 1e6:  # ms（そのまま）
+    abs_x = abs(x)
+    if abs_x < 1.0:  # 小さな値は秒として解釈
+        return x * 1_000.0
+    if abs_x < 100_000.0:  # 0.1s未満～100s未満はそのままmsとみなす
         return x
-    if x <= 1e3:  # s（小さな実数は秒とみなす）
-        return x * 1e3
-    return x  # フォールバック（ms扱い）
+    if abs_x < 100_000_000.0:  # 100s以上1e5ms超級はµs想定で1/1000
+        return x / 1_000.0
+    return x / 1_000_000.0  # それより大きければns（もしくはそれ以上）とみなして1/1e6
+

@@ -37,10 +37,11 @@ class StallThenStrike(StrategyBase):
 
         # 現在の指標を取得（BestAge/Spread）:contentReference[oaicite:6]{index=6}
         age_ms = coerce_ms(ob.best_age_ms(now)) or 0.0
+
         sp_tick = ob.spread_ticks()
 
         # トリガ成立：ミッド±1tick に最小ロット両面
-        if age_ms >= stall_T and sp_tick >= min_sp:
+        if age_ms is not None and age_ms >= stall_T and sp_tick >= min_sp:
             mid = (ob.best_bid.price + ob.best_ask.price) / 2.0
             return [
                 {"type": "place", "order": Order(side="buy",  price=mid - 1 * tick, size=lot, tif="GTC", ttl_ms=ttl_ms, tag="stall")},
