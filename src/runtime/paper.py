@@ -8,8 +8,9 @@ from pathlib import Path  # 何をするか：ログファイルの場所を扱�
 from datetime import datetime, timezone  # 何をするか：UTCの現在時刻・経過の計算
 import json  # 何をするか：心拍を ndjson(1行1JSON) で書く
 import uuid  # 何をするか：疑似の受理ID(acc)を作る
-from typing import Any, Dict  # 何をするか：型ヒント（辞書など）
+from typing import Any, Dict, List, Optional  # 何をするか：型ヒント（辞書など）
 import csv  # 何をするか：orders.csv / trades.csv に追記するために使う
+from types import SimpleNamespace  # 何をするか：戦略 on_fill に渡す簡易オブジェクトを作る
 
 from loguru import logger  # 何をするか：run.log へ可読ログを出す
 from src.core.realtime import stream_events  # 何をするか：WSイベントの同期ジェネレーター
@@ -202,6 +203,64 @@ def run_paper(cfg, strategy_name: str, *, strategy_cfg=None):
                     order_log.add(ts=now.isoformat(), action="cancel", tif=None, ttl_ms=ttl_ms, px=meta.get("px"), sz=meta.get("rem_sz", 0.0), reason="ttl")  # 何をするか：Parquetにもcancelを記録
                     del live_orders[acc]
 
+            def _register_actions(action_list: Optional[List[Dict[str, Any]]]) -> None:
+                for act in action_list or []:
+                    if not act:
+                        continue
+                    act_type = str(_act(act, "type", "place") or "place").lower()
+                    if act_type == "cancel_tag":
+                        tag_val = str(_act(act, "tag", ""))
+                        for acc_key, meta in list(live_orders.items()):
+                            if tag_val and str(meta.get("tag", "")) != tag_val:
+                                continue
+                            _hb_write(hb_path, event="cancel", ts=now.isoformat(), acc=acc_key, reason="cancel_tag", tag=tag_val)
+                            _orders_add(ts=now.isoformat(), action="cancel", tif=None, ttl_ms=meta.get("ttl_ms"), px=meta.get("px"), sz=meta.get("rem_sz", 0.0), reason=tag_val)
+                            order_log.add(ts=now.isoformat(), action="cancel", tif=None, ttl_ms=meta.get("ttl_ms"), px=meta.get("px"), sz=meta.get("rem_sz", 0.0), reason=tag_val)
+                            del live_orders[acc_key]
+                        continue
+
+                    if act_type != "place":
+                        continue
+
+                    payload = _act(act, "order", None)
+                    target = payload or act
+                    sz = float(_act(target, "size", default_sz) or 0.0)
+                    if sz <= 0.0:
+                        continue
+
+                    side = _side_norm(_act(target, "side"))
+                    px_raw = _act(target, "price", None)
+                    if px_raw is None:
+                        px_val = bid if side == "BUY" else ask
+                    else:
+                        try:
+                            px_val = float(px_raw)
+                        except Exception:
+                            _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="price_invalid")
+                            continue
+                    if px_val is None:
+                        _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="price_fallback_unavailable")
+                        continue
+
+                    px_val = _round_to_tick(px_val, tick)
+                    acc_new = f"paper-{uuid.uuid4().hex[:12]}"
+                    ttl_ms = _act(target, "ttl_ms", ttl_cfg)
+                    tif = _act(target, "tif", "GTC")
+                    tag_val = _act(target, "tag", "")
+                    live_orders[acc_new] = {
+                        "side": side,
+                        "px": px_val,
+                        "sz": sz,
+                        "rem_sz": sz,
+                        "ttl_ms": ttl_ms,
+                        "placed_at": now,
+                        "tag": tag_val,
+                        "order": payload if payload is not None else SimpleNamespace(side=side, price=px_val, size=sz, tif=tif, ttl_ms=ttl_ms, tag=tag_val),
+                    }
+                    _hb_write(hb_path, event="place", ts=now.isoformat(), acc=acc_new, side=side, px=px_val, sz=sz, tif=tif, ttl_ms=ttl_ms, reason=tag_val)
+                    _orders_add(ts=now.isoformat(), action="place", tif=tif, ttl_ms=ttl_ms, px=px_val, sz=sz, reason=tag_val)
+                    order_log.add(ts=now.isoformat(), action="place", tif=tif, ttl_ms=ttl_ms, px=px_val, sz=sz, reason=tag_val)
+
             # 何をするか：戦略評価（place/hold の判断）
             try:
                 actions = strat.evaluate(ob, now, cfg)
@@ -210,37 +269,7 @@ def run_paper(cfg, strategy_name: str, *, strategy_cfg=None):
                 _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="strategy_error")
                 continue
 
-            # 何をするか：アクションを疑似発注（place）として登録
-            for o in actions or []:
-                sz = float(_act(o, "size", default_sz) or 0.0)
-                if sz <= 0.0:
-                    continue  # 何をするか：サイズが無いアクションは無視
-
-                side = _side_norm(_act(o, "side"))
-                px_raw = _act(o, "price", None)
-                if px_raw is None:
-                    # 何をするか：価格未指定は「板に置く」＝BUYはbid、SELLはaskに並べる（即時約定はさせない）
-                    px = bid if side == "BUY" else ask
-                else:
-                    try:
-                        px = float(px_raw)
-                    except Exception:
-                        _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="price_invalid")
-                        continue
-
-                if px is None:
-                    _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="price_fallback_unavailable")
-                    continue
-
-                px = _round_to_tick(px, tick)
-                acc = f"paper-{uuid.uuid4().hex[:12]}"
-                ttl_ms = _act(o, "ttl_ms", ttl_cfg)
-                tag = _act(o, "tag", "")
-
-                live_orders[acc] = {"side": side, "px": px, "sz": sz, "rem_sz": sz, "ttl_ms": ttl_ms, "placed_at": now, "tag": tag}  # 何をするか：残量(rem_sz)を持つ
-                _hb_write(hb_path, event="place", ts=now.isoformat(), acc=acc, side=side, px=px, sz=sz, tif=_act(o, "tif", "GTC"), ttl_ms=ttl_ms, reason=tag)
-                _orders_add(ts=now.isoformat(), action="place", tif=_act(o, "tif", "GTC"), ttl_ms=ttl_ms, px=px, sz=sz, reason=tag)  # 何をするか：orders.csvにも記録
-                order_log.add(ts=now.isoformat(), action="place", tif=_act(o, "tif", "GTC"), ttl_ms=ttl_ms, px=px, sz=sz, reason=tag)  # 何をするか：Parquetにもplaceを記録
+            _register_actions(actions)
 
 
             execs = []  # 何をするか：この周回で観測した出来高（price/sizeの配列）をためる
@@ -295,6 +324,24 @@ def run_paper(cfg, strategy_name: str, *, strategy_cfg=None):
                         done = meta["rem_sz"] <= 1e-12
                         _hb_write(hb_path, event=("fill" if done else "partial"), ts=now.isoformat(), acc=acc, side=side, px=ex_price, sz=fill_sz, reason=tag)
                         _orders_add(ts=now.isoformat(), action=("fill" if done else "partial"), tif=None, ttl_ms=None, px=ex_price, sz=fill_sz, reason=tag)
+
+                        if hasattr(strat, "on_fill"):
+                            fill_event = SimpleNamespace(
+                                side=side,
+                                price=ex_price,
+                                size=fill_sz,
+                                tag=tag,
+                                done=done,
+                                order=meta.get("order"),
+                                acceptance_id=acc,
+                            )
+                            try:
+                                follow_actions = strat.on_fill(ob, fill_event)
+                            except Exception as e:
+                                logger.exception(f"paper: strategy on_fill error: {e}")
+                                _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="strategy_on_fill_error")
+                            else:
+                                _register_actions(follow_actions)
 
                 # 何をするか：残量ゼロになった注文を片付ける
                 for acc in [k for k, v in live_orders.items() if v.get("rem_sz", 0.0) <= 1e-12]:
