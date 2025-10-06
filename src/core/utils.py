@@ -160,6 +160,7 @@ def coerce_ms(v) -> float | None:
         x = float(v)
     except Exception:
         return None
+
     if not math.isfinite(x):
         return None
     if x < 0:
@@ -172,3 +173,4 @@ def coerce_ms(v) -> float | None:
     if abs_x < 100_000_000.0:  # 100s以上1e5ms超級はµs想定で1/1000
         return x / 1_000.0
     return x / 1_000_000.0  # それより大きければns（もしくはそれ以上）とみなして1/1e6
+

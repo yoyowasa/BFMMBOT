@@ -36,7 +36,8 @@ class StallThenStrike(StrategyBase):
             return []
 
         # 現在の指標を取得（BestAge/Spread）:contentReference[oaicite:6]{index=6}
-        age_ms = coerce_ms(ob.best_age_ms(now))
+        age_ms = coerce_ms(ob.best_age_ms(now)) or 0.0
+
         sp_tick = ob.spread_ticks()
 
         # トリガ成立：ミッド±1tick に最小ロット両面
