@@ -139,5 +139,35 @@ def load_config(config_path: str | os.PathLike[str]) -> Config:
 
 
 def now_ms() -> int:
-    # 何をする関数か：現在のUNIX時刻(エポック)をミリ秒で返す（ログ/TTL/クールダウン判定に使用）
-    return time.time_ns() // 1_000_000
+    """【関数】現在のUNIX時刻をミリ秒で返す（戦略のTTLやログ時刻用）。"""
+    return int(time.time() * 1000)
+
+
+def monotonic_ms() -> int:
+    """【関数】単調増加の経過時間(ms)。相対時間の測定に使う（NTPずれの影響を避ける）。"""
+    return int(time.perf_counter_ns() // 1_000_000)
+
+
+def coerce_ms(v) -> float | None:
+    """【関数】秒/ミリ秒/マイクロ秒/ナノ秒の“っぽい数字”を安全にmsへ正規化。
+    - 例: 0.25(秒)→250ms, 250(たぶんms)→250ms, 250000(µs)→250ms, 250000000(ns)→250ms
+    - Noneや不正値は None を返して呼び元で無視できるようにする。
+    """
+    if v is None:
+        return None
+    try:
+        x = float(v)
+    except Exception:
+        return None
+    if x < 0:
+        x = 0.0
+    # 桁から推定（経験則）：ns>=1e13, µs>=1e10, ms>=1e6, s<=1e3 あたりを目安に分岐
+    if x >= 1e13:  # ns
+        return x / 1e6
+    if x >= 1e10:  # µs
+        return x / 1e3
+    if x >= 1e6:  # ms（そのまま）
+        return x
+    if x <= 1e3:  # s（小さな実数は秒とみなす）
+        return x * 1e3
+    return x  # フォールバック（ms扱い）
