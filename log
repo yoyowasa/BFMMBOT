@@ -129,3 +129,17 @@ Get-Content configs/live.yml
 8) 追加：ランタイムの“スロットル中”の様子だけ追う
 # 何をするか：心拍から throttle の行だけをライブ表示（レート制限追跡）
 Get-Content logs/runtime/heartbeat.ndjson -Wait | ForEach-Object { if (($_ | ConvertFrom-Json).reason -eq 'throttle') { $_ } }
+
+code tunnel --name home-dev
+
+gitから上書き
+git fetch origin main
+git reset --hard origin/main
+検証に進む。origin/main と作業ツリーの差分がゼロか確認。
+git --no-pager diff --name-status origin/main
+# 直近コミットIDを比較して一致を確認する
+git --no-pager log -1 --oneline
+git --no-pager log -1 --oneline origin/main
+
+cd "E:\BF-MMBOT"
+poetry shell
