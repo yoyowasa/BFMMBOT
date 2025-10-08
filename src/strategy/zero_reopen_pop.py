@@ -12,12 +12,9 @@ from src.core.orderbook import OrderBook  # best/中値/tick/スプレッド/健
 from src.core.orders import Order        # Limit/IOC と TTL/タグを付けて発注する型
 from src.core.utils import now_ms        # クールダウンや“直後”判定に使うミリ秒時刻
 
-import logging  # 何をするか：この戦略の意思決定ログを出すために使う
+from loguru import logger  # 何をするか：この戦略の意思決定ログを出すために使う
 import random  # 何をするか：TTLに±ゆらぎ（jitter）を与えるための乱数を使う
 from collections import deque  # 何をするか：レート制限用に“時刻のキュー”を使う
-
-
-logger = logging.getLogger(__name__)  # 何をするか：戦略専用のロガーを用意（情報/デバッグを出す）
 
 
 @dataclass
@@ -158,7 +155,7 @@ class ZeroReopenPop(StrategyBase):
 
         # 正規化結果をログへ
         try:
-            logger.info("zr_cfg_normalized %s", asdict(c))  # 何をするか：最終的に使う設定を1行で記録
+            logger.info(f"zr_cfg_normalized {asdict(c)}")  # 何をするか：最終的に使う設定を1行で記録
         except Exception:
             logger.exception("zr_cfg_log_error")  # 何をするか：ログ化に失敗しても戦略は継続
 
@@ -166,7 +163,10 @@ class ZeroReopenPop(StrategyBase):
         """【関数】意思決定ログ：何をするか：判断理由と主要パラメータを1行で記録する"""
         try:
             payload = " ".join(f"{k}={v}" for k, v in fields.items())
-            logger.info("zr_decision reason=%s %s", reason, payload)
+            msg = f"zr_decision reason={reason}"
+            if payload:
+                msg = f"{msg} {payload}"
+            logger.info(msg)
         except Exception:
             logger.exception("zr_decision_log_error")
 
