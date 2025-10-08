@@ -74,3 +74,6 @@ strategies:  # まずは2本だけON（他はOFF）
 logging:  # ログ出力の基本設定
   level: INFO     # paper既定はINFO（paper.ymlでDEBUGに上書き予定）
   rotate_mb: 128  # ログローテーションの閾値（MB）
+  run_log_template: logs/runtime/run.log  # 何をする設定か：共通run.logの出力先テンプレート
+  strategy_log_template: null  # 何をする設定か：戦略専用ログのテンプレート（nullで無効）
+  strategy_level: null  # 何をする設定か：戦略専用ログのレベル（nullならlevelを流用）
