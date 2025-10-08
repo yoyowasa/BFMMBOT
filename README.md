@@ -4,6 +4,11 @@
 
 ### 起動コマンド（シンプル）
 
+#### デフォルトONリスト（`configs/*.yml` の `strategies:` 配列）をまとめて起動
+- 紙トレード: `poetry run python -m src.cli.trade --config configs/paper.yml`
+- 本番: `poetry run python -m src.cli.trade --config configs/live.yml`
+  - 起動直後に `logs/runtime/run.log` を確認すると `paper start: ... strategy=<名前>` の行が出力され、実際に動いている戦略名を把握できます。
+
 #### zero_reopen_pop
 - 紙トレード: `./scripts/run_zero_reopen_paper.sh`
   - CLI直接実行: `poetry run python -m src.cli.trade --config configs/paper.yml --strategy zero_reopen_pop`
