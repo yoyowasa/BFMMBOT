@@ -88,9 +88,15 @@ features:  # 戦略のしきい値（#1/#2 の主材料）
     cooloff_ms: 250            # 何をする設定か：連打を防ぐ冷却時間ms
     seen_zero_window_ms: 1000  # 何をする設定か：ゼロを“直後”とみなす時間窓ms
 
-strategies:  # まずは2本だけON（他はOFF）
-  - stall_then_strike  # #1 静止→一撃
-  - cancel_add_gate    # #2 キャンセル比ゲート
+# 何をする設定か：起動時にデフォルトでONにする戦略のリスト（※CLIの --strategy があればそちら優先）
+strategies:
+  - stall_then_strike      # #1 静止→一撃：最良気配が一定時間止まった直後だけ両面で薄く回す（常用・有効）
+  - cancel_add_gate        # #2 C/Aゲート：Best層のCancel/Add比が低いときだけ出す“毒性ゲート”（常用・有効）
+  # - age_microprice       # #3 Age×Microprice：Best滞留×MP寄りでリーン（試験用・普段はOFF）
+  # - gap_edge_refill      # #4 ギャップ縁補充：Top数層の2tick空きを縁で拾う（試験用・普段はOFF）
+  # - tiny_prints_filter   # #5 小口連発フィルタ：小口偏り時だけ両面薄く（試験用・普段はOFF）
+  # - queue_eta_gate       # #6 Queue ETAゲート：自分の順番ETAが短いときだけ置く（試験用・普段はOFF）
+  # - zero_reopen_pop      # #7 0→再拡大ポップ：スプレッド0の直後、再拡大の1拍を取る（試験用・普段はOFF）
 
 logging:  # ログ出力の基本設定
   level: INFO     # paper既定はINFO（paper.ymlでDEBUGに上書き予定）
