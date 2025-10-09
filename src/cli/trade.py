@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import argparse  # 引数処理
 import asyncio  # 非同期ランタイム
-from collections.abc import Mapping  # 何をするか：設定のdictアクセスを許可
+from collections.abc import Mapping, Sequence  # 何をするか：設定のdictアクセスを許可
+from typing import List
 from loguru import logger  # 実行ログ
 try:
     from dotenv import load_dotenv, find_dotenv  # 何をするか：.env を読み込む（healthと同じ方式）
@@ -91,9 +92,13 @@ def _parse_args() -> argparse.Namespace:
     """【関数】引数を読む：--config（必須）/ --strategy（#1 既定 か #2）"""
     p = argparse.ArgumentParser(description="Run paper trading (real-time)")
     p.add_argument("--config", required=True, help="configs/paper.yml など")
-    p.add_argument("--strategy", default="stall_then_strike",
-                choices=["stall_then_strike", "cancel_add_gate", "age_microprice", "zero_reopen_pop"],
-                help="どの戦略で動かすか（#1/#2/#3/#4）")
+    p.add_argument(
+        "--strategy",
+        nargs="*",
+        default=None,
+        choices=["stall_then_strike", "cancel_add_gate", "age_microprice", "zero_reopen_pop"],
+        help="どの戦略で動かすか（省略時は config[strategies] を使用する）",
+    )
     p.add_argument("--dry-run", action="store_true", help="何をするか：liveでも実発注せず疎通確認だけ行う（安全テスト）")
     p.add_argument("--paper", action="store_true", help="何をするか：取引所へ発注せず、板に当たれば fills をシミュレートする")
 
@@ -105,7 +110,30 @@ def main() -> None:
     args = _parse_args()
     cfg = load_config(args.config)
     strategy_cfg = None
-    sink_ids = _setup_text_logs(cfg, args.strategy)
+
+    cfg_strategies = getattr(cfg, "strategies", None)
+    cli_strategies = args.strategy
+    if cli_strategies is None:
+        raw_strategies = cfg_strategies
+    else:
+        raw_strategies = cli_strategies
+
+    normalized_strategies: List[str]
+    if raw_strategies is None:
+        normalized_strategies = []
+    elif isinstance(raw_strategies, Sequence) and not isinstance(raw_strategies, (str, bytes)):
+        normalized_strategies = [str(s) for s in raw_strategies if s]
+    else:
+        normalized_strategies = [str(raw_strategies)]
+
+    if not normalized_strategies:
+        logger.error("strategy_not_specified CLIまたはconfigのstrategiesが空です")
+        raise SystemExit(1)
+
+    # NOTE: マルチ戦略対応を見据えてリストは保持しつつ、現状の呼び出しは先頭のみ使用する
+    selected_strategy = normalized_strategies[0]
+
+    sink_ids = _setup_text_logs(cfg, selected_strategy)
     try:
         # 何をするか：設定の env を見て live/paper を切り替える（ワークフローの 8.3→8.4 切替）
         if getattr(cfg, "env", "paper") == "live":
@@ -135,16 +163,16 @@ def main() -> None:
                 if rp is None:
                     raise RuntimeError("paper runner が見つかりません（engine.run_paper / engine.paper_main / runtime.paper.main などを確認）")  # 何をするか：どこにも無ければ分かりやすく停止
                 try:
-                    rp(cfg, args.strategy, strategy_cfg=strategy_cfg)  # 何をするか：見つけた入口でペーパー運転を開始
+                    rp(cfg, selected_strategy, strategy_cfg=strategy_cfg)  # 何をするか：見つけた入口でペーパー運転を開始
                 except TypeError:
-                    rp(cfg, args.strategy)  # 互換：旧シグネチャ（strategy_cfg未対応）の場合は従来呼び出し
+                    rp(cfg, selected_strategy)  # 互換：旧シグネチャ（strategy_cfg未対応）の場合は従来呼び出し
             else:
-                run_live(cfg, args.strategy, dry_run=args.dry_run, strategy_cfg=strategy_cfg)  # 何をするか：従来どおりlive/dry-run
+                run_live(cfg, selected_strategy, dry_run=args.dry_run, strategy_cfg=strategy_cfg)  # 何をするか：従来どおりlive/dry-run
             return  # 何をするか：live 分岐ではここで終了（paper へは進まない）
 
         if cfg.env != "paper":
             logger.warning(f"env is '{cfg.env}' (expected 'paper') - 続行はします")
-        engine = PaperEngine(cfg, args.strategy, strategy_cfg=strategy_cfg)
+        engine = PaperEngine(cfg, selected_strategy, strategy_cfg=strategy_cfg)
         try:
             asyncio.run(engine.run_paper())
         except KeyboardInterrupt:
