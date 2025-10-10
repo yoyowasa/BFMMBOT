@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio  # 非同期ループ/キャンセル
 from collections import deque  # 30sミッド履歴でガード
+from collections.abc import Mapping  # 戦略別設定の判定に使用
 from datetime import datetime, timezone, timedelta  # ts解析と現在時刻 JST日付の境界計算にtimedeltaを使う
 from typing import Deque, Optional, Sequence, Tuple  # 型ヒント
 import csv  # 役割：窓イベントをCSVに1行追記するために使用
@@ -20,6 +21,7 @@ from src.core.simulator import MiniSimulator  # 【関数】最小約定シミ�
 from src.core.logs import OrderLog, TradeLog  # 【関数】発注/約定ログ（Parquet）:contentReference[oaicite:5]{index=5}
 from src.core.analytics import DecisionLog  # 【関数】意思決定ログ（Parquet）:contentReference[oaicite:6]{index=6}
 from src.strategy import build_strategy  # 何をするか：戦略生成を中央ファクトリに委譲する
+from src.strategy.base import MultiStrategy  # 何をするか：複数戦略を束ねるラッパー
 from src.core.risk import RiskGate  # 何をするか：在庫ゲート（市場モードでClose-Onlyを切り替える）
 
 
@@ -77,12 +79,31 @@ def _now_utc() -> datetime:
 class PaperEngine:
     """リアルタイム“paper”の最小エンジン"""
 
+    @staticmethod
+    def _normalize_strategy_names(
+        primary: str,
+        strategies: Sequence[str] | str | None,
+    ) -> list[str]:
+        if strategies is None:
+            names = [primary]
+        elif isinstance(strategies, str):
+            names = [strategies]
+        else:
+            names = list(strategies)
+        return names or [primary]
+
+    @staticmethod
+    def _strategy_cfg_for(strategy_cfg, name: str):
+        if isinstance(strategy_cfg, Mapping):
+            return strategy_cfg.get(name)
+        return strategy_cfg
+
     def __init__(
         self,
         cfg,
         strategy_name: str,
         *,
-        strategies: Sequence[str] | None = None,
+        strategies: Sequence[str] | str | None = None,
         strategy_cfg=None,
     ) -> None:
         # 設定（製品コード/刻み/ガード閾値）
@@ -109,9 +130,17 @@ class PaperEngine:
             self._stale_halt_ms = float(halt_sec) * 1000.0 if halt_sec is not None else None  # 何をする行か：秒→ms換算
 
         # 戦略（#1/#2/#3）を選択
-        self.strategies = list(strategies) if strategies is not None else [strategy_name]
-        primary_strategy = self.strategies[0] if self.strategies else strategy_name
-        self.strat = build_strategy(primary_strategy, cfg, strategy_cfg=strategy_cfg)
+        self.strategies = self._normalize_strategy_names(strategy_name, strategies)
+        if len(self.strategies) == 1:
+            selected = self.strategies[0]
+            cfg_override = self._strategy_cfg_for(strategy_cfg, selected)
+            self.strat = build_strategy(selected, cfg, strategy_cfg=cfg_override)
+        else:
+            children = [
+                build_strategy(name, cfg, strategy_cfg=self._strategy_cfg_for(strategy_cfg, name))
+                for name in self.strategies
+            ]
+            self.strat = MultiStrategy(children)
 
 
         # ローカル板・シミュ・ログ器
@@ -548,7 +577,9 @@ class PaperEngine:
         """【関数】paper実行の本体：WS→板→戦略→シミュ→ログ（Ctrl+Cで安全終了）
         - 文書の 8.3 ペーパー運用の最小形。:contentReference[oaicite:10]{index=10}
         """
-        logger.info(f"paper start: product={self.product} strategy={self.strat.name}")
+        logger.info(
+            f"paper start: product={self.product} strategy={self.strat.name} strategies={self.strategies}"
+        )
         try:
             async for ev in event_stream(product_code=self.product):
                 now = _parse_iso(ev["ts"])

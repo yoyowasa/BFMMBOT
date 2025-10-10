@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os  # 何をするか：APIキー/シークレットを環境変数から読む
 from typing import Any, Sequence  # 何をするか：cfg の型ヒント用
+from collections.abc import Mapping  # 何をするか：戦略別設定を判定する
 from loguru import logger  # 何をするか：進行ログを出す
 import json  # 何をするか：heartbeatをndjsonで書くためにJSONへ直す
 from zoneinfo import ZoneInfo  # 何をするか：JST（Asia/Tokyo）へのタイムゾーン変換に使う
@@ -32,6 +33,7 @@ from src.core.orderbook import OrderBook  # 何をするか：ローカル板（
 from src.core.orders import Order  # 何をするか：戦略が返す注文モデル（tif/ttl_ms/price/size/tag）
 from src.core.realtime import stream_events  # 何をするか：WSのboard/executionsストリーム
 from src.strategy import build_strategy  # 何をするか：戦略インスタンスを中央ファクトリから取得する
+from src.strategy.base import MultiStrategy  # 何をするか：複数戦略をまとめるラッパー
 from src.core.logs import OrderLog, TradeLog  # 何をするか：orders/trades を Parquet＋NDJSON に記録する
 from src.core.analytics import DecisionLog  # 何をするか：戦略の意思決定ログ（Parquet＋NDJSONミラー）を扱う
 
@@ -41,6 +43,27 @@ from src.core.exchange import BitflyerExchange, ExchangeError, ServerError, Netw
 def _select_strategy(name: str, cfg, strategy_cfg=None):
     """何をするか：戦略名から実体を生成（中央ファクトリへ委譲）"""
     return build_strategy(name, cfg, strategy_cfg=strategy_cfg)
+
+
+def _normalize_strategy_names(
+    primary: str,
+    strategies: Sequence[str] | str | None,
+) -> list[str]:
+    names: list[str]
+    if strategies is None:
+        names = [primary]
+    elif isinstance(strategies, str):
+        names = [strategies]
+    else:
+        names = list(strategies)
+    return names or [primary]
+
+
+def _strategy_cfg_for(strategy_cfg, name: str):
+    if isinstance(strategy_cfg, Mapping):
+        return strategy_cfg.get(name)
+    return strategy_cfg
+
 
 def _now_utc() -> datetime:
     """何をするか：UTC現在時刻を返す（ログ/TTL計算の基準）"""
@@ -462,7 +485,7 @@ def run_live(
     strategy_name: str,
     dry_run: bool = True,
     *,
-    strategies: Sequence[str] | None = None,
+    strategies: Sequence[str] | str | None = None,
     strategy_cfg=None,
 ) -> None:
     """
@@ -483,22 +506,25 @@ def run_live(
 
 
     # 何をするか：exchange adapter で「未約定一覧」を1件だけ取得し、疎通を確かめる
-    strategy_list = list(strategies) if strategies is not None else [strategy_name]
-    primary_strategy = strategy_list[0] if strategy_list else strategy_name
+    strategy_list = _normalize_strategy_names(strategy_name, strategies)
+    if len(strategy_list) > 1:
+        primary_strategy = strategy_list[0]
+        summary_name = MultiStrategy._compose_name(strategy_list)
+    else:
+        primary_strategy = strategy_list[0]
+        summary_name = primary_strategy
 
     with BitflyerExchange(api_key, api_secret, product_code=product_code) as ex:
         try:
             _ = ex.list_active_child_orders(count=1)
             if dry_run:
                 logger.info(
-                    f"live(dry-run): exchange OK product={product_code} strategy={primary_strategy}"
+                    f"live(dry-run): exchange OK product={product_code} strategy={summary_name} strategies={strategy_list}"
                 )
                 logger.info("live(dry-run): ここでは発注しません（導線の疎通確認だけ）")
             else:
                 # 次ステップで：ここにイベントループ＋戦略呼び出し＋TTL取消などを実装
-            # 何をするか：ここから live のイベントループ（WS→板→戦略→発注／TTL取消／ガード）を回す
-                ob = OrderBook()  # 何をするか：ローカル板（戦略の入力）を用意
-            strat = _select_strategy(primary_strategy, cfg, strategy_cfg=strategy_cfg)  # 何をするか：戦略に設定（cfg）を渡す
+                pass
             live_orders: dict[str, dict] = {}  # 何をするか：受理ID→TTLなどのメタ情報を保持
             if not bool(getattr(cfg, "cancel_all_on_start", True)):  # 何をするか：起動時に全取消しない運用なら、残っている注文を監視にシード
                 _seed_live_orders_from_active(ex, live_orders)
@@ -555,8 +581,18 @@ def run_live(
             canary_min = int(getattr(cfg, "canary_minutes", 60))  # 何をするか：最長運転時間（分）。未指定は60分
             throttle_until: datetime | None = None  # 何をするか：レート制限に当たった時のクールダウン期限
 
-            logger.info(f"live: starting loop product={product_code} strategy={strategy_name}")  # 何をするか：起動ログ
-            _hb_write(hb_path, event="start", ts=_now_utc().isoformat(), reason="launch", product=product_code, strategy=strategy_name)  # 何をするか：起動の合図を心拍に1行記録
+            logger.info(
+                f"live: starting loop product={product_code} strategy={summary_name} strategies={strategy_list}"
+            )  # 何をするか：起動ログ
+            _hb_write(
+                hb_path,
+                event="start",
+                ts=_now_utc().isoformat(),
+                reason="launch",
+                product=product_code,
+                strategy=summary_name,
+                strategies=strategy_list,
+            )  # 何をするか：起動の合図を心拍に1行記録
             atexit.register(_mk_atexit(hb_path))  # 何をするか：プログラム終了時に stop を1行だけ書くよう登録
 
             try:
@@ -588,9 +624,29 @@ def run_live(
             signal.signal(signal.SIGINT, _on_signal)   # 何をするか：Ctrl+C（SIGINT）で停止
             signal.signal(signal.SIGTERM, _on_signal)  # 何をするか：SIGTERM（停止要求）で停止
 
-            _hb_write(hb_path, event="start", ts=_now_utc().isoformat(), product=product_code, strategy=strategy_name)  # 何をするか：起動を記録
+            _hb_write(
+                hb_path,
+                event="start",
+                ts=_now_utc().isoformat(),
+                product=product_code,
+                strategy=summary_name,
+                strategies=strategy_list,
+            )  # 何をするか：起動を記録
             ob = OrderBook()  # 何をするか：ローカル板（戦略の入力）を用意
-            strat = _select_strategy(strategy_name, cfg, strategy_cfg=strategy_cfg)  # 何をするか：選択した戦略を設定(cfg)付きで組み立てる
+            if len(strategy_list) == 1:
+                strat = _select_strategy(
+                    strategy_list[0],
+                    cfg,
+                    strategy_cfg=_strategy_cfg_for(strategy_cfg, strategy_list[0]),
+                )
+            else:
+                strat = MultiStrategy(
+                    [
+                        _select_strategy(name, cfg, strategy_cfg=_strategy_cfg_for(strategy_cfg, name))
+                        for name in strategy_list
+                    ]
+                )
+            summary_name = strat.name
 
 
             for ev in _stream_with_reconnect(product_code, hb_path):  # 何をするか：WSが切れても自動再接続しながらイベントを処理
@@ -834,7 +890,7 @@ def run_live(
                     fee = px * sz * (fee_bps / 10000.0)  # 何をするか：約定金額×bpsで手数料（正=コスト/負=リベート）
                     realized -= fee  # 何をするか：PnLは手数料込み（ネット）で積算する
 
-                    trade_log.add(ts=now.isoformat(), side=side, px=px, sz=sz, fee=fee, pnl=realized, strategy=strategy_name, tag=tag, inventory_after=pnl_state["pos"], window_funding=fund_now, window_maint=maint_now)  # 何をするか：手数料込みで trades を記録
+                    trade_log.add(ts=now.isoformat(), side=side, px=px, sz=sz, fee=fee, pnl=realized, strategy=summary_name, tag=tag, inventory_after=pnl_state["pos"], window_funding=fund_now, window_maint=maint_now)  # 何をするか：手数料込みで trades を記録
                     order_log.add(ts=now.isoformat(), action=("fill" if done else "partial"), tif=None, ttl_ms=None, px=px, sz=sz, reason=tag)  # 何をするか：ordersログにも fill/partial を記録する
                     _hb_write(hb_path, event=("fill" if done else "partial"), ts=now.isoformat(), side=side, px=px, sz=sz, pnl=realized, tag=tag)  # 何をするか：約定イベントを心拍へ（部分約定はpartialとして記録）
                     daily_R += realized  # 何をするか：当日実現PnL(JPY)を更新（手数料込みの realized を積算）
@@ -907,10 +963,10 @@ def run_live(
                         except Exception as e:
                             logger.exception(f"strategy error: {e}")  # 何をするか：原因をrun.logに記録（スタック付き）
                             _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="strategy_error")  # 何をするか：心拍に“戦略エラー”を記録
-                            decision_log.add(ts=now.isoformat(), strategy=strategy_name, decision="error", features={}, expected_edge_bp=None, eta_ms=int((time.perf_counter() - t0) * 1000), ca_ratio=None, best_age_ms=None, spread_state=None)  # 何をするか：必須のKW引数をすべて埋めて“error”を記録
+                            decision_log.add(ts=now.isoformat(), strategy=summary_name, decision="error", features={}, expected_edge_bp=None, eta_ms=int((time.perf_counter() - t0) * 1000), ca_ratio=None, best_age_ms=None, spread_state=None)  # 何をするか：必須のKW引数をすべて埋めて“error”を記録
                             skip_new_orders = True
                         else:
-                            decision_log.add(ts=now.isoformat(), strategy=strategy_name, decision=("place" if evaluate_actions else "hold"), features={}, expected_edge_bp=None, eta_ms=int((time.perf_counter() - t0) * 1000), ca_ratio=None, best_age_ms=None, spread_state=None)  # 何をするか：必須のKW引数をすべて埋めて“place/hold”を記録
+                            decision_log.add(ts=now.isoformat(), strategy=summary_name, decision=("place" if evaluate_actions else "hold"), features={}, expected_edge_bp=None, eta_ms=int((time.perf_counter() - t0) * 1000), ca_ratio=None, best_age_ms=None, spread_state=None)  # 何をするか：必須のKW引数をすべて埋めて“place/hold”を記録
 
                 except Exception as e:
                     logger.error(f"strategy evaluate failed: {e}")
