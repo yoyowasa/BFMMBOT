@@ -162,17 +162,35 @@ def main() -> None:
                             rp = None
                 if rp is None:
                     raise RuntimeError("paper runner が見つかりません（engine.run_paper / engine.paper_main / runtime.paper.main などを確認）")  # 何をするか：どこにも無ければ分かりやすく停止
+                paper_kwargs = {
+                    "strategies": normalized_strategies,
+                    "strategy_cfg": strategy_cfg,
+                }
                 try:
-                    rp(cfg, selected_strategy, strategy_cfg=strategy_cfg)  # 何をするか：見つけた入口でペーパー運転を開始
+                    rp(cfg, selected_strategy, **paper_kwargs)  # 何をするか：見つけた入口でペーパー運転を開始
                 except TypeError:
-                    rp(cfg, selected_strategy)  # 互換：旧シグネチャ（strategy_cfg未対応）の場合は従来呼び出し
+                    try:
+                        rp(cfg, selected_strategy, strategy_cfg=strategy_cfg)  # 互換：旧シグネチャ（strategy_cfg未対応）の場合は従来呼び出し
+                    except TypeError:
+                        rp(cfg, selected_strategy)  # 互換：さらに古いシグネチャ（strategyのみ）の場合
             else:
-                run_live(cfg, selected_strategy, dry_run=args.dry_run, strategy_cfg=strategy_cfg)  # 何をするか：従来どおりlive/dry-run
+                run_live(
+                    cfg,
+                    selected_strategy,
+                    dry_run=args.dry_run,
+                    strategies=normalized_strategies,
+                    strategy_cfg=strategy_cfg,
+                )  # 何をするか：従来どおりlive/dry-run
             return  # 何をするか：live 分岐ではここで終了（paper へは進まない）
 
         if cfg.env != "paper":
             logger.warning(f"env is '{cfg.env}' (expected 'paper') - 続行はします")
-        engine = PaperEngine(cfg, selected_strategy, strategy_cfg=strategy_cfg)
+        engine = PaperEngine(
+            cfg,
+            selected_strategy,
+            strategies=normalized_strategies,
+            strategy_cfg=strategy_cfg,
+        )
         try:
             asyncio.run(engine.run_paper())
         except KeyboardInterrupt:
