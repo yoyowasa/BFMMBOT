@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio  # 非同期ループ/キャンセル
 from collections import deque  # 30sミッド履歴でガード
 from datetime import datetime, timezone, timedelta  # ts解析と現在時刻 JST日付の境界計算にtimedeltaを使う
-from typing import Deque, Optional, Tuple  # 型ヒント
+from typing import Deque, Optional, Sequence, Tuple  # 型ヒント
 import csv  # 役割：窓イベントをCSVに1行追記するために使用
 import time  # 何をするか：現在時刻(ms)を取得してHB間隔を測る
 from loguru import logger  # 実行ログ
@@ -77,7 +77,14 @@ def _now_utc() -> datetime:
 class PaperEngine:
     """リアルタイム“paper”の最小エンジン"""
 
-    def __init__(self, cfg, strategy_name: str, *, strategy_cfg=None) -> None:
+    def __init__(
+        self,
+        cfg,
+        strategy_name: str,
+        *,
+        strategies: Sequence[str] | None = None,
+        strategy_cfg=None,
+    ) -> None:
         # 設定（製品コード/刻み/ガード閾値）
         self.cfg = cfg
         self.product = getattr(cfg, "product_code", "FX_BTC_JPY") or "FX_BTC_JPY"
@@ -102,7 +109,9 @@ class PaperEngine:
             self._stale_halt_ms = float(halt_sec) * 1000.0 if halt_sec is not None else None  # 何をする行か：秒→ms換算
 
         # 戦略（#1/#2/#3）を選択
-        self.strat = build_strategy(strategy_name, cfg, strategy_cfg=strategy_cfg)
+        self.strategies = list(strategies) if strategies is not None else [strategy_name]
+        primary_strategy = self.strategies[0] if self.strategies else strategy_name
+        self.strat = build_strategy(primary_strategy, cfg, strategy_cfg=strategy_cfg)
 
 
         # ローカル板・シミュ・ログ器

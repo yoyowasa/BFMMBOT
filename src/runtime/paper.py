@@ -143,7 +143,13 @@ def _select_strategy(strategy_name: str, cfg, strategy_cfg=None):
 
 # ---- メイン：疑似発注ランナー ----
 
-def run_paper(cfg, strategy_name: str, *, strategy_cfg=None):
+def run_paper(
+    cfg,
+    strategy_name: str,
+    *,
+    strategies: Optional[List[str]] = None,
+    strategy_cfg=None,
+):
     """何をする関数か：疑似発注（place/ fill / cancel）を心拍に記録しながら回す最小ランナー"""
     product = getattr(cfg, "product_code", "FX_BTC_JPY")
     tick = float(getattr(cfg, "tick_size", 1))
@@ -152,8 +158,18 @@ def run_paper(cfg, strategy_name: str, *, strategy_cfg=None):
 
     hb_path = Path("logs/runtime/heartbeat.ndjson")
 
-    logger.info(f"paper start: product={product} strategy={strategy_name}")
-    _hb_write(hb_path, event="start", ts=_now_utc().isoformat(), mode="paper", product=product, strategy=strategy_name)
+    strategy_list = strategies or [strategy_name]
+    primary_strategy = strategy_list[0] if strategy_list else strategy_name
+
+    logger.info(f"paper start: product={product} strategy={primary_strategy}")
+    _hb_write(
+        hb_path,
+        event="start",
+        ts=_now_utc().isoformat(),
+        mode="paper",
+        product=product,
+        strategy=primary_strategy,
+    )
     order_log = OrderLog(path=Path("logs/orders/order_log.parquet"))  # 何をするか：ordersのParquet出力先を明示
     trade_log = TradeLog(path=Path("logs/trades/trade_log.parquet"))  # 何をするか：tradesのParquet出力先を明示
     fee_bps = float(getattr(getattr(cfg, "fees", None), "bps", 0.0))  # 何をするか：手数料(bps)。設定が無ければ0bps
@@ -162,7 +178,7 @@ def run_paper(cfg, strategy_name: str, *, strategy_cfg=None):
 
 
     ob = OrderBook()  # 何をするか：ローカル板
-    strat = _select_strategy(strategy_name, cfg, strategy_cfg=strategy_cfg)  # 何をするか：戦略インスタンス
+    strat = _select_strategy(primary_strategy, cfg, strategy_cfg=strategy_cfg)  # 何をするか：戦略インスタンス
     start_at = _now_utc()
     canary_sec = int(getattr(cfg, "dry_run_max_sec", 3600))  # 何をするか：安全のため紙運転も1時間で停止（必要に応じて調整）
 

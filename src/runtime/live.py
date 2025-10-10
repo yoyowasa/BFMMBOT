@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import os  # 何をするか：APIキー/シークレットを環境変数から読む
-from typing import Any  # 何をするか：cfg の型ヒント用
+from typing import Any, Sequence  # 何をするか：cfg の型ヒント用
 from loguru import logger  # 何をするか：進行ログを出す
 import json  # 何をするか：heartbeatをndjsonで書くためにJSONへ直す
 from zoneinfo import ZoneInfo  # 何をするか：JST（Asia/Tokyo）へのタイムゾーン変換に使う
@@ -457,7 +457,14 @@ def _refresh_fills(ex: BitflyerExchange, live_orders: dict[str, dict]) -> None:
         if state == "COMPLETED" or (outstanding <= 1e-12 and executed > 0.0):
             del live_orders[acc_id]  # 何をするか：完了注文は監視から除去
 
-def run_live(cfg: Any, strategy_name: str, dry_run: bool = True, *, strategy_cfg=None) -> None:
+def run_live(
+    cfg: Any,
+    strategy_name: str,
+    dry_run: bool = True,
+    *,
+    strategies: Sequence[str] | None = None,
+    strategy_cfg=None,
+) -> None:
     """
     live（本番）を起動する関数（最小版・導線）。
     - 何をするか：API鍵の取得→ exchange adapter で疎通確認（未発注）
@@ -476,17 +483,22 @@ def run_live(cfg: Any, strategy_name: str, dry_run: bool = True, *, strategy_cfg
 
 
     # 何をするか：exchange adapter で「未約定一覧」を1件だけ取得し、疎通を確かめる
+    strategy_list = list(strategies) if strategies is not None else [strategy_name]
+    primary_strategy = strategy_list[0] if strategy_list else strategy_name
+
     with BitflyerExchange(api_key, api_secret, product_code=product_code) as ex:
         try:
             _ = ex.list_active_child_orders(count=1)
             if dry_run:
-                logger.info(f"live(dry-run): exchange OK product={product_code} strategy={strategy_name}")
+                logger.info(
+                    f"live(dry-run): exchange OK product={product_code} strategy={primary_strategy}"
+                )
                 logger.info("live(dry-run): ここでは発注しません（導線の疎通確認だけ）")
             else:
                 # 次ステップで：ここにイベントループ＋戦略呼び出し＋TTL取消などを実装
             # 何をするか：ここから live のイベントループ（WS→板→戦略→発注／TTL取消／ガード）を回す
                 ob = OrderBook()  # 何をするか：ローカル板（戦略の入力）を用意
-            strat = _select_strategy(strategy_name, cfg, strategy_cfg=strategy_cfg)  # 何をするか：戦略に設定（cfg）を渡す
+            strat = _select_strategy(primary_strategy, cfg, strategy_cfg=strategy_cfg)  # 何をするか：戦略に設定（cfg）を渡す
             live_orders: dict[str, dict] = {}  # 何をするか：受理ID→TTLなどのメタ情報を保持
             if not bool(getattr(cfg, "cancel_all_on_start", True)):  # 何をするか：起動時に全取消しない運用なら、残っている注文を監視にシード
                 _seed_live_orders_from_active(ex, live_orders)
