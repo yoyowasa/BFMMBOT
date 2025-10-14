@@ -527,7 +527,17 @@ class PaperEngine:
     ) -> None:
         """【関数】Fillを在庫Q/A/Rに適用し、orders/tradesへ記録（最小PnL）"""
         # 1) orders：fill行
-        self.order_log.add(ts=ts_iso, action="fill", tif="GTC", ttl_ms=None, px=px, sz=sz, reason=tag)
+        reason_tag = tag if tag is not None else "-"
+        order_tag = getattr(order, "tag", getattr(order, "_strategy", "-"))
+        self.order_log.add(
+            ts=ts_iso,
+            action="fill",
+            tif="GTC",
+            ttl_ms=None,
+            px=px,
+            sz=sz,
+            reason=f"{reason_tag}; tag={order_tag}",
+        )
         dt = _parse_iso(ts_iso)  # 【関数】この約定時刻で窓フラグを判定するためにdatetime化
         is_maint = self._in_maintenance(dt)  # 【関数】メンテ窓か？
         is_fund = self._in_funding_calc(dt) or self._in_funding_transfer(dt)  # 【関数】Funding窓か？
@@ -629,11 +639,25 @@ class PaperEngine:
                     hit, why, rday, dd = self._maybe_trigger_kill()
                     if hit:
                         for o in self.sim.cancel_by_tag("stall"):
-                            self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
-                                            px=o.price, sz=o.remaining, reason="kill")
+                            self.order_log.add(
+                                ts=now.isoformat(),
+                                action="cancel",
+                                tif=o.tif,
+                                ttl_ms=o.ttl_ms,
+                                px=o.price,
+                                sz=o.remaining,
+                                reason=f"kill; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                            )
                         for o in self.sim.cancel_by_tag("ca_gate"):
-                            self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
-                                            px=o.price, sz=o.remaining, reason="kill")
+                            self.order_log.add(
+                                ts=now.isoformat(),
+                                action="cancel",
+                                tif=o.tif,
+                                ttl_ms=o.ttl_ms,
+                                px=o.price,
+                                sz=o.remaining,
+                                reason=f"kill; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                            )
                         self.halted = True
                         logger.error(f"Kill‑Switch({why}) fired: R_day={rday:.2f}, DD={dd:.2f} → stopping")
                         return  # 安全停止（finallyでログflush）  # 文書の“Kill到達で停止”に準拠
@@ -652,29 +676,64 @@ class PaperEngine:
                     # メンテ窓：新規禁止＋同タグ一括Cancel（reason="window"）
                     if self._in_maintenance(now):
                         for o in self.sim.cancel_by_tag("stall"):
-                            self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
-                                            px=o.price, sz=o.remaining, reason="window")
+                            self.order_log.add(
+                                ts=now.isoformat(),
+                                action="cancel",
+                                tif=o.tif,
+                                ttl_ms=o.ttl_ms,
+                                px=o.price,
+                                sz=o.remaining,
+                                reason=f"window; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                            )
                         for o in self.sim.cancel_by_tag("ca_gate"):
-                            self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
-                                            px=o.price, sz=o.remaining, reason="window")
+                            self.order_log.add(
+                                ts=now.isoformat(),
+                                action="cancel",
+                                tif=o.tif,
+                                ttl_ms=o.ttl_ms,
+                                px=o.price,
+                                sz=o.remaining,
+                                reason=f"window; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                            )
                             self._heartbeat(now, "pause", reason="maintenance")
                         continue  # このboardイベントでは新規Placeを行わない
                     
                     # Funding窓（計算 or 授受）：新規禁止＋同タグ一括Cancel（reason="funding"）
                     if self._in_funding_calc(now) or self._in_funding_transfer(now):
                         for o in self.sim.cancel_by_tag("stall"):
-                            self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
-                                            px=o.price, sz=o.remaining, reason="funding")  # 【関数】Funding窓で停止
+                            self.order_log.add(
+                                ts=now.isoformat(),
+                                action="cancel",
+                                tif=o.tif,
+                                ttl_ms=o.ttl_ms,
+                                px=o.price,
+                                sz=o.remaining,
+                                reason=f"funding; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                            )  # 【関数】Funding窓で停止
                         for o in self.sim.cancel_by_tag("ca_gate"):
-                            self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
-                                            px=o.price, sz=o.remaining, reason="funding")  # 【関数】Funding窓で停止
+                            self.order_log.add(
+                                ts=now.isoformat(),
+                                action="cancel",
+                                tif=o.tif,
+                                ttl_ms=o.ttl_ms,
+                                px=o.price,
+                                sz=o.remaining,
+                                reason=f"funding; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                            )  # 【関数】Funding窓で停止
                             self._heartbeat(now, "pause", reason="funding")
                         continue  # このboardイベントでは新規Placeを行わない
 
                     # TTL失効を処理（取消ログ）
                     for o in self.sim.on_time(now):
-                        self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
-                                           px=o.price, sz=o.remaining, reason="ttl")
+                        self.order_log.add(
+                            ts=now.isoformat(),
+                            action="cancel",
+                            tif=o.tif,
+                            ttl_ms=o.ttl_ms,
+                            px=o.price,
+                            sz=o.remaining,
+                            reason=f"ttl; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                        )
 
                     # ガード（速すぎるときは新規停止＋全取消）
                     paused = self._guard_midmove_bp(now)
@@ -682,11 +741,25 @@ class PaperEngine:
 
                     if paused:
                         for o in self.sim.cancel_by_tag("stall"):
-                            self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
-                                               px=o.price, sz=o.remaining, reason="guard")
+                            self.order_log.add(
+                                ts=now.isoformat(),
+                                action="cancel",
+                                tif=o.tif,
+                                ttl_ms=o.ttl_ms,
+                                px=o.price,
+                                sz=o.remaining,
+                                reason=f"guard; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                            )
                         for o in self.sim.cancel_by_tag("ca_gate"):
-                            self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
-                                               px=o.price, sz=o.remaining, reason="guard")
+                            self.order_log.add(
+                                ts=now.isoformat(),
+                                action="cancel",
+                                tif=o.tif,
+                                ttl_ms=o.ttl_ms,
+                                px=o.price,
+                                sz=o.remaining,
+                                reason=f"guard; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                            )
                             self._heartbeat(now, "pause", reason="midmove_guard")  # 直近イベントを要約（ミッド変化ガードで停止）
                         continue  # 新規は出さない
                     
@@ -697,11 +770,25 @@ class PaperEngine:
                     if eff_limit is not None and abs(self.Q) >= eff_limit:
                         close_only_mode = True
                         for o in self.sim.cancel_by_tag("stall"):
-                            self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
-                                            px=o.price, sz=o.remaining, reason="risk")  # 何を/なぜ記録したか（在庫上限）
+                            self.order_log.add(
+                                ts=now.isoformat(),
+                                action="cancel",
+                                tif=o.tif,
+                                ttl_ms=o.ttl_ms,
+                                px=o.price,
+                                sz=o.remaining,
+                                reason=f"risk; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                            )  # 何を/なぜ記録したか（在庫上限）
                         for o in self.sim.cancel_by_tag("ca_gate"):
-                            self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
-                                            px=o.price, sz=o.remaining, reason="risk")  # 何を/なぜ記録したか（在庫上限）
+                            self.order_log.add(
+                                ts=now.isoformat(),
+                                action="cancel",
+                                tif=o.tif,
+                                ttl_ms=o.ttl_ms,
+                                px=o.price,
+                                sz=o.remaining,
+                                reason=f"risk; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                            )  # 何を/なぜ記録したか（在庫上限）
                         logger.warning(f"risk guard: |Q|>={eff_limit} → new orders paused")  # 画面でも分かるように一言
                         self._heartbeat(now, "pause", reason="inventory_guard")  # ハートビート：在庫上限で停止
 
@@ -766,14 +853,29 @@ class PaperEngine:
                                     self._heartbeat(now, "pause", reason="inventory_guard")
                                     continue
                             self.sim.place(o, now)
-                            self.order_log.add(ts=now.isoformat(), action="place", tif=o.tif, ttl_ms=o.ttl_ms, px=o.price, sz=o.size, reason=o.tag)  # placeでも“注文タグ”（stall / ca_gate）を記録する
+                            self.order_log.add(
+                                ts=now.isoformat(),
+                                action="place",
+                                tif=o.tif,
+                                ttl_ms=o.ttl_ms,
+                                px=o.price,
+                                sz=o.size,
+                                reason=f"{o.tag}; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                            )  # placeでも“注文タグ”（stall / ca_gate）を記録する
 
                             self._heartbeat(now, "place", reason=o.tag)  # ハートビート：発注を要約
 
                         elif act.get("type") == "cancel_tag":
                             for o in self.sim.cancel_by_tag(act["tag"]):
-                                self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
-                                                   px=o.price, sz=o.remaining, reason="strategy")
+                                self.order_log.add(
+                                    ts=now.isoformat(),
+                                    action="cancel",
+                                    tif=o.tif,
+                                    ttl_ms=o.ttl_ms,
+                                    px=o.price,
+                                    sz=o.remaining,
+                                    reason=f"strategy; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                                )
 
                 elif ch.startswith("lightning_executions_"):
                     # 約定でシミュを進め、Fill明細を受け取る→PnL/ログ反映
@@ -786,8 +888,15 @@ class PaperEngine:
                         )
                     # TTLチェックをもう一度（成約後の期限切れ）
                     for o in self.sim.on_time(now):
-                        self.order_log.add(ts=now.isoformat(), action="cancel", tif=o.tif, ttl_ms=o.ttl_ms,
-                                           px=o.price, sz=o.remaining, reason="ttl")
+                        self.order_log.add(
+                            ts=now.isoformat(),
+                            action="cancel",
+                            tif=o.tif,
+                            ttl_ms=o.ttl_ms,
+                            px=o.price,
+                            sz=o.remaining,
+                            reason=f"ttl; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                        )
 
         except asyncio.CancelledError:
             logger.info("paper cancelled")
