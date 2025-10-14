@@ -21,7 +21,7 @@ from src.core.simulator import MiniSimulator  # 【関数】最小約定シミ�
 from src.core.logs import OrderLog, TradeLog  # 【関数】発注/約定ログ（Parquet）:contentReference[oaicite:5]{index=5}
 from src.core.analytics import DecisionLog  # 【関数】意思決定ログ（Parquet）:contentReference[oaicite:6]{index=6}
 from src.strategy import build_strategy  # 何をするか：戦略生成を中央ファクトリに委譲する
-from src.strategy.base import MultiStrategy  # 何をするか：複数戦略を束ねるラッパー
+from src.strategy.base import MultiStrategy, current_strategy_ctx  # 何をするか：複数戦略を束ねるラッパーと子戦略名の合図
 from src.core.risk import RiskGate  # 何をするか：在庫ゲート（市場モードでClose-Onlyを切り替える）
 
 
@@ -467,7 +467,7 @@ class PaperEngine:
 
         self.decision_log.add(
             ts=now.isoformat(),
-            strategy=self.strat.name,
+            strategy=(current_strategy_ctx.get() or self.strat.name),
             decision=decision,
             features=feats,
             expected_edge_bp=None,  # 最小実装では未算出
