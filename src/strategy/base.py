@@ -92,6 +92,9 @@ class MultiStrategy(StrategyBase):
         if not actions:
             return wrapped
         child_name = getattr(child, "name", "")
+        child_strategy_name = (
+            getattr(child, "strategy_name", None) or child_name or "unknown"
+        )
         for action in actions:
             if not isinstance(action, dict):
                 wrapped.append(action)
@@ -100,6 +103,10 @@ class MultiStrategy(StrategyBase):
             if item.get("type") == "place":
                 order = self._get_order_from_action(item)
                 if order is not None:
+                    try:
+                        setattr(order, "_strategy", child_strategy_name)
+                    except Exception:
+                        pass
                     order.tag = self._prefixed_tag(child_name, getattr(order, "tag", ""))
             elif item.get("type") == "cancel_tag":
                 item["tag"] = self._prefixed_tag(child_name, item.get("tag"))

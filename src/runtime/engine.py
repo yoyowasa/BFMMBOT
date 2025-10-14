@@ -479,17 +479,19 @@ class PaperEngine:
 
     def _heartbeat(self, now: datetime, event: str, reason: str | None = None) -> None:
         """【関数】ハートビート：Q/A/R・日次R・各ガード/窓の状態を1行JSONで追記する"""
-        j = {
+        eff_limit = self.effective_inventory_limit()
+        inventory_guard = eff_limit is not None and abs(self.Q) >= float(eff_limit)
+        payload = {
             "ts": now.isoformat(),
             "event": event,           # "place" / "fill" / "pause" など直近イベント
             "reason": reason,         # "inventory_guard" / "midmove_guard" / "maintenance" / "funding" など
-            "strategy": self.strat.name,
+            "strategy": getattr(self.strat, "strategy_name", None) or self.strat.name,
             "Q": self.Q,              # 現在在庫（+ロング/−ショート）
             "A": self.A,              # 平均建値
             "R": self.R,              # 累計実現PnL
             "R_day": self._daily_R,   # 日次実現PnL
             "guard": {                # ガードのON/OFF（Trueで“新規停止中”）
-                "inventory": (self.effective_inventory_limit() is not None and abs(self.Q) >= float(self.effective_inventory_limit())),
+                "inventory": inventory_guard,
                 "midmove": self._midguard_paused,
             },
             "window": {
@@ -497,10 +499,32 @@ class PaperEngine:
                 "funding": self._in_funding_calc(now) or self._in_funding_transfer(now),
             },
         }
-        self._hb_path.open("a", encoding="utf-8").write(orjson.dumps(j).decode("utf-8") + "\n")
+        child_names = ([
+            getattr(child, "strategy_name", None) or getattr(child, "name", "unknown")
+            for child in getattr(self.strat, "children", [])
+        ] or [payload["strategy"]])
+        lines = []
+        for child_name in child_names:
+            entry = dict(payload)
+            entry["strategy"] = child_name
+            lines.append(orjson.dumps(entry).decode("utf-8"))
+        if not lines:
+            return
+        with self._hb_path.open("a", encoding="utf-8") as fh:
+            for line in lines:
+                fh.write(line + "\n")
 
     # ─────────────────────────────────────────────────────────────
-    def _apply_fill_and_log(self, ts_iso: str, side: str, px: float, sz: float, tag: str) -> None:
+    def _apply_fill_and_log(
+        self,
+        ts_iso: str,
+        side: str,
+        px: float,
+        sz: float,
+        tag: str,
+        *,
+        order=None,
+    ) -> None:
         """【関数】Fillを在庫Q/A/Rに適用し、orders/tradesへ記録（最小PnL）"""
         # 1) orders：fill行
         self.order_log.add(ts=ts_iso, action="fill", tif="GTC", ttl_ms=None, px=px, sz=sz, reason=tag)
@@ -537,9 +561,19 @@ class PaperEngine:
         self._R_HWM = max(self._R_HWM, self._daily_R)  # 【関数】HWM更新（DD計算用）
 
         # 3) trades：約定行
+        order_strategy = None
+        if order is not None:
+            order_strategy = getattr(order, "_strategy", None)
+        strategy_name = (
+            current_strategy_ctx.get()
+            or order_strategy
+            or getattr(self.strat, "strategy_name", None)
+            or self.strat.name
+        )
+
         self.trade_log.add(
             ts=ts_iso, side=side, px=px, sz=sz, pnl=realized,
-            strategy=self.strat.name, tag=tag, inventory_after=self.Q,
+            strategy=strategy_name, tag=tag, inventory_after=self.Q,
             window_funding=is_fund, window_maint=is_maint  # 【関数】どの窓中の約定かを明示
         )
         self._heartbeat(dt, "fill", reason=tag)  # ハートビート：約定を要約
@@ -747,7 +781,8 @@ class PaperEngine:
                     for f in fills:
                         self._apply_fill_and_log(
                             ts_iso=f["ts"], side=f["side"], px=float(f["price"]),
-                            sz=float(f["size"]), tag=f["tag"]
+                            sz=float(f["size"]), tag=f["tag"],
+                            order=f.get("order"),
                         )
                     # TTLチェックをもう一度（成約後の期限切れ）
                     for o in self.sim.on_time(now):
