@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import contextvars
 from typing import Any, Dict, Iterable, List, Sequence  # 返り値の型
 from datetime import datetime  # 戦略判断の時刻
 from src.core.orderbook import OrderBook  # ローカル板
@@ -14,6 +15,9 @@ class StrategyBase:
     def evaluate(self, ob: OrderBook, now: datetime, cfg) -> List[Dict[str, Any]]:
         """【関数】戦略評価：必要なときだけ [{'type':'place'|'cancel_tag', ...}] を返す"""
         return []
+
+
+current_strategy_ctx = contextvars.ContextVar("current_strategy_name", default=None)
 
 
 class MultiStrategy(StrategyBase):
@@ -88,6 +92,9 @@ class MultiStrategy(StrategyBase):
         if not actions:
             return wrapped
         child_name = getattr(child, "name", "")
+        child_strategy_name = (
+            getattr(child, "strategy_name", None) or child_name or "unknown"
+        )
         for action in actions:
             if not isinstance(action, dict):
                 wrapped.append(action)
@@ -96,6 +103,10 @@ class MultiStrategy(StrategyBase):
             if item.get("type") == "place":
                 order = self._get_order_from_action(item)
                 if order is not None:
+                    try:
+                        setattr(order, "_strategy", child_strategy_name)
+                    except Exception:
+                        pass
                     order.tag = self._prefixed_tag(child_name, getattr(order, "tag", ""))
             elif item.get("type") == "cancel_tag":
                 item["tag"] = self._prefixed_tag(child_name, item.get("tag"))
@@ -116,7 +127,19 @@ class MultiStrategy(StrategyBase):
         return self._dispatch_actions("on_start", *args, **kwargs)
 
     def on_event(self, *args, **kwargs):
-        return self._dispatch_actions("on_event", *args, **kwargs)
+        results: List[Dict[str, Any]] = []
+        for child in self.children:
+            method = getattr(child, "on_event", None)
+            if not callable(method):
+                continue
+            child_name = getattr(child, "strategy_name", None) or getattr(child, "name", "unknown")
+            token = current_strategy_ctx.set(child_name or "unknown")
+            try:
+                actions = method(*args, **kwargs)
+            finally:
+                current_strategy_ctx.reset(token)
+            results.extend(self._wrap_actions(child, actions))
+        return results
 
     def on_stop(self, *args, **kwargs):
         return self._dispatch_actions("on_stop", *args, **kwargs)
