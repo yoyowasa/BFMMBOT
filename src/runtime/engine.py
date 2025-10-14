@@ -465,11 +465,25 @@ class PaperEngine:
             else:
                 decision = "none"
 
+        _features = dict(feats or {})  # 何をするか：特徴量JSONを壊さないようコピーしてタグ情報を追記する土台を作る
+        orders = [
+            a.get("order")
+            for a in (actions or [])
+            if isinstance(a, dict) and a.get("type") == "place" and a.get("order") is not None
+        ]  # 何をするか：今回の意思決定で生成された注文を拾う
+        tags = sorted({
+            str(getattr(o, "tag", getattr(o, "_strategy", None)))
+            for o in orders
+            if getattr(o, "tag", None) or getattr(o, "_strategy", None)
+        })  # 何をするか：注文に刻まれたタグ/子戦略名を収集して一意化
+        if tags:
+            _features["tags"] = tags  # 何をするか：タグ情報があれば features_json に配列で書き込む
+
         self.decision_log.add(
             ts=now.isoformat(),
             strategy=(current_strategy_ctx.get() or self.strat.name),
             decision=decision,
-            features=feats,
+            features=_features,
             expected_edge_bp=None,  # 最小実装では未算出
             eta_ms=None,            # 最小実装では未算出
             ca_ratio=feats["ca_ratio"],
