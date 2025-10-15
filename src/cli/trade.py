@@ -111,27 +111,34 @@ def main() -> None:
     cfg = load_config(args.config)
     strategy_cfg = None
 
-    cfg_strategies = getattr(cfg, "strategies", None)
-    cli_strategies = args.strategy
-    if cli_strategies is None:
-        raw_strategies = cfg_strategies
+    raw_cli = getattr(args, "strategy", None)
+    if raw_cli:
+        strategy_names: List[str] = []  # 何をするか：CLI指定があればカンマ区切りにも対応して正規化する
+        for entry in raw_cli:
+            for part in str(entry).split(","):
+                name = part.strip()
+                if name:
+                    strategy_names.append(name)
     else:
-        raw_strategies = cli_strategies
+        cfg_strategies = getattr(cfg, "strategies", None)
+        if cfg_strategies is None:
+            strategy_names = []
+        elif isinstance(cfg_strategies, Sequence) and not isinstance(cfg_strategies, (str, bytes)):
+            strategy_names = [str(s) for s in cfg_strategies if s]
+        else:
+            strategy_names = [str(cfg_strategies)]
 
-    normalized_strategies: List[str]
-    if raw_strategies is None:
-        normalized_strategies = []
-    elif isinstance(raw_strategies, Sequence) and not isinstance(raw_strategies, (str, bytes)):
-        normalized_strategies = [str(s) for s in raw_strategies if s]
-    else:
-        normalized_strategies = [str(raw_strategies)]
-
-    if not normalized_strategies:
+    if not strategy_names:
         logger.error("strategy_not_specified CLIまたはconfigのstrategiesが空です")
         raise SystemExit(1)
 
+    try:
+        cfg["strategies"] = strategy_names  # 何をするか：後段が参照する戦略名リストをcfgへ確定させる（Mapping互換時）
+    except Exception:
+        setattr(cfg, "strategies", strategy_names)  # 何をするか：BaseModel等でも同じリストを保持する
+
     # NOTE: マルチ戦略対応を見据えてリストは保持しつつ、現状の呼び出しは先頭のみ使用する
-    selected_strategy = normalized_strategies[0]
+    selected_strategy = strategy_names[0]
 
     sink_ids = _setup_text_logs(cfg, selected_strategy)
     try:

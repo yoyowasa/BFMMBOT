@@ -581,20 +581,6 @@ def run_live(
             canary_min = int(getattr(cfg, "canary_minutes", 60))  # 何をするか：最長運転時間（分）。未指定は60分
             throttle_until: datetime | None = None  # 何をするか：レート制限に当たった時のクールダウン期限
 
-            logger.info(
-                f"live: starting loop product={product_code} strategy={summary_name} strategies={strategy_list}"
-            )  # 何をするか：起動ログ
-            _hb_write(
-                hb_path,
-                event="start",
-                ts=_now_utc().isoformat(),
-                reason="launch",
-                product=product_code,
-                strategy=summary_name,
-                strategies=strategy_list,
-            )  # 何をするか：起動の合図を心拍に1行記録
-            atexit.register(_mk_atexit(hb_path))  # 何をするか：プログラム終了時に stop を1行だけ書くよう登録
-
             try:
                 _ = ex.list_active_child_orders(count=1)  # 何をするか：認証/権限・疎通の最小チェック（実発注なし）
             except AuthError as e:
@@ -624,14 +610,6 @@ def run_live(
             signal.signal(signal.SIGINT, _on_signal)   # 何をするか：Ctrl+C（SIGINT）で停止
             signal.signal(signal.SIGTERM, _on_signal)  # 何をするか：SIGTERM（停止要求）で停止
 
-            _hb_write(
-                hb_path,
-                event="start",
-                ts=_now_utc().isoformat(),
-                product=product_code,
-                strategy=summary_name,
-                strategies=strategy_list,
-            )  # 何をするか：起動を記録
             ob = OrderBook()  # 何をするか：ローカル板（戦略の入力）を用意
             if len(strategy_list) == 1:
                 strat = _select_strategy(
@@ -647,6 +625,26 @@ def run_live(
                     ]
                 )
             summary_name = strat.name
+
+            strategy_names = [
+                getattr(child, "strategy_name", getattr(child, "name", "unknown"))
+                for child in getattr(strat, "children", [])
+            ] or [getattr(strat, "strategy_name", getattr(strat, "name", "unknown"))]
+            strategy_list = strategy_names
+            summary_name = getattr(strat, "strategy_name", summary_name)
+            logger.info(
+                f"live: starting loop product={product_code} strategy={summary_name} strategies={strategy_list}"
+            )  # 何をするか：起動ログ
+            _hb_write(
+                hb_path,
+                event="start",
+                ts=_now_utc().isoformat(),
+                reason="launch",
+                product=product_code,
+                strategy=summary_name,
+                strategies=strategy_list,
+            )  # 何をするか：起動の合図をrun.logと揃えて心拍に記録
+            atexit.register(_mk_atexit(hb_path))  # 何をするか：終了時にstopを1行出す
 
 
             for ev in _stream_with_reconnect(product_code, hb_path):  # 何をするか：WSが切れても自動再接続しながらイベントを処理

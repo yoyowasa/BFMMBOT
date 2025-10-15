@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import contextvars
+import uuid  # 何をするか：各子戦略の意思決定に固有の相関IDを割り当てる
 from typing import Any, Dict, Iterable, List, Sequence  # 返り値の型
 from datetime import datetime  # 戦略判断の時刻
 from src.core.orderbook import OrderBook  # ローカル板
@@ -14,6 +16,10 @@ class StrategyBase:
     def evaluate(self, ob: OrderBook, now: datetime, cfg) -> List[Dict[str, Any]]:
         """【関数】戦略評価：必要なときだけ [{'type':'place'|'cancel_tag', ...}] を返す"""
         return []
+
+
+current_strategy_ctx = contextvars.ContextVar("current_strategy_name", default=None)
+current_corr_ctx = contextvars.ContextVar("current_corr_id", default=None)  # 何をするか：現在の意思決定に割り当てた相関IDを共有する
 
 
 class MultiStrategy(StrategyBase):
@@ -88,14 +94,26 @@ class MultiStrategy(StrategyBase):
         if not actions:
             return wrapped
         child_name = getattr(child, "name", "")
+        child_strategy_name = (
+            getattr(child, "strategy_name", None) or child_name or "unknown"
+        )
+        corr_id = current_corr_ctx.get()
         for action in actions:
             if not isinstance(action, dict):
                 wrapped.append(action)
                 continue
             item = dict(action)
+            if corr_id is not None and "_corr_id" not in item:
+                item["_corr_id"] = corr_id
             if item.get("type") == "place":
                 order = self._get_order_from_action(item)
                 if order is not None:
+                    try:
+                        setattr(order, "_strategy", child_strategy_name)
+                    except Exception:
+                        pass
+                        if corr_id is not None:
+                            setattr(order, "_corr_id", corr_id)
                     order.tag = self._prefixed_tag(child_name, getattr(order, "tag", ""))
             elif item.get("type") == "cancel_tag":
                 item["tag"] = self._prefixed_tag(child_name, item.get("tag"))
@@ -108,15 +126,42 @@ class MultiStrategy(StrategyBase):
             method = getattr(child, method_name, None)
             if not callable(method):
                 continue
-            actions = method(*args, **kwargs)
-            results.extend(self._wrap_actions(child, actions))
+            child_name = getattr(child, "strategy_name", None) or getattr(child, "name", "unknown")
+            token_strategy = current_strategy_ctx.set(child_name or "unknown")
+            token_corr = current_corr_ctx.set(uuid.uuid4().hex)
+            actions = None
+            wrapped: List[Dict[str, Any]] = []
+            try:
+                actions = method(*args, **kwargs)
+                wrapped = self._wrap_actions(child, actions)
+            finally:
+                current_corr_ctx.reset(token_corr)
+                current_strategy_ctx.reset(token_strategy)
+            results.extend(wrapped)
         return results
 
     def on_start(self, *args, **kwargs):
         return self._dispatch_actions("on_start", *args, **kwargs)
 
     def on_event(self, *args, **kwargs):
-        return self._dispatch_actions("on_event", *args, **kwargs)
+        results: List[Dict[str, Any]] = []
+        for child in self.children:
+            method = getattr(child, "on_event", None)
+            if not callable(method):
+                continue
+            child_name = getattr(child, "strategy_name", None) or getattr(child, "name", "unknown")
+            token_strategy = current_strategy_ctx.set(child_name or "unknown")
+            token_corr = current_corr_ctx.set(uuid.uuid4().hex)
+            actions = None
+            wrapped: List[Dict[str, Any]] = []
+            try:
+                actions = method(*args, **kwargs)
+                wrapped = self._wrap_actions(child, actions)
+            finally:
+                current_corr_ctx.reset(token_corr)
+                current_strategy_ctx.reset(token_strategy)
+            results.extend(wrapped)
+        return results
 
     def on_stop(self, *args, **kwargs):
         return self._dispatch_actions("on_stop", *args, **kwargs)
