@@ -160,16 +160,6 @@ def run_paper(
 
     strategy_list = strategies or [strategy_name]
     primary_strategy = strategy_list[0] if strategy_list else strategy_name
-
-    logger.info(f"paper start: product={product} strategy={primary_strategy}")
-    _hb_write(
-        hb_path,
-        event="start",
-        ts=_now_utc().isoformat(),
-        mode="paper",
-        product=product,
-        strategy=primary_strategy,
-    )
     order_log = OrderLog(path=Path("logs/orders/order_log.parquet"))  # 何をするか：ordersのParquet出力先を明示
     trade_log = TradeLog(path=Path("logs/trades/trade_log.parquet"))  # 何をするか：tradesのParquet出力先を明示
     fee_bps = float(getattr(getattr(cfg, "fees", None), "bps", 0.0))  # 何をするか：手数料(bps)。設定が無ければ0bps
@@ -179,6 +169,23 @@ def run_paper(
 
     ob = OrderBook()  # 何をするか：ローカル板
     strat = _select_strategy(primary_strategy, cfg, strategy_cfg=strategy_cfg)  # 何をするか：戦略インスタンス
+    strategy_names = [
+        getattr(child, "strategy_name", getattr(child, "name", "unknown"))
+        for child in getattr(strat, "children", [])
+    ] or [getattr(strat, "strategy_name", getattr(strat, "name", "unknown"))]
+    primary_strategy = strategy_names[0]
+    logger.info(
+        f"paper start: product={product} strategies={strategy_names}"
+    )
+    _hb_write(
+        hb_path,
+        event="start",
+        ts=_now_utc().isoformat(),
+        mode="paper",
+        product=product,
+        strategy=primary_strategy,
+        strategies=strategy_names,
+    )
     start_at = _now_utc()
     canary_sec = int(getattr(cfg, "dry_run_max_sec", 3600))  # 何をするか：安全のため紙運転も1時間で停止（必要に応じて調整）
 
