@@ -6,7 +6,8 @@
 from __future__ import annotations
 
 import asyncio  # 非同期ループ/キャンセル
-from collections import deque  # 30sミッド履歴でガード
+import uuid  # 何をするか：corr_idのフォールバック生成に使用
+from collections import OrderedDict, deque  # 30sミッド履歴でガード＋client_order_id↔corr_id対応の保持
 from collections.abc import Mapping  # 戦略別設定の判定に使用
 from datetime import datetime, timezone, timedelta  # ts解析と現在時刻 JST日付の境界計算にtimedeltaを使う
 from typing import Deque, Optional, Sequence, Tuple  # 型ヒント
@@ -21,8 +22,15 @@ from src.core.simulator import MiniSimulator  # 【関数】最小約定シミ�
 from src.core.logs import OrderLog, TradeLog  # 【関数】発注/約定ログ（Parquet）:contentReference[oaicite:5]{index=5}
 from src.core.analytics import DecisionLog  # 【関数】意思決定ログ（Parquet）:contentReference[oaicite:6]{index=6}
 from src.strategy import build_strategy  # 何をするか：戦略生成を中央ファクトリに委譲する
-from src.strategy.base import MultiStrategy, current_strategy_ctx  # 何をするか：複数戦略を束ねるラッパーと子戦略名の合図
+from src.strategy.base import (
+    MultiStrategy,
+    current_corr_ctx,
+    current_strategy_ctx,
+)  # 何をするか：複数戦略を束ねるラッパーと子戦略名・相関IDの合図
 from src.core.risk import RiskGate  # 何をするか：在庫ゲート（市場モードでClose-Onlyを切り替える）
+
+_CORR_MAP_MAX = 8192  # 何をするか：client_order_id→corr_id の保持件数上限
+_coid_to_corr: OrderedDict[str, str] = OrderedDict()  # 何をするか：corr参照用のLRUマップ
 
 
 def _eval_feed_health(cfg: dict | object,
@@ -479,6 +487,15 @@ class PaperEngine:
         if tags:
             _features["tags"] = tags  # 何をするか：タグ情報があれば features_json に配列で書き込む
 
+        corr_hint = current_corr_ctx.get()
+        if not corr_hint:
+            corr_hint = next(
+                (getattr(o, "_corr_id", None) for o in orders if getattr(o, "_corr_id", None)),
+                None,
+            )
+        corr_id = corr_hint or uuid.uuid4().hex  # 何をするか：決定単位で一意な相関IDを決める
+        _features["corr_id"] = corr_id  # 何をするか：features_json内に相関IDを残す
+
         self.decision_log.add(
             ts=now.isoformat(),
             strategy=(current_strategy_ctx.get() or self.strat.name),
@@ -543,6 +560,20 @@ class PaperEngine:
         # 1) orders：fill行
         reason_tag = tag if tag is not None else "-"
         order_tag = getattr(order, "tag", getattr(order, "_strategy", "-"))
+        corr_for_log = _coid_to_corr.get(
+            getattr(order, "client_order_id", "") if order is not None else "",
+            (getattr(order, "_corr_id", None) if order is not None else None)
+            or current_corr_ctx.get()
+            or "-",
+        )
+        if (
+            order is not None
+            and getattr(order, "client_order_id", None)
+            and getattr(order, "_corr_id", None)
+        ):
+            _coid_to_corr[order.client_order_id] = order._corr_id
+            if len(_coid_to_corr) > _CORR_MAP_MAX:
+                _coid_to_corr.popitem(last=False)
         self.order_log.add(
             ts=ts_iso,
             action="fill",
@@ -550,7 +581,7 @@ class PaperEngine:
             ttl_ms=None,
             px=px,
             sz=sz,
-            reason=f"{reason_tag}; tag={order_tag}",
+            reason=f"{reason_tag}; tag={order_tag}; corr={corr_for_log}",
         )
         dt = _parse_iso(ts_iso)  # 【関数】この約定時刻で窓フラグを判定するためにdatetime化
         is_maint = self._in_maintenance(dt)  # 【関数】メンテ窓か？
@@ -595,9 +626,22 @@ class PaperEngine:
             or self.strat.name
         )
 
+        corr_for_trade = corr_for_log if corr_for_log != "-" else _coid_to_corr.get(
+            getattr(order, "client_order_id", "") if order is not None else "",
+            current_corr_ctx.get() or "-",
+        )
+        tag_payload = "" if tag is None else str(tag)
+        if corr_for_trade and corr_for_trade != "-":
+            if tag_payload:
+                if f"corr:{corr_for_trade}" not in tag_payload:
+                    tag_payload = f"{tag_payload}|corr:{corr_for_trade}"
+            else:
+                tag_payload = f"corr:{corr_for_trade}"
+        final_tag = tag_payload or ("" if tag is None else str(tag))
         self.trade_log.add(
             ts=ts_iso, side=side, px=px, sz=sz, pnl=realized,
-            strategy=strategy_name, tag=tag, inventory_after=self.Q,
+            strategy=strategy_name, tag=final_tag,
+            inventory_after=self.Q,
             window_funding=is_fund, window_maint=is_maint  # 【関数】どの窓中の約定かを明示
         )
         self._heartbeat(dt, "fill", reason=tag)  # ハートビート：約定を要約
@@ -649,7 +693,7 @@ class PaperEngine:
                     # 日次境界（JST）を跨いだら R_day/HWM をリセット
                     self._roll_daily(now)
 
-                    # Kill‑Switch 判定（trueで全キャンセル→停止）
+                    # Kill-Switch 判定（trueで全キャンセル→停止）
                     hit, why, rday, dd = self._maybe_trigger_kill()
                     if hit:
                         for o in self.sim.cancel_by_tag("stall"):
@@ -660,7 +704,10 @@ class PaperEngine:
                                 ttl_ms=o.ttl_ms,
                                 px=o.price,
                                 sz=o.remaining,
-                                reason=f"kill; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                                reason=(
+                                    f"kill; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                    f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                                ),
                             )
                         for o in self.sim.cancel_by_tag("ca_gate"):
                             self.order_log.add(
@@ -670,10 +717,13 @@ class PaperEngine:
                                 ttl_ms=o.ttl_ms,
                                 px=o.price,
                                 sz=o.remaining,
-                                reason=f"kill; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                                reason=(
+                                    f"kill; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                    f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                                ),
                             )
                         self.halted = True
-                        logger.error(f"Kill‑Switch({why}) fired: R_day={rday:.2f}, DD={dd:.2f} → stopping")
+                        logger.error(f"Kill-Switch({why}) fired: R_day={rday:.2f}, DD={dd:.2f} → stopping")
                         return  # 安全停止（finallyでログflush）  # 文書の“Kill到達で停止”に準拠
 
                     self.ob.update_from_event(ev)
@@ -697,7 +747,10 @@ class PaperEngine:
                                 ttl_ms=o.ttl_ms,
                                 px=o.price,
                                 sz=o.remaining,
-                                reason=f"window; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                                reason=(
+                                    f"window; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                    f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                                ),
                             )
                         for o in self.sim.cancel_by_tag("ca_gate"):
                             self.order_log.add(
@@ -707,7 +760,10 @@ class PaperEngine:
                                 ttl_ms=o.ttl_ms,
                                 px=o.price,
                                 sz=o.remaining,
-                                reason=f"window; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                                reason=(
+                                    f"window; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                    f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                                ),
                             )
                             self._heartbeat(now, "pause", reason="maintenance")
                         continue  # このboardイベントでは新規Placeを行わない
@@ -722,7 +778,10 @@ class PaperEngine:
                                 ttl_ms=o.ttl_ms,
                                 px=o.price,
                                 sz=o.remaining,
-                                reason=f"funding; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                                reason=(
+                                    f"funding; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                    f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                                ),
                             )  # 【関数】Funding窓で停止
                         for o in self.sim.cancel_by_tag("ca_gate"):
                             self.order_log.add(
@@ -732,7 +791,10 @@ class PaperEngine:
                                 ttl_ms=o.ttl_ms,
                                 px=o.price,
                                 sz=o.remaining,
-                                reason=f"funding; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                                reason=(
+                                    f"funding; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                    f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                                ),
                             )  # 【関数】Funding窓で停止
                             self._heartbeat(now, "pause", reason="funding")
                         continue  # このboardイベントでは新規Placeを行わない
@@ -746,7 +808,10 @@ class PaperEngine:
                             ttl_ms=o.ttl_ms,
                             px=o.price,
                             sz=o.remaining,
-                            reason=f"ttl; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                            reason=(
+                                f"ttl; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                            ),
                         )
 
                     # ガード（速すぎるときは新規停止＋全取消）
@@ -762,7 +827,10 @@ class PaperEngine:
                                 ttl_ms=o.ttl_ms,
                                 px=o.price,
                                 sz=o.remaining,
-                                reason=f"guard; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                                reason=(
+                                    f"guard; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                    f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                                ),
                             )
                         for o in self.sim.cancel_by_tag("ca_gate"):
                             self.order_log.add(
@@ -772,7 +840,10 @@ class PaperEngine:
                                 ttl_ms=o.ttl_ms,
                                 px=o.price,
                                 sz=o.remaining,
-                                reason=f"guard; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                                reason=(
+                                    f"guard; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                    f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                                ),
                             )
                             self._heartbeat(now, "pause", reason="midmove_guard")  # 直近イベントを要約（ミッド変化ガードで停止）
                         continue  # 新規は出さない
@@ -791,7 +862,10 @@ class PaperEngine:
                                 ttl_ms=o.ttl_ms,
                                 px=o.price,
                                 sz=o.remaining,
-                                reason=f"risk; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                                reason=(
+                                    f"risk; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                    f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                                ),
                             )  # 何を/なぜ記録したか（在庫上限）
                         for o in self.sim.cancel_by_tag("ca_gate"):
                             self.order_log.add(
@@ -801,7 +875,10 @@ class PaperEngine:
                                 ttl_ms=o.ttl_ms,
                                 px=o.price,
                                 sz=o.remaining,
-                                reason=f"risk; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                                reason=(
+                                    f"risk; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                    f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                                ),
                             )  # 何を/なぜ記録したか（在庫上限）
                         logger.warning(f"risk guard: |Q|>={eff_limit} → new orders paused")  # 画面でも分かるように一言
                         self._heartbeat(now, "pause", reason="inventory_guard")  # ハートビート：在庫上限で停止
@@ -816,80 +893,134 @@ class PaperEngine:
                     }
                     self._record_decision(now, actions, features=features)
                     for act in actions:
-                        if act.get("type") == "place":
-                            # 同タグの重複を最小抑止
-                            if self.sim.has_open_tag(act["order"].tag):
-                                continue
-                            o = act["order"]
-                            age = None  # 何をする行か：best_age_msをfeatures/decisionから拾う準備
-                            if isinstance(locals().get("features"), dict):  # 何をする行か：戦略特徴量が存在する場合
-                                age = features.get("best_age_ms")
-                            elif isinstance(locals().get("decision"), dict):  # 何をする行か：決定ペイロードに含まれる場合
-                                age = decision.get("best_age_ms")
-                            if isinstance(age, (int, float)):
-                                if self._stale_halt_ms is not None and age >= self._stale_halt_ms:
-                                    self.risk.set_market_mode("halted")  # 何をする行か：Best静止が閾値超→Haltedに切替
-                                elif self._stale_warn_ms is not None and age >= self._stale_warn_ms:
-                                    self.risk.set_market_mode("caution")  # 何をする行か：Best静止が注意閾値超→Cautionに切替
-                                else:
-                                    self.risk.set_market_mode("healthy")  # 何をする行か：静止時間が短いので通常モード
-                            else:
-                                self.risk.set_market_mode("healthy")  # 何をする行か：best_ageが無ければ通常モードに戻す
-                            if self.risk.market_mode in ("caution", "halted"):
-                                close_only_mode = True  # 何をする行か：市場モードが注意/停止ならClose-Only扱いにする
-                            eff_limit = self.effective_inventory_limit()
-                            req_qty = float(getattr(o, "size", 0.0) or 0.0)
-                            side_val = getattr(o, "side", None)
-                            reduce_only = bool(getattr(o, "reduce_only", False))
-                            allow_place = self.risk.can_place(
-                                self.Q,
-                                req_qty,
-                                side=side_val,
-                                reduce_only=reduce_only,
-                                best_age_ms=age,
-                            )  # 何をする行か：市場モードと在庫から発注可否を判定
-                            if not allow_place and self.risk.market_mode in ("caution", "halted"):
-                                logger.debug(f"skip place: market_mode={self.risk.market_mode}")  # 何をする行か：静止検知で新規停止を記録
-                                self._heartbeat(now, "pause", reason="market_mode")  # 何をする行か：ハートビートに市場停止を記録
-                                continue
-                            if eff_limit is not None:
-                                if abs(self.Q) + req_qty > eff_limit:
-                                    if reduce_only or self.would_reduce_inventory(self.Q, side_val, req_qty):
-                                        pass  # 決済方向なのでClose-Only中でも許可
+                        corr_from_action = act.get("_corr_id") if isinstance(act, dict) else None
+                        corr_token = None
+                        if corr_from_action is not None:
+                            corr_token = current_corr_ctx.set(corr_from_action)
+                        try:
+                            if act.get("type") == "place":
+                                # 同タグの重複を最小抑止
+                                if self.sim.has_open_tag(act["order"].tag):
+                                    continue
+                                o = act["order"]
+                                corr_value = (
+                                    corr_from_action
+                                    or getattr(o, "_corr_id", None)
+                                    or current_corr_ctx.get()
+                                )
+                                if corr_token is None and corr_value is not None:
+                                    corr_token = current_corr_ctx.set(corr_value)
+                                if corr_value is not None:
+                                    try:
+                                        setattr(o, "_corr_id", corr_value)
+                                    except Exception:
+                                        pass
+                                if not getattr(o, "client_order_id", None):
+                                    o.client_order_id = f"BFM-{uuid.uuid4().hex[:12]}"
+                                if corr_value:
+                                    _coid_to_corr[o.client_order_id] = corr_value
+                                    if len(_coid_to_corr) > _CORR_MAP_MAX:
+                                        _coid_to_corr.popitem(last=False)
+                                    tag_current = getattr(o, "tag", "")
+                                    tag_str = str(tag_current) if tag_current is not None else ""
+                                    if not tag_str:
+                                        tag_str = f"corr:{corr_value}"
+                                    elif f"corr:{corr_value}" not in tag_str:
+                                        tag_str = f"{tag_str}|corr:{corr_value}"
+                                    try:
+                                        o.tag = tag_str
+                                    except Exception:
+                                        pass
+                                age = None  # 何をするか：best_age_msをfeatures/decisionから拾う準備
+                                if isinstance(locals().get("features"), dict):  # 何をするか：戦略特徴量が存在する場合
+                                    age = features.get("best_age_ms")
+                                elif isinstance(locals().get("decision"), dict):  # 何をするか：決定ペイロードに含まれる場合
+                                    age = decision.get("best_age_ms")
+                                if isinstance(age, (int, float)):
+                                    if self._stale_halt_ms is not None and age >= self._stale_halt_ms:
+                                        self.risk.set_market_mode("halted")  # 何をする行か：Best静止が閾値超→Haltedに切替
+                                    elif self._stale_warn_ms is not None and age >= self._stale_warn_ms:
+                                        self.risk.set_market_mode("caution")  # 何をする行か：Best静止が注意閾値超→Cautionに切替
                                     else:
-                                        logger.debug(
-                                            f"skip place: |Q|+req={abs(self.Q) + req_qty:.6f} > eff_limit={eff_limit:.6f}"
-                                        )
+                                        self.risk.set_market_mode("healthy")  # 何をする行か：静止時間が短いので通常モード
+                                else:
+                                    self.risk.set_market_mode("healthy")  # 何をする行か：best_ageが無ければ通常モードに戻す
+                                if self.risk.market_mode in ("caution", "halted"):
+                                    close_only_mode = True  # 何をする行か：市場モードが注意/停止ならClose-Only扱いにする
+                                eff_limit = self.effective_inventory_limit()
+                                req_qty = float(getattr(o, "size", 0.0) or 0.0)
+                                side_val = getattr(o, "side", None)
+                                reduce_only = bool(getattr(o, "reduce_only", False))
+                                allow_place = self.risk.can_place(
+                                    self.Q,
+                                    req_qty,
+                                    side=side_val,
+                                    reduce_only=reduce_only,
+                                    best_age_ms=age,
+                                )  # 何をする行か：市場モードと在庫から発注可否を判定
+                                if not allow_place and self.risk.market_mode in ("caution", "halted"):
+                                    logger.debug(f"skip place: market_mode={self.risk.market_mode}")  # 何をする行か：静止検知で新規停止を記録
+                                    self._heartbeat(now, "pause", reason="market_mode")  # 何をする行か：ハートビートに市場停止を記録
+                                    continue
+                                if eff_limit is not None:
+                                    if abs(self.Q) + req_qty > eff_limit:
+                                        if reduce_only or self.would_reduce_inventory(self.Q, side_val, req_qty):
+                                            pass  # 決済方向なのでClose-Only中でも許可
+                                        else:
+                                            logger.debug(
+                                                f"skip place: |Q|+req={abs(self.Q) + req_qty:.6f} > eff_limit={eff_limit:.6f}"
+                                            )
+                                            self._heartbeat(now, "pause", reason="inventory_guard")
+                                            continue
+                                    elif close_only_mode and not (reduce_only or self.would_reduce_inventory(self.Q, side_val, req_qty)):
+                                        logger.debug("skip place: close_only_mode (inventory_guard)")
                                         self._heartbeat(now, "pause", reason="inventory_guard")
                                         continue
-                                elif close_only_mode and not (reduce_only or self.would_reduce_inventory(self.Q, side_val, req_qty)):
-                                    logger.debug("skip place: close_only_mode (inventory_guard)")
-                                    self._heartbeat(now, "pause", reason="inventory_guard")
-                                    continue
-                            self.sim.place(o, now)
-                            self.order_log.add(
-                                ts=now.isoformat(),
-                                action="place",
-                                tif=o.tif,
-                                ttl_ms=o.ttl_ms,
-                                px=o.price,
-                                sz=o.size,
-                                reason=f"{o.tag}; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
-                            )  # placeでも“注文タグ”（stall / ca_gate）を記録する
-
-                            self._heartbeat(now, "place", reason=o.tag)  # ハートビート：発注を要約
-
-                        elif act.get("type") == "cancel_tag":
-                            for o in self.sim.cancel_by_tag(act["tag"]):
+                                self.sim.place(o, now)
+                                corr_for_log = _coid_to_corr.get(
+                                    getattr(o, "client_order_id", ""),
+                                    (getattr(o, "_corr_id", None) or current_corr_ctx.get() or "-"),
+                                )
                                 self.order_log.add(
                                     ts=now.isoformat(),
-                                    action="cancel",
+                                    action="place",
                                     tif=o.tif,
                                     ttl_ms=o.ttl_ms,
                                     px=o.price,
-                                    sz=o.remaining,
-                                    reason=f"strategy; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
-                                )
+                                    sz=o.size,
+                                    reason=(
+                                        f"{o.tag}; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; corr={corr_for_log}"
+                                    ),
+                                )  # placeでも“注文タグ”（stall / ca_gate）を記録する
+
+                                self._heartbeat(now, "place", reason=o.tag)  # ハートビート：発注を要約
+
+                            elif act.get("type") == "cancel_tag":
+                                tag_val = act.get("tag")
+                                if not tag_val:
+                                    continue
+                                for o in self.sim.cancel_by_tag(tag_val):
+                                    corr_val = getattr(o, "_corr_id", None)
+                                    if corr_token is None and corr_val is not None:
+                                        corr_token = current_corr_ctx.set(corr_val)
+                                    corr_for_log = _coid_to_corr.get(
+                                        getattr(o, "client_order_id", ""),
+                                        (getattr(o, "_corr_id", None) or current_corr_ctx.get() or "-"),
+                                    )
+                                    self.order_log.add(
+                                        ts=now.isoformat(),
+                                        action="cancel",
+                                        tif=o.tif,
+                                        ttl_ms=o.ttl_ms,
+                                        px=o.price,
+                                        sz=o.remaining,
+                                        reason=(
+                                            f"strategy; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; corr={corr_for_log}"
+                                        ),
+                                    )
+                        finally:
+                            if corr_token is not None:
+                                current_corr_ctx.reset(corr_token)
 
                 elif ch.startswith("lightning_executions_"):
                     # 約定でシミュを進め、Fill明細を受け取る→PnL/ログ反映
@@ -909,7 +1040,10 @@ class PaperEngine:
                             ttl_ms=o.ttl_ms,
                             px=o.price,
                             sz=o.remaining,
-                            reason=f"ttl; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}",
+                            reason=(
+                                f"ttl; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                            ),
                         )
 
         except asyncio.CancelledError:

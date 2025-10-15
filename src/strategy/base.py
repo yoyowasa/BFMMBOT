@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import contextvars
+import uuid  # 何をするか：各子戦略の意思決定に固有の相関IDを割り当てる
 from typing import Any, Dict, Iterable, List, Sequence  # 返り値の型
 from datetime import datetime  # 戦略判断の時刻
 from src.core.orderbook import OrderBook  # ローカル板
@@ -18,6 +19,7 @@ class StrategyBase:
 
 
 current_strategy_ctx = contextvars.ContextVar("current_strategy_name", default=None)
+current_corr_ctx = contextvars.ContextVar("current_corr_id", default=None)  # 何をするか：現在の意思決定に割り当てた相関IDを共有する
 
 
 class MultiStrategy(StrategyBase):
@@ -95,11 +97,14 @@ class MultiStrategy(StrategyBase):
         child_strategy_name = (
             getattr(child, "strategy_name", None) or child_name or "unknown"
         )
+        corr_id = current_corr_ctx.get()
         for action in actions:
             if not isinstance(action, dict):
                 wrapped.append(action)
                 continue
             item = dict(action)
+            if corr_id is not None and "_corr_id" not in item:
+                item["_corr_id"] = corr_id
             if item.get("type") == "place":
                 order = self._get_order_from_action(item)
                 if order is not None:
@@ -107,6 +112,8 @@ class MultiStrategy(StrategyBase):
                         setattr(order, "_strategy", child_strategy_name)
                     except Exception:
                         pass
+                    if corr_id is not None:
+                        setattr(order, "_corr_id", corr_id)
                     order.tag = self._prefixed_tag(child_name, getattr(order, "tag", ""))
             elif item.get("type") == "cancel_tag":
                 item["tag"] = self._prefixed_tag(child_name, item.get("tag"))
@@ -119,8 +126,18 @@ class MultiStrategy(StrategyBase):
             method = getattr(child, method_name, None)
             if not callable(method):
                 continue
-            actions = method(*args, **kwargs)
-            results.extend(self._wrap_actions(child, actions))
+            child_name = getattr(child, "strategy_name", None) or getattr(child, "name", "unknown")
+            token_strategy = current_strategy_ctx.set(child_name or "unknown")
+            token_corr = current_corr_ctx.set(uuid.uuid4().hex)
+            actions = None
+            wrapped: List[Dict[str, Any]] = []
+            try:
+                actions = method(*args, **kwargs)
+                wrapped = self._wrap_actions(child, actions)
+            finally:
+                current_corr_ctx.reset(token_corr)
+                current_strategy_ctx.reset(token_strategy)
+            results.extend(wrapped)
         return results
 
     def on_start(self, *args, **kwargs):
@@ -133,12 +150,17 @@ class MultiStrategy(StrategyBase):
             if not callable(method):
                 continue
             child_name = getattr(child, "strategy_name", None) or getattr(child, "name", "unknown")
-            token = current_strategy_ctx.set(child_name or "unknown")
+            token_strategy = current_strategy_ctx.set(child_name or "unknown")
+            token_corr = current_corr_ctx.set(uuid.uuid4().hex)
+            actions = None
+            wrapped: List[Dict[str, Any]] = []
             try:
                 actions = method(*args, **kwargs)
+                wrapped = self._wrap_actions(child, actions)
             finally:
-                current_strategy_ctx.reset(token)
-            results.extend(self._wrap_actions(child, actions))
+                current_corr_ctx.reset(token_corr)
+                current_strategy_ctx.reset(token_strategy)
+            results.extend(wrapped)
         return results
 
     def on_stop(self, *args, **kwargs):
@@ -147,20 +169,20 @@ class MultiStrategy(StrategyBase):
     def evaluate(self, *args, **kwargs):
         return self._dispatch_actions("evaluate", *args, **kwargs)
 
-    def on_fill(self, ob: OrderBook, fill_event: Any):
+    def on_fill(self, ob: OrderBook, fill: Any):
         results: List[Dict[str, Any]] = []
         for child in self.children:
             handler = getattr(child, "on_fill", None)
             if not callable(handler):
                 continue
             child_name = getattr(child, "name", "")
-            tag_value = getattr(fill_event, "tag", None)
-            if isinstance(fill_event, dict):
-                tag_value = fill_event.get("tag")
+            tag_value = getattr(fill, "tag", None)
+            if isinstance(fill, dict):
+                tag_value = fill.get("tag")
             stripped_tag, matched = self._strip_child_tag(child_name, tag_value)
             if not matched and tag_value not in (None, ""):
                 continue
-            event_copy = self._clone_fill_event(fill_event)
+            event_copy = self._clone_fill_event(fill)
             self._set_tag(event_copy, stripped_tag)
             order = getattr(event_copy, "order", None)
             if isinstance(event_copy, dict):
@@ -173,3 +195,4 @@ class MultiStrategy(StrategyBase):
             actions = handler(ob, event_copy)
             results.extend(self._wrap_actions(child, actions))
         return results
+
