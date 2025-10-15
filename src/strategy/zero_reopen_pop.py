@@ -12,10 +12,11 @@ from src.core.orderbook import OrderBook  # best/中値/tick/スプレッド/健
 from src.core.orders import Order        # Limit/IOC と TTL/タグを付けて発注する型
 from src.core.utils import now_ms        # クールダウンや“直後”判定に使うミリ秒時刻
 
-from loguru import logger  # 何をするか：この戦略の意思決定ログを出すために使う
+from loguru import logger as _logger  # 何をするか：この戦略のログをloguruへ統一出力する
 import random  # 何をするか：TTLに±ゆらぎ（jitter）を与えるための乱数を使う
 from collections import deque  # 何をするか：レート制限用に“時刻のキュー”を使う
 
+logger = _logger.bind(strategy="zero_reopen_pop")  # 何をするか：戦略名タグを固定したロガーを生成
 
 @dataclass
 class ZeroReopenConfig:
