@@ -112,8 +112,8 @@ class MultiStrategy(StrategyBase):
                         setattr(order, "_strategy", child_strategy_name)
                     except Exception:
                         pass
-                        if corr_id is not None:
-                            setattr(order, "_corr_id", corr_id)
+                    if corr_id is not None:
+                        setattr(order, "_corr_id", corr_id)
                     order.tag = self._prefixed_tag(child_name, getattr(order, "tag", ""))
             elif item.get("type") == "cancel_tag":
                 item["tag"] = self._prefixed_tag(child_name, item.get("tag"))
@@ -169,20 +169,20 @@ class MultiStrategy(StrategyBase):
     def evaluate(self, *args, **kwargs):
         return self._dispatch_actions("evaluate", *args, **kwargs)
 
-    def on_fill(self, ob: OrderBook, fill_event: Any):
+    def on_fill(self, ob: OrderBook, fill: Any):
         results: List[Dict[str, Any]] = []
         for child in self.children:
             handler = getattr(child, "on_fill", None)
             if not callable(handler):
                 continue
             child_name = getattr(child, "name", "")
-            tag_value = getattr(fill_event, "tag", None)
-            if isinstance(fill_event, dict):
-                tag_value = fill_event.get("tag")
+            tag_value = getattr(fill, "tag", None)
+            if isinstance(fill, dict):
+                tag_value = fill.get("tag")
             stripped_tag, matched = self._strip_child_tag(child_name, tag_value)
             if not matched and tag_value not in (None, ""):
                 continue
-            event_copy = self._clone_fill_event(fill_event)
+            event_copy = self._clone_fill_event(fill)
             self._set_tag(event_copy, stripped_tag)
             order = getattr(event_copy, "order", None)
             if isinstance(event_copy, dict):
@@ -195,3 +195,4 @@ class MultiStrategy(StrategyBase):
             actions = handler(ob, event_copy)
             results.extend(self._wrap_actions(child, actions))
         return results
+

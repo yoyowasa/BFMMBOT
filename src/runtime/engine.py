@@ -693,7 +693,7 @@ class PaperEngine:
                     # 日次境界（JST）を跨いだら R_day/HWM をリセット
                     self._roll_daily(now)
 
-                    # Kill‑Switch 判定（trueで全キャンセル→停止）
+                    # Kill-Switch 判定（trueで全キャンセル→停止）
                     hit, why, rday, dd = self._maybe_trigger_kill()
                     if hit:
                         for o in self.sim.cancel_by_tag("stall"):
@@ -723,7 +723,7 @@ class PaperEngine:
                                 ),
                             )
                         self.halted = True
-                        logger.error(f"Kill‑Switch({why}) fired: R_day={rday:.2f}, DD={dd:.2f} → stopping")
+                        logger.error(f"Kill-Switch({why}) fired: R_day={rday:.2f}, DD={dd:.2f} → stopping")
                         return  # 安全停止（finallyでログflush）  # 文書の“Kill到達で停止”に準拠
 
                     self.ob.update_from_event(ev)
