@@ -164,8 +164,26 @@ class MultiStrategy(StrategyBase):
     def on_start(self, *args, **kwargs):
         return self._dispatch_actions("on_start", *args, **kwargs)
 
-    def on_event(self, *args, **kwargs):
-        return self._dispatch_actions("on_event", *args, **kwargs)
+    def on_event(self, state):
+        # 何をするか：全ての子戦略を順に実行し、返ってきた注文をひとつのリストに結合して返す
+        merged = []  # 何をするか：全子戦略の発注をここに集める
+        for c in self.children:  # 何をするか：子戦略を1つずつ実行
+            token_strategy = current_strategy_ctx.set(getattr(c, "strategy_name", getattr(c, "name", "unknown")))  # 何をするか：実行中の子戦略名を合図にセット
+            token_corr = current_corr_ctx.set(uuid.uuid4().hex)  # 何をするか：この子戦略の意思決定に一意の相関IDを振る
+            try:
+                out = c.on_event(state) or []  # 何をするか：子戦略の意思決定（[Order] または None）を取得
+            finally:
+                current_corr_ctx.reset(token_corr)  # 何をするか：相関IDの合図を元に戻す
+                current_strategy_ctx.reset(token_strategy)  # 何をするか：子戦略名の合図を元に戻す
+            child_name = getattr(c, "strategy_name", getattr(c, "name", "unknown"))  # 何をするか：この注文群の出所（子戦略名）
+            for o in out:
+                if not getattr(o, "_strategy", None):
+                    o._strategy = child_name  # 何をするか：注文オブジェクトに子戦略名の印（ログ用）を刻む
+                if getattr(o, "tag", None) and child_name not in str(o.tag):
+                    o.tag = f"{o.tag}|{child_name}"  # 何をするか：tag末尾に「|子戦略名」を付けて order/trade ログで見分けやすくする
+            merged.extend(out)  # 何をするか：この子からの注文を結合
+        return merged  # 何をするか：全ての子戦略の注文をまとめて返す
+
 
     def on_stop(self, *args, **kwargs):
         return self._dispatch_actions("on_stop", *args, **kwargs)
