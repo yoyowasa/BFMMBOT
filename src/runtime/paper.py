@@ -13,9 +13,9 @@ import csv  # 何をするか：orders.csv / trades.csv に追記するために
 from types import SimpleNamespace  # 何をするか：戦略 on_fill に渡す簡易オブジェクトを作る
 
 from loguru import logger  # 何をするか：run.log へ可読ログを出す
+from src.strategy.base import build_strategy_from_cfg  # 何をするか：cfg['strategies'] 配列から戦略群を構築する
 from src.core.realtime import stream_events  # 何をするか：WSイベントの同期ジェネレーター
 from src.core.orderbook import OrderBook  # 何をするか：ローカル板（best_bid/best_ask を持つ）
-from src.strategy.stall_then_strike import StallThenStrike  # 何をするか：例の戦略（必要なら増やす）
 from src.core.logs import OrderLog, TradeLog  # 何をするか：Parquet出力（orders/trades）用のヘルパ
 
 # ---- 小さなユーティリティ（live.pyに依存せず単体で動く最小セット） ----
@@ -134,13 +134,6 @@ def _round_to_tick(px: float, tick: float) -> float:
         return float(px)
     return float(round(float(px) / float(tick)) * float(tick))
 
-def _select_strategy(strategy_name: str, cfg, strategy_cfg=None):
-    """何をする関数か：live側の選択ロジックを再利用して戦略インスタンスを生成する"""
-    # 何をするか：関数内だけで使う遅延importで依存ループを避ける
-    from src.runtime.live import _select_strategy as _select_strategy_live
-    return _select_strategy_live(strategy_name, cfg, strategy_cfg=strategy_cfg)
-
-
 # ---- メイン：疑似発注ランナー ----
 
 def run_paper(
@@ -158,7 +151,16 @@ def run_paper(
 
     hb_path = Path("logs/runtime/heartbeat.ndjson")
 
-    strategy_list = strategies or [strategy_name]
+    if strategies:
+        strategy_list = list(strategies)
+    else:
+        cfg_strategies = getattr(cfg, "strategies", None)
+        if cfg_strategies is None:
+            strategy_list = [strategy_name] if strategy_name else []
+        elif isinstance(cfg_strategies, (list, tuple)):
+            strategy_list = [str(s) for s in cfg_strategies if s]
+        else:
+            strategy_list = [str(cfg_strategies)]
     primary_strategy = strategy_list[0] if strategy_list else strategy_name
     order_log = OrderLog(path=Path("logs/orders/order_log.parquet"))  # 何をするか：ordersのParquet出力先を明示
     trade_log = TradeLog(path=Path("logs/trades/trade_log.parquet"))  # 何をするか：tradesのParquet出力先を明示
@@ -168,7 +170,15 @@ def run_paper(
 
 
     ob = OrderBook()  # 何をするか：ローカル板
-    strat = _select_strategy(primary_strategy, cfg, strategy_cfg=strategy_cfg)  # 何をするか：戦略インスタンス
+    if hasattr(cfg, "model_dump"):
+        cfg_payload = cfg.model_dump()
+    elif isinstance(cfg, dict):
+        cfg_payload = dict(cfg)
+    else:
+        cfg_payload = dict(getattr(cfg, "__dict__", {}))
+    if strategy_list:
+        cfg_payload["strategies"] = strategy_list
+    strat = build_strategy_from_cfg(cfg_payload)  # 何をするか：--strategy省略時でも config[strategies] をそのまま束ねて起動する
     strategy_names = [
         getattr(child, "strategy_name", getattr(child, "name", "unknown"))
         for child in getattr(strat, "children", [])

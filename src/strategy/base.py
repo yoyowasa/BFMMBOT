@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import contextvars
 import uuid  # 何をするか：各子戦略の意思決定に固有の相関IDを割り当てる
+import importlib  # 何をするか：戦略モジュールを動的に読み込むために使う
+import inspect    # 何をするか：モジュール内から StrategyBase のサブクラスを見つけるために使う
 from typing import Any, Dict, Iterable, List, Sequence  # 返り値の型
 from datetime import datetime  # 戦略判断の時刻
 from src.core.orderbook import OrderBook  # ローカル板
@@ -184,7 +186,6 @@ class MultiStrategy(StrategyBase):
             merged.extend(out)  # 何をするか：この子からの注文を結合
         return merged  # 何をするか：全ての子戦略の注文をまとめて返す
 
-
     def on_stop(self, *args, **kwargs):
         return self._dispatch_actions("on_stop", *args, **kwargs)
 
@@ -217,4 +218,59 @@ class MultiStrategy(StrategyBase):
             actions = handler(ob, event_copy)
             results.extend(self._wrap_actions(child, actions))
         return results
+
+
+def _get_strategy_registry():
+    # 何をするか：戦略名→モジュール名の対応表（設定の strategies 配列はこのキーで指定する）
+    return {
+        "stall_then_strike": "stall_then_strike",
+        "cancel_add_gate": "cancel_add_gate",
+        "age_microprice": "age_microprice",
+        "gap_edge_refill": "gap_edge_refill",
+        "tiny_prints_filter": "tiny_prints_filter",
+        "queue_eta_gate": "queue_eta_gate",
+        "zero_reopen_pop": "zero_reopen_pop",
+    }  # 参照：7戦略の命名と配置（docsの構成と一致）。
+
+
+def _load_strategy_class(module_name: str):
+    # 何をするか：指定モジュールから StrategyBase を継承するクラスを1つ見つけて返す
+    m = importlib.import_module(f"src.strategy.{module_name}")
+    for _, obj in inspect.getmembers(m, inspect.isclass):
+        try:
+            if issubclass(obj, StrategyBase) and obj is not StrategyBase:
+                return obj
+        except Exception:
+            continue
+    raise ImportError(f"No StrategyBase subclass found in module: {module_name}")
+
+
+def build_strategy_from_cfg(cfg: dict):
+    # 何をするか：cfg['strategies'] の配列から戦略を作り、複数なら MultiStrategy に束ねて返す
+    names = list(cfg.get("strategies", []) or [])
+    if not names:
+        raise ValueError("No strategies specified in cfg['strategies']")  # 何をするか：必須チェック
+    reg = _get_strategy_registry()
+    children = []
+    for name in names:
+        module_name = reg.get(name)
+        if not module_name:
+            raise KeyError(f"Unknown strategy name: {name}")  # 何をするか：未登録名を早期に知らせる
+        cls = _load_strategy_class(module_name)  # 何をするか：モジュールから戦略クラスを取得
+        try:
+            inst = cls(cfg=cfg)  # 何をするか：設定をキーワード引数で渡して生成（一般形）
+        except TypeError:
+            try:
+                inst = cls(cfg)  # 何をするか：位置引数でcfgを受ける実装へのフォールバック
+            except TypeError:
+                inst = cls()     # 何をするか：設定不要な最小実装へのフォールバック
+        if not getattr(inst, "strategy_name", None):
+            inst.strategy_name = name  # 何をするか：ログ・タグ用に“正式名”を刻む（docsの命名に揃える）
+        children.append(inst)
+    if len(children) == 1:
+        return children[0]  # 何をするか：1本だけならそのまま返す
+    try:
+        return MultiStrategy(children=children)  # 何をするか：複数本を束ねる（キーワード引数版）
+    except TypeError:
+        return MultiStrategy(children)           # 何をするか：位置引数版の互換フォールバック
 
