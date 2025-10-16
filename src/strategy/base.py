@@ -43,25 +43,29 @@ class MultiStrategy(StrategyBase):
     @staticmethod
     def _prefixed_tag(child_name: str, tag: Any) -> str:
         base = "" if tag in (None, "") else str(tag)
-        prefix = str(child_name) if child_name else ""
-        if not prefix:
+        child = str(child_name) if child_name else ""
+        suffix = f"|{child}" if child else ""
+        if not suffix:
             return base
-        if base == prefix or base.startswith(f"{prefix}:"):
+        if not base:
+            return child
+        if base.endswith(suffix):
             return base
-        return f"{prefix}:{base}" if base else prefix
+        return f"{base}{suffix}"
 
     @staticmethod
     def _strip_child_tag(child_name: str, tag: Any) -> tuple[str, bool]:
         base = "" if tag in (None, "") else str(tag)
-        if not child_name:
+        child = str(child_name) if child_name else ""
+        if not child:
             return base, True
         if not base:
             return "", True
-        prefix = f"{child_name}:"
-        if base == child_name:
+        suffix = f"|{child}"
+        if base == child:
             return "", True
-        if base.startswith(prefix):
-            return base[len(prefix):], True
+        if base.endswith(suffix):
+            return base[: -len(suffix)], True
         return base, False
 
     @staticmethod
@@ -100,6 +104,23 @@ class MultiStrategy(StrategyBase):
         corr_id = current_corr_ctx.get()
         for action in actions:
             if not isinstance(action, dict):
+                if corr_id is not None:
+                    try:
+                        setattr(action, "_corr_id", corr_id)
+                    except Exception:
+                        pass
+                try:
+                    setattr(action, "_strategy", child_strategy_name)
+                except Exception:
+                    pass
+                if hasattr(action, "tag"):
+                    try:
+                        current_tag = getattr(action, "tag", "")
+                        prefixed = self._prefixed_tag(child_name, current_tag)
+                        if prefixed != current_tag:
+                            setattr(action, "tag", prefixed)
+                    except Exception:
+                        pass
                 wrapped.append(action)
                 continue
             item = dict(action)
@@ -162,6 +183,7 @@ class MultiStrategy(StrategyBase):
                     o.tag = f"{o.tag}|{child_name}"  # 何をするか：tag末尾に「|子戦略名」を付けて order/trade ログで見分けやすくする
             merged.extend(out)  # 何をするか：この子からの注文を結合
         return merged  # 何をするか：全ての子戦略の注文をまとめて返す
+
 
     def on_stop(self, *args, **kwargs):
         return self._dispatch_actions("on_stop", *args, **kwargs)
