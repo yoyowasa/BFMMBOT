@@ -9,6 +9,7 @@ from datetime import datetime, timezone  # 何をするか：UTCの現在時刻�
 import json  # 何をするか：心拍を ndjson(1行1JSON) で書く
 import uuid  # 何をするか：疑似の受理ID(acc)を作る
 from typing import Any, Dict, List, Optional  # 何をするか：型ヒント（辞書など）
+from collections.abc import Mapping
 import csv  # 何をするか：orders.csv / trades.csv に追記するために使う
 from types import SimpleNamespace  # 何をするか：戦略 on_fill に渡す簡易オブジェクトを作る
 
@@ -178,7 +179,18 @@ def run_paper(
         cfg_payload = dict(getattr(cfg, "__dict__", {}))
     if strategy_list:
         cfg_payload["strategies"] = strategy_list
-    strat = build_strategy_from_cfg(cfg_payload)  # 何をするか：--strategy省略時でも config[strategies] をそのまま束ねて起動する
+    effective_strategy_cfg = strategy_cfg
+    if effective_strategy_cfg is None:
+        if isinstance(cfg, Mapping):
+            effective_strategy_cfg = cfg.get("strategy_cfg")
+        else:
+            effective_strategy_cfg = getattr(cfg, "strategy_cfg", None)
+    if effective_strategy_cfg is None:
+        effective_strategy_cfg = cfg_payload.get("strategy_cfg")
+    strat = build_strategy_from_cfg(
+        cfg_payload,
+        strategy_cfg=effective_strategy_cfg,
+    )  # 何をするか：--strategy省略時でも config[strategies] をそのまま束ねて起動する
     strategy_names = [
         getattr(child, "strategy_name", getattr(child, "name", "unknown"))
         for child in getattr(strat, "children", [])

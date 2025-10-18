@@ -49,5 +49,13 @@ logging:
   heartbeat_status_sec: 5  # 何をするか：心拍（status）出力間隔
   rotate_mb: 128           # 何をするか：run.log をこのサイズ(MB)でローテーション
 
+strategy_cfg:
+  stall_then_strike:
+    size:
+      default: 0.003
+  cancel_add_gate:
+    size:
+      default: 0.007
+
 
 

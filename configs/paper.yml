@@ -18,3 +18,11 @@ guard:
 logging:
   level: DEBUG             # 【関数】詳細ログ：判断材料を多く残す
 
+strategy_cfg:
+  stall_then_strike:
+    size:
+      default: 0.003
+  cancel_add_gate:
+    size:
+      default: 0.007
+
