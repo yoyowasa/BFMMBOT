@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path  # ファイルパスを安全に扱う
-from typing import Any, Dict  # 型ヒント用
+from typing import Any, Dict, Mapping, Sequence  # 型ヒント用
 import os  # 実行ディレクトリの判定や環境変数利用
 import copy  # 辞書のディープコピーで安全に合成
 import yaml  # YAML読取（pyyaml）
@@ -138,6 +138,49 @@ def load_config(config_path: str | os.PathLike[str]) -> Config:
     override = _read_yaml(cfg_path)
     merged = deep_merge(base, override)
     return Config.model_validate(merged)
+
+
+def normalize_ttl_bands(raw_bands: Any) -> list[dict[str, Any]]:
+    """【関数】TTLバンド設定を安全なリスト(dict)へ正規化（threshold昇順に整列）"""
+    if raw_bands is None:
+        return []
+    entries: list[dict[str, Any]] = []
+    items: Sequence[Any]
+    if isinstance(raw_bands, Mapping):
+        items = list(raw_bands.values()) if not isinstance(raw_bands.get("threshold_bp"), (int, float)) else [raw_bands]
+    elif isinstance(raw_bands, Sequence) and not isinstance(raw_bands, (str, bytes, bytearray)):
+        items = list(raw_bands)
+    else:
+        return []
+    for item in items:
+        threshold = None
+        ttl = None
+        window = None
+        if isinstance(item, Mapping):
+            threshold = item.get("threshold_bp")
+            ttl = item.get("ttl_ms")
+            window = item.get("window_ms")
+        elif isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
+            if len(item) >= 2:
+                threshold, ttl = item[0], item[1]
+            if len(item) >= 3:
+                window = item[2]
+        if threshold is None or ttl is None:
+            continue
+        try:
+            threshold_val = float(threshold)
+            ttl_val = int(ttl)
+        except Exception:
+            continue
+        record: dict[str, Any] = {"threshold_bp": threshold_val, "ttl_ms": ttl_val}
+        if window is not None:
+            try:
+                record["window_ms"] = int(window)
+            except Exception:
+                pass
+        entries.append(record)
+    entries.sort(key=lambda x: x["threshold_bp"])
+    return entries
 
 
 def now_ms() -> int:

@@ -464,6 +464,11 @@ class PaperEngine:
             "ca_ratio": self.ob.ca_ratio(now, window_ms=feats_win),
             "spread_tick": self.ob.spread_ticks(),
         }
+        extra = self._consume_strategy_features()
+        if isinstance(extra, Mapping):
+            for key, value in extra.items():
+                if key not in feats:
+                    feats[key] = value
         # 結論を要約
         if not actions:
             decision = "none"
@@ -512,6 +517,14 @@ class PaperEngine:
             best_age_ms=feats["best_age_ms"],
             spread_state=("zero" if feats["spread_tick"] == 0 else "ge1"),
         )
+
+    def _consume_strategy_features(self) -> dict | None:
+        getter = getattr(self.strat, "consume_decision_features", None)
+        if callable(getter):
+            extra = getter()
+            if isinstance(extra, Mapping):
+                return dict(extra)
+        return None
 
     def _heartbeat(self, now: datetime, event: str, reason: str | None = None) -> None:
         """【関数】ハートビート：Q/A/R・日次R・各ガード/窓の状態を1行JSONで追記する"""

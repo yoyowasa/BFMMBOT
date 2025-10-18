@@ -11,7 +11,7 @@ from loguru import logger  # 何をするか：ゲート理由を戦略ログに
 from src.core.orderbook import OrderBook  # Best/Spreadを参照
 from src.core.orders import Order  # 置く指値の表現
 from src.strategy.base import StrategyBase  # 共通IF
-from src.core.utils import coerce_ms  # 追加：時間値をmsに正規化するユーティリティ
+from src.core.utils import coerce_ms, normalize_ttl_bands  # 追加：時間値をmsに正規化するユーティリティ
 
 class StallThenStrike(StrategyBase):
     """【関数】#1 静止→一撃の最小実装（文書のトリガ/撤退に準拠）"""
@@ -48,6 +48,24 @@ class StallThenStrike(StrategyBase):
                 return base_default
         return 0.01
 
+    def _resolve_ttl_bands(self, cfg) -> list[dict[str, float | int]]:
+        raw = self._value_from(self._strategy_cfg, "ttl_bands")
+        if not raw:
+            raw = self._value_from(getattr(cfg, "features", None), "stall_then_strike", "ttl_bands")
+        return normalize_ttl_bands(raw)
+
+    def _resolve_ttl_band_window_ms(self, cfg, default: int = 1000) -> int:
+        win = self._value_from(self._strategy_cfg, "ttl_band_window_ms")
+        if win is None:
+            win = self._value_from(getattr(cfg, "features", None), "stall_then_strike", "ttl_band_window_ms")
+        try:
+            win_val = int(win) if win is not None else default
+        except Exception:
+            win_val = default
+        if win_val <= 0:
+            return default
+        return win_val
+
     def evaluate(self, ob: OrderBook, now: datetime, cfg) -> List[Dict[str, Any]]:
         engine = locals().get("engine", getattr(self, "engine", None))  # 何をするか：エンジン参照（引数or属性）
         gate = engine.gate_status() if (engine and hasattr(engine, "gate_status")) else {"mode": "healthy", "reason": "na", "limits": {}, "ts_ms": None}  # 何をするか：ゲート状態を取得
@@ -62,6 +80,35 @@ class StallThenStrike(StrategyBase):
         ttl_ms = getattr(feats, "ttl_ms", 800)
         lot = self._resolve_size_default(cfg)
         tick = float(getattr(cfg, "tick_size", 1.0))
+
+        ttl_bands = self._resolve_ttl_bands(cfg)
+        ttl_window_ms = self._resolve_ttl_band_window_ms(cfg)
+        mid_change_bp = ob.mid_change_bps(ttl_window_ms)
+        selected_band = None
+        if ttl_bands:
+            abs_change = abs(mid_change_bp)
+            for band in ttl_bands:
+                threshold = band.get("threshold_bp")
+                ttl_candidate = band.get("ttl_ms")
+                if threshold is None or ttl_candidate is None:
+                    continue
+                if abs_change <= float(threshold):
+                    try:
+                        ttl_ms = int(ttl_candidate)
+                    except Exception:
+                        ttl_ms = getattr(feats, "ttl_ms", 800)
+                    else:
+                        selected_band = band
+                    break
+
+        decision_features = {
+            "stall_mid_change_bp": mid_change_bp,
+            "stall_ttl_selected_ms": ttl_ms,
+            "stall_ttl_window_ms": ttl_window_ms,
+        }
+        if selected_band is not None and selected_band.get("threshold_bp") is not None:
+            decision_features["stall_ttl_band_threshold_bp"] = selected_band["threshold_bp"]
+        self._set_decision_features(decision_features)
 
         # Bestが未確定のときは何もしない
         if ob.best_bid.price is None or ob.best_ask.price is None:
