@@ -90,3 +90,41 @@ def test_ttl_falls_back_to_default_when_bands_missing():
     decision_features = strat.consume_decision_features() or {}
     assert decision_features.get("stall_ttl_selected_ms") == 900
     assert "stall_ttl_band_threshold_bp" not in decision_features
+
+
+def test_cancel_rate_throttled_by_min_interval():
+    now = datetime.now(timezone.utc)
+    ob = OrderBook(tick_size=1.0)
+    ob.apply_board(
+        now,
+        {
+            "bids": [{"price": 100.0, "size": 0.5}],
+            "asks": [{"price": 101.0, "size": 0.5}],
+        },
+    )
+
+    cfg = _make_cfg()
+    cfg.features.stall_T_ms = 10_000
+    strategy_cfg = {"min_requote_interval_ms": 1000}
+    strat = StallThenStrike(cfg=cfg, strategy_cfg=strategy_cfg)
+
+    clock = {"ms": 1_000}
+
+    def _time_source() -> int:
+        return clock["ms"]
+
+    strat.set_time_source(_time_source)
+
+    # 最初の評価ではキャンセルが発行される
+    act1 = strat.evaluate(ob, now, cfg)
+    assert any(a.get("type") == "cancel_tag" for a in act1)
+
+    # インターバル未満の時間経過ではキャンセルが抑制される
+    clock["ms"] = 1_500
+    act2 = strat.evaluate(ob, now, cfg)
+    assert act2 == []
+
+    # インターバル経過後は再びキャンセルが発行される
+    clock["ms"] = 2_500
+    act3 = strat.evaluate(ob, now, cfg)
+    assert any(a.get("type") == "cancel_tag" for a in act3)

@@ -18,6 +18,7 @@ from src.strategy.base import build_strategy_from_cfg  # 何をするか：cfg['
 from src.core.realtime import stream_events  # 何をするか：WSイベントの同期ジェネレーター
 from src.core.orderbook import OrderBook  # 何をするか：ローカル板（best_bid/best_ask を持つ）
 from src.core.logs import OrderLog, TradeLog  # 何をするか：Parquet出力（orders/trades）用のヘルパ
+from src.core.utils import monotonic_ms
 
 # ---- 小さなユーティリティ（live.pyに依存せず単体で動く最小セット） ----
 
@@ -135,6 +136,21 @@ def _round_to_tick(px: float, tick: float) -> float:
         return float(px)
     return float(round(float(px) / float(tick)) * float(tick))
 
+
+def _attach_strategy_time_source(strategy, time_source) -> None:
+    if strategy is None:
+        return
+    setter = getattr(strategy, "set_time_source", None)
+    if callable(time_source) and callable(setter):
+        try:
+            setter(time_source)
+        except Exception:
+            pass
+    children = getattr(strategy, "children", None)
+    if children:
+        for child in children:
+            _attach_strategy_time_source(child, time_source)
+
 # ---- メイン：疑似発注ランナー ----
 
 def run_paper(
@@ -191,6 +207,7 @@ def run_paper(
         cfg_payload,
         strategy_cfg=effective_strategy_cfg,
     )  # 何をするか：--strategy省略時でも config[strategies] をそのまま束ねて起動する
+    _attach_strategy_time_source(strat, monotonic_ms)
     strategy_names = [
         getattr(child, "strategy_name", getattr(child, "name", "unknown"))
         for child in getattr(strat, "children", [])

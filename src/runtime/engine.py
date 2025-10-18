@@ -28,6 +28,7 @@ from src.strategy.base import (
     current_strategy_ctx,
 )  # 何をするか：複数戦略を束ねるラッパーと子戦略名・相関IDの合図
 from src.core.risk import RiskGate  # 何をするか：在庫ゲート（市場モードでClose-Onlyを切り替える）
+from src.core.utils import monotonic_ms
 
 _CORR_MAP_MAX = 8192  # 何をするか：client_order_id→corr_id の保持件数上限
 _coid_to_corr: OrderedDict[str, str] = OrderedDict()  # 何をするか：corr参照用のLRUマップ
@@ -154,6 +155,8 @@ class PaperEngine:
                 for name in self.strategies
             ]
             self.strat = MultiStrategy(children)
+
+        self._attach_strategy_context(self.strat)
 
 
         # ローカル板・シミュ・ログ器
@@ -353,6 +356,29 @@ class PaperEngine:
         if s in ("buy", "sell"):
             return s
         return None
+
+    def now_ms(self) -> int:
+        """【関数】戦略から利用する単調増加の現在時刻(ms)。"""
+        return monotonic_ms()
+
+    def _attach_strategy_context(self, strategy) -> None:
+        if strategy is None:
+            return
+        try:
+            setattr(strategy, "engine", self)
+        except Exception:
+            pass
+        time_source = getattr(self, "now_ms", None)
+        setter = getattr(strategy, "set_time_source", None)
+        if callable(time_source) and callable(setter):
+            try:
+                setter(time_source)
+            except Exception:
+                pass
+        children = getattr(strategy, "children", None)
+        if children:
+            for child in children:
+                self._attach_strategy_context(child)
 
     def would_reduce_inventory(self, current_inventory: float, side: str | None, request_qty: float) -> bool:
         """【関数】注文が在庫|Q|を縮める（=決済）か判定し、縮めるならTrue"""
