@@ -1,38 +1,5 @@
 # configs/paper.yml：paper環境で base.yml を安全側に“上書き”する設定
 env: paper                 # 【関数】paperモード指定：実行環境をpaperと明示
-strategies:
-  - stall_then_strike     # 何をするか：STS を起動
-  - cancel_add_gate       # 何をするか：CAG を起動
-strategies_params:
-  stall_then_strike:                      # 何をするか：STSの設定一式
-    ttl_ms_default: 900                   # 何をするか：基本のTTL（約定待ち）
-    ttl_ms_overrides:                     # 何をするか：価格帯でTTLを切り替える
-      - price_band_jpy: [16360000, 16370000]   # 16.36M帯（負けが目立つ帯）
-        ttl_ms: 1500                           # 何をするか：浅刺さり回避のため長めに待つ
-      - price_band_jpy: [16370000, 16380000]   # 16.37M帯（巻き返しが効いた帯）
-        ttl_ms: 900                            # 何をするか：現状維持（回転を殺さない）
-    size_base_btc: 0.005                  # 何をするか：通常ロット
-    size_when_soft_long_btc: 0.0025       # 何をするか：ロング在庫が膨らんだらBUYロットを半減
-    inventory_soft_btc: 0.03              # 何をするか：soft閾値（超えたらサイズ/TTLを守り方向に）
-    inventory_hard_btc: 0.05              # 何をするか：hard閾値（超えたら新規は在庫解消方向のみ）
-    spread_multiplier_overrides:          # 何をするか：置き位置を帯域で安全側へ寄せる
-      - price_band_jpy: [16360000, 16370000]
-        spread_mult: 1.5
-    buy_momentum_gate_bps: 0.2            # 何をするか：直近上昇(+0.2bp超)中はBUY新規を止める
-    min_requote_interval_ms: 300          # 何をするか：貼替え間隔の下限（無駄なcancel連打を抑制）
-
-  cancel_add_gate:                         # 何をするか：CAGの設定一式
-    ttl_ms_default: 900                    # 何をするか：基本のTTL
-    ttl_ms_overrides:
-      - price_band_jpy: [16340000, 16350000]   # 22:03–22:07 × 16.34–16.35M が地雷
-        time_window_hhmm: ["22:03", "22:07"]   # 何をするか：この時間窓の間だけ
-        ttl_ms: 1500                            # 何をするか：判定を遅らせて浅い刺さりを回避
-    block_buy_when_long:                   # 何をするか：ロング寄り＆上昇モメンタムのときBUYを抑制
-      inv_gt_btc: 0.02
-      momentum_bps_gt: 0.2
-    cancel_gate:
-      queue_eta_s: 1.2                     # 何をするか：板の滞留推定(ETA)が長いなら即キャンセル
-    size_base_btc: 0.006                   # 何をするか：CAGはSTSより一段大きめの基本ロット
 risk:
   max_inventory: 0.05      # 【関数】在庫上限の縮小：練習なので最大在庫を小さく
 guard:
@@ -50,11 +17,4 @@ guard:
     max_order_rate_per_sec: 2     # 何をするか：新規の上限レート（1秒あたりの件数）
 logging:
   level: DEBUG             # 【関数】詳細ログ：判断材料を多く残す
-monitoring:
-  inventory_thresholds_btc:               # 何をするか：在庫量の3段階ガード
-    soft: 0.03
-    hard: 0.05
-    panic: 0.10
-  panic_actions:                          # 何をするか：panic越え時の自動挙動（例：新規停止・解消寄せ）
-    ttl_scale: 1.2
-    size_scale: 0.0
+

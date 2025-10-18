@@ -2,39 +2,6 @@
 env: live                  # 何をするか：liveモード指定
 product_code: FX_BTC_JPY   # 何をするか：取引銘柄を指定（WS購読とRESTの対象）
 tick_size: 1               # 何をするか：価格の最小刻み（JPYは1円）
-strategies:
-  - stall_then_strike
-  - cancel_add_gate
-strategies_params:
-  stall_then_strike:
-    ttl_ms_default: 900
-    ttl_ms_overrides:
-      - price_band_jpy: [16360000, 16370000]
-        ttl_ms: 1500
-      - price_band_jpy: [16370000, 16380000]
-        ttl_ms: 900
-    size_base_btc: 0.005
-    size_when_soft_long_btc: 0.0025
-    inventory_soft_btc: 0.03
-    inventory_hard_btc: 0.05
-    spread_multiplier_overrides:
-      - price_band_jpy: [16360000, 16370000]
-        spread_mult: 1.5
-    buy_momentum_gate_bps: 0.2
-    min_requote_interval_ms: 300
-
-  cancel_add_gate:
-    ttl_ms_default: 900
-    ttl_ms_overrides:
-      - price_band_jpy: [16340000, 16350000]
-        time_window_hhmm: ["22:03", "22:07"]
-        ttl_ms: 1500
-    block_buy_when_long:
-      inv_gt_btc: 0.02
-      momentum_bps_gt: 0.2
-    cancel_gate:
-      queue_eta_s: 1.2
-    size_base_btc: 0.006
 
 # 運転時間制御
 canary_minutes: 60         # 何をするか：liveを最大60分だけ運転し、超えたら全取消→停止（カナリア）
@@ -82,13 +49,5 @@ logging:
   heartbeat_status_sec: 5  # 何をするか：心拍（status）出力間隔
   rotate_mb: 128           # 何をするか：run.log をこのサイズ(MB)でローテーション
 
-monitoring:
-  inventory_thresholds_btc:
-    soft: 0.03
-    hard: 0.05
-    panic: 0.10
-  panic_actions:
-    ttl_scale: 1.2
-    size_scale: 0.0
 
 

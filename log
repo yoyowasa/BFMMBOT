@@ -143,3 +143,12 @@ git --no-pager log -1 --oneline origin/main
 
 cd "E:\BF-MMBOT"
 poetry shell
+
+
+git add -A         
+
+# コミット
+git commit -m "chore: bulk update after lint & format"
+
+# プッシュ
+git push
