@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -90,6 +90,7 @@ def test_ttl_falls_back_to_default_when_bands_missing():
     decision_features = strat.consume_decision_features() or {}
     assert decision_features.get("stall_ttl_selected_ms") == 900
     assert "stall_ttl_band_threshold_bp" not in decision_features
+    assert decision_features.get("stall_buy_filter_suppressed") is False
 
 
 def test_cancel_rate_throttled_by_min_interval():
@@ -128,3 +129,86 @@ def test_cancel_rate_throttled_by_min_interval():
     clock["ms"] = 2_500
     act3 = strat.evaluate(ob, now, cfg)
     assert any(a.get("type") == "cancel_tag" for a in act3)
+
+
+def test_buy_momentum_filter_skips_buy_and_keeps_sell():
+    now = datetime.now(timezone.utc)
+    ob = OrderBook(tick_size=1.0)
+    earlier = now - timedelta(milliseconds=800)
+    ob.apply_board(
+        earlier,
+        {
+            "bids": [{"price": 100.0, "size": 0.5}],
+            "asks": [{"price": 101.0, "size": 0.5}],
+        },
+    )
+    ob.apply_board(
+        now,
+        {
+            "bids": [{"price": 110.0, "size": 0.5}],
+            "asks": [{"price": 111.0, "size": 0.5}],
+        },
+    )
+
+    cfg = _make_cfg()
+    strategy_cfg = {
+        "stall_then_strike": {
+            "buy_momentum_filter": {
+                "window_ms": 1000,
+                "threshold_bps": 50.0,
+                "mode": "sell_only",
+            }
+        }
+    }
+    strat = StallThenStrike(cfg=cfg, strategy_cfg=strategy_cfg)
+
+    actions = strat.evaluate(ob, now, cfg)
+    assert actions, "expected actions when trigger conditions met"
+    assert actions[0].get("type") == "cancel_tag"
+    places = [a for a in actions if a.get("type") == "place"]
+    assert len(places) == 1
+    sell_order = places[0]["order"]
+    assert sell_order.side == "sell"
+
+    decision_features = strat.consume_decision_features() or {}
+    assert decision_features.get("stall_buy_filter_suppressed") is True
+    assert decision_features.get("stall_buy_filter_mode") == "sell_only"
+
+
+def test_buy_momentum_filter_halts_both_sides():
+    now = datetime.now(timezone.utc)
+    ob = OrderBook(tick_size=1.0)
+    earlier = now - timedelta(milliseconds=800)
+    ob.apply_board(
+        earlier,
+        {
+            "bids": [{"price": 100.0, "size": 0.5}],
+            "asks": [{"price": 101.0, "size": 0.5}],
+        },
+    )
+    ob.apply_board(
+        now,
+        {
+            "bids": [{"price": 110.0, "size": 0.5}],
+            "asks": [{"price": 111.0, "size": 0.5}],
+        },
+    )
+
+    cfg = _make_cfg()
+    strategy_cfg = {
+        "stall_then_strike": {
+            "buy_momentum_filter": {
+                "window_ms": 1000,
+                "threshold_bps": 50.0,
+                "mode": "halt_both",
+            }
+        }
+    }
+    strat = StallThenStrike(cfg=cfg, strategy_cfg=strategy_cfg)
+
+    actions = strat.evaluate(ob, now, cfg)
+    assert actions == [{"type": "cancel_tag", "tag": "stall"}]
+
+    decision_features = strat.consume_decision_features() or {}
+    assert decision_features.get("stall_buy_filter_suppressed") is True
+    assert decision_features.get("stall_buy_filter_mode") == "halt_both"

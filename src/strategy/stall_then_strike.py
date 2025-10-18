@@ -13,6 +13,7 @@ from src.core.orders import Order  # 置く指値の表現
 from src.strategy.base import StrategyBase  # 共通IF
 from src.core.utils import coerce_ms, normalize_ttl_bands  # 追加：時間値をmsに正規化するユーティリティ
 
+
 class StallThenStrike(StrategyBase):
     """【関数】#1 静止→一撃の最小実装（文書のトリガ/撤退に準拠）"""
     name: str = "stall_then_strike"
@@ -87,6 +88,51 @@ class StallThenStrike(StrategyBase):
             return None
         return value
 
+    def _resolve_buy_momentum_filter(self) -> dict[str, float | int | str] | None:
+        node = self._value_from(self._strategy_cfg, "stall_then_strike", "buy_momentum_filter")
+        if node is None:
+            node = self._value_from(self._strategy_cfg, "buy_momentum_filter")
+        if node is None:
+            return None
+        raw: dict[str, float | int | str] = {}
+        if isinstance(node, Mapping):
+            raw = dict(node)
+        else:
+            for key in ("window_ms", "threshold_bps", "mode", "behavior", "skip_mode"):
+                if hasattr(node, key):
+                    raw[key] = getattr(node, key)
+        if not raw:
+            return None
+        window_ms = raw.get("window_ms")
+        threshold = raw.get("threshold_bps")
+        mode = (
+            raw.get("mode")
+            or raw.get("behavior")
+            or raw.get("skip_mode")
+            or raw.get("on_trigger")
+            or raw.get("when_triggered")
+        )
+        result: dict[str, float | int | str] = {}
+        try:
+            if window_ms is not None:
+                win_val = int(window_ms)
+                if win_val > 0:
+                    result["window_ms"] = win_val
+        except Exception:
+            pass
+        try:
+            if threshold is not None:
+                result["threshold_bps"] = float(threshold)
+        except Exception:
+            pass
+        if isinstance(mode, str):
+            mode_val = mode.strip().lower()
+            if mode_val in {"sell_only", "halt_both", "both"}:
+                if mode_val == "both":
+                    mode_val = "halt_both"
+                result["mode"] = mode_val
+        return result or None
+
     def _current_time_ms(self, now: datetime) -> int | None:
         if callable(self._time_source):
             try:
@@ -153,6 +199,17 @@ class StallThenStrike(StrategyBase):
                         selected_band = band
                     break
 
+        buy_filter_cfg = self._resolve_buy_momentum_filter() or {}
+        buy_filter_window = buy_filter_cfg.get("window_ms")
+        buy_filter_threshold = buy_filter_cfg.get("threshold_bps")
+        buy_filter_mode = buy_filter_cfg.get("mode") or "sell_only"
+        buy_filter_mid_change = None
+        if buy_filter_window is not None:
+            try:
+                buy_filter_mid_change = ob.mid_change_bps(int(buy_filter_window))
+            except Exception:
+                buy_filter_mid_change = None
+
         decision_features = {
             "stall_mid_change_bp": mid_change_bp,
             "stall_ttl_selected_ms": ttl_ms,
@@ -160,10 +217,19 @@ class StallThenStrike(StrategyBase):
         }
         if selected_band is not None and selected_band.get("threshold_bp") is not None:
             decision_features["stall_ttl_band_threshold_bp"] = selected_band["threshold_bp"]
-        self._set_decision_features(decision_features)
+        if buy_filter_window is not None:
+            decision_features["stall_buy_filter_window_ms"] = buy_filter_window
+        if buy_filter_threshold is not None:
+            decision_features["stall_buy_filter_threshold_bp"] = buy_filter_threshold
+        if buy_filter_mid_change is not None:
+            decision_features["stall_buy_filter_mid_change_bp"] = buy_filter_mid_change
+        if buy_filter_cfg:
+            decision_features["stall_buy_filter_mode"] = buy_filter_mode
+        decision_features["stall_buy_filter_suppressed"] = False
 
         # Bestが未確定のときは何もしない
         if ob.best_bid.price is None or ob.best_ask.price is None:
+            self._set_decision_features(decision_features)
             return []
 
         # 現在の指標を取得（BestAge/Spread）:contentReference[oaicite:6]{index=6}
@@ -174,9 +240,56 @@ class StallThenStrike(StrategyBase):
         # トリガ成立：ミッド±1tick に最小ロット両面
         if age_ms is not None and age_ms >= stall_T and sp_tick >= min_sp:
             mid = (ob.best_bid.price + ob.best_ask.price) / 2.0
+            buy_suppressed = False
+            if buy_filter_cfg and buy_filter_threshold is not None and buy_filter_mid_change is not None:
+                try:
+                    buy_suppressed = float(buy_filter_mid_change) >= float(buy_filter_threshold)
+                except Exception:
+                    buy_suppressed = False
+            decision_features["stall_buy_filter_suppressed"] = bool(buy_suppressed)
+            self._set_decision_features(decision_features)
+            if buy_suppressed:
+                actions: List[Dict[str, Any]] = [
+                    {"type": "cancel_tag", "tag": "stall"},
+                ]
+                if buy_filter_mode != "halt_both":
+                    actions.append(
+                        {
+                            "type": "place",
+                            "order": Order(
+                                side="sell",
+                                price=mid + 1 * tick,
+                                size=lot,
+                                tif="GTC",
+                                ttl_ms=ttl_ms,
+                                tag="stall",
+                            ),
+                        }
+                    )
+                return actions
             return [
-                {"type": "place", "order": Order(side="buy",  price=mid - 1 * tick, size=lot, tif="GTC", ttl_ms=ttl_ms, tag="stall")},
-                {"type": "place", "order": Order(side="sell", price=mid + 1 * tick, size=lot, tif="GTC", ttl_ms=ttl_ms, tag="stall")},
+                {
+                    "type": "place",
+                    "order": Order(
+                        side="buy",
+                        price=mid - 1 * tick,
+                        size=lot,
+                        tif="GTC",
+                        ttl_ms=ttl_ms,
+                        tag="stall",
+                    ),
+                },
+                {
+                    "type": "place",
+                    "order": Order(
+                        side="sell",
+                        price=mid + 1 * tick,
+                        size=lot,
+                        tif="GTC",
+                        ttl_ms=ttl_ms,
+                        tag="stall",
+                    ),
+                },
             ]
         # 条件外：この戦略タグの注文は撤退
         min_requote_interval_ms = self._resolve_min_requote_interval_ms()
@@ -187,7 +300,9 @@ class StallThenStrike(StrategyBase):
                 and self._last_cancel_ts_ms is not None
                 and (current_ts_ms - self._last_cancel_ts_ms) < min_requote_interval_ms
             ):
+                self._set_decision_features(decision_features)
                 return []
             if current_ts_ms is not None:
                 self._last_cancel_ts_ms = current_ts_ms
+        self._set_decision_features(decision_features)
         return [{"type": "cancel_tag", "tag": "stall"}]
