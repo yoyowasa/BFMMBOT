@@ -2,9 +2,9 @@
 # 役割：#1 静止→一撃（BestがTms静止 & Spread>=Sの直後にミッド±1tickへ最小ロット両面、条件外は即撤退）
 from __future__ import annotations
 
-from typing import List, Dict, Any  # 返り値の型
+from typing import List, Dict, Any, Callable  # 返り値の型
 from collections.abc import Mapping
-from datetime import datetime  # 戦略判断時刻
+from datetime import datetime, timezone  # 戦略判断時刻
 
 from loguru import logger  # 何をするか：ゲート理由を戦略ログに1行で出す
 
@@ -20,6 +20,9 @@ class StallThenStrike(StrategyBase):
     def __init__(self, cfg=None, *, strategy_cfg=None):
         self.cfg = cfg
         self._strategy_cfg = strategy_cfg
+        self._last_cancel_ts_ms: int | None = None
+        self.engine = None
+        self._time_source: Callable[[], int] | None = None
 
     @staticmethod
     def _value_from(node, *keys):
@@ -65,6 +68,55 @@ class StallThenStrike(StrategyBase):
         if win_val <= 0:
             return default
         return win_val
+
+    def set_time_source(self, time_source: Callable[[], int] | None) -> None:
+        if callable(time_source):
+            self._time_source = time_source
+        else:
+            self._time_source = None
+
+    def _resolve_min_requote_interval_ms(self) -> int | None:
+        raw = self._value_from(self._strategy_cfg, "min_requote_interval_ms")
+        if raw is None:
+            return None
+        try:
+            value = int(raw)
+        except Exception:
+            return None
+        if value <= 0:
+            return None
+        return value
+
+    def _current_time_ms(self, now: datetime) -> int | None:
+        if callable(self._time_source):
+            try:
+                ts = int(self._time_source())
+            except Exception:
+                ts = None
+            else:
+                if ts >= 0:
+                    return ts
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            for attr in ("now_ms", "monotonic_ms"):
+                candidate = getattr(engine, attr, None)
+                if callable(candidate):
+                    try:
+                        ts = int(candidate())
+                    except Exception:
+                        continue
+                    if ts >= 0:
+                        return ts
+        if isinstance(now, datetime):
+            try:
+                if now.tzinfo is None:
+                    epoch = now.replace(tzinfo=timezone.utc)
+                else:
+                    epoch = now.astimezone(timezone.utc)
+                return int(epoch.timestamp() * 1000)
+            except Exception:
+                return None
+        return None
 
     def evaluate(self, ob: OrderBook, now: datetime, cfg) -> List[Dict[str, Any]]:
         engine = locals().get("engine", getattr(self, "engine", None))  # 何をするか：エンジン参照（引数or属性）
@@ -127,4 +179,15 @@ class StallThenStrike(StrategyBase):
                 {"type": "place", "order": Order(side="sell", price=mid + 1 * tick, size=lot, tif="GTC", ttl_ms=ttl_ms, tag="stall")},
             ]
         # 条件外：この戦略タグの注文は撤退
+        min_requote_interval_ms = self._resolve_min_requote_interval_ms()
+        if min_requote_interval_ms is not None:
+            current_ts_ms = self._current_time_ms(now)
+            if (
+                current_ts_ms is not None
+                and self._last_cancel_ts_ms is not None
+                and (current_ts_ms - self._last_cancel_ts_ms) < min_requote_interval_ms
+            ):
+                return []
+            if current_ts_ms is not None:
+                self._last_cancel_ts_ms = current_ts_ms
         return [{"type": "cancel_tag", "tag": "stall"}]
