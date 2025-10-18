@@ -16,7 +16,11 @@ from loguru import logger as _logger  # 何をするか：この戦略のログ�
 import random  # 何をするか：TTLに±ゆらぎ（jitter）を与えるための乱数を使う
 from collections import deque  # 何をするか：レート制限用に“時刻のキュー”を使う
 
-logger = _logger.bind(strategy="zero_reopen_pop")  # 何をするか：戦略名タグを固定したロガーを生成
+try:
+    _bound_logger = _logger.bind(strategy="zero_reopen_pop")
+except Exception:
+    _bound_logger = None
+logger = _bound_logger or _logger  # 何をするか：戦略名タグを固定したロガー（bind失敗時は素のロガーを利用）
 
 @dataclass
 class ZeroReopenConfig:
