@@ -49,6 +49,7 @@ class OrderBook:
         self._last_best_ask_px = None  # Best Askの直近価格（Ageリセット判定用）
         self._last_best_update_mono = time.monotonic()  # Age起点（単調時計）
         self._best_age_ms = 0.0  # Bestの滞留時間（ms）— 外部へ提供する指標
+        self._mid_history: Deque[Tuple[float, float]] = deque()  # ミッド価格履歴（timestamp, mid）
 
     # ── 【関数】イベント受信→適用（boardチャンネルのみ拾う）
     def update_from_event(self, ev: Dict[str, Any]) -> None:
@@ -76,6 +77,29 @@ class OrderBook:
         self._best_age_ms = (current_mono - self._last_best_update_mono) * 1000.0  # 単調時計差分から最新の滞留時間(ms)を算出
         self._last_best_bid_px = bid_px  # 次回比較に向けてBest Bid価格を保存
         self._last_best_ask_px = ask_px  # 次回比較に向けてBest Ask価格を保存
+        if bid_px is not None and ask_px is not None:
+            mid = (bid_px + ask_px) / 2.0
+            self._mid_history.append((now.timestamp(), mid))
+
+    def mid_change_bps(self, window_ms: int) -> float:
+        """【関数】ミッド価格の変化率（bps）を直近window_msから算出"""
+        if window_ms is None or window_ms <= 0:
+            return 0.0
+        if not self._mid_history:
+            return 0.0
+        now_ts, current_mid = self._mid_history[-1]
+        cutoff = now_ts - (window_ms / 1000.0)
+        # 古い履歴を整理（window外の完全に古いものは破棄）
+        while len(self._mid_history) > 1 and self._mid_history[1][0] <= cutoff:
+            self._mid_history.popleft()
+        if len(self._mid_history) > 1 and self._mid_history[0][0] < cutoff:
+            self._mid_history.popleft()
+        base_ts, base_mid = self._mid_history[0]
+        if base_ts < cutoff and len(self._mid_history) == 1:
+            return 0.0
+        if base_mid is None or base_mid == 0:
+            return 0.0
+        return ((current_mid - base_mid) / base_mid) * 10_000.0
 
     # ── 側ごとの差分適用（Best層のC/Aイベントもここで採集）
     def _apply_side(self, side: str, now: datetime, levels: Iterable[Dict[str, Any]]) -> None:

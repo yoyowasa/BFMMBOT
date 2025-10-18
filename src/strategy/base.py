@@ -20,6 +20,22 @@ class StrategyBase:
         """【関数】戦略評価：必要なときだけ [{'type':'place'|'cancel_tag', ...}] を返す"""
         return []
 
+    def _set_decision_features(self, features: Mapping[str, Any] | None) -> None:
+        if features is None:
+            self._decision_features = None
+            return
+        if isinstance(features, Mapping):
+            self._decision_features = dict(features)
+        else:
+            self._decision_features = None
+
+    def consume_decision_features(self) -> Dict[str, Any] | None:
+        payload = getattr(self, "_decision_features", None)
+        self._decision_features = None
+        if isinstance(payload, Mapping):
+            return dict(payload)
+        return None
+
 
 current_strategy_ctx = contextvars.ContextVar("current_strategy_name", default=None)
 current_corr_ctx = contextvars.ContextVar("current_corr_id", default=None)  # 何をするか：現在の意思決定に割り当てた相関IDを共有する
@@ -163,6 +179,19 @@ class MultiStrategy(StrategyBase):
                 current_strategy_ctx.reset(token_strategy)
             results.extend(wrapped)
         return results
+
+    def consume_decision_features(self) -> Dict[str, Any] | None:
+        merged: Dict[str, Any] = {}
+        for child in self.children:
+            getter = getattr(child, "consume_decision_features", None)
+            child_feats = getter() if callable(getter) else None
+            if not isinstance(child_feats, Mapping):
+                continue
+            for key, value in child_feats.items():
+                if key in merged:
+                    continue
+                merged[key] = value
+        return merged or None
 
     def on_start(self, *args, **kwargs):
         return self._dispatch_actions("on_start", *args, **kwargs)
