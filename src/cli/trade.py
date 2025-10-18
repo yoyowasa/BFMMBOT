@@ -139,6 +139,7 @@ def main() -> None:
 
     # NOTE: マルチ戦略対応を見据えてリストは保持しつつ、現状の呼び出しは先頭のみ使用する
     selected_strategy = strategy_names[0]
+    normalized_strategies = tuple(strategy_names)  # 何をするか：後段に渡す戦略リストを確定（タプルで不変化）
 
     sink_ids = _setup_text_logs(cfg, selected_strategy)
     try:

@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import os  # 何をするか：APIキー/シークレットを環境変数から読む
 from typing import Any, Sequence  # 何をするか：cfg の型ヒント用
-from collections.abc import Mapping  # 何をするか：戦略別設定を判定する
 from loguru import logger  # 何をするか：進行ログを出す
+from src.strategy.base import build_strategy_from_cfg  # 何をするか：cfg['strategies'] 配列から戦略群を構築する
 import json  # 何をするか：heartbeatをndjsonで書くためにJSONへ直す
 from zoneinfo import ZoneInfo  # 何をするか：JST（Asia/Tokyo）へのタイムゾーン変換に使う
 
@@ -32,19 +32,11 @@ from collections import deque  # 何をするか：ミッド変化ガード用�
 from src.core.orderbook import OrderBook  # 何をするか：ローカル板（戦略の入力）
 from src.core.orders import Order  # 何をするか：戦略が返す注文モデル（tif/ttl_ms/price/size/tag）
 from src.core.realtime import stream_events  # 何をするか：WSのboard/executionsストリーム
-from src.strategy import build_strategy  # 何をするか：戦略インスタンスを中央ファクトリから取得する
 from src.strategy.base import MultiStrategy  # 何をするか：複数戦略をまとめるラッパー
 from src.core.logs import OrderLog, TradeLog  # 何をするか：orders/trades を Parquet＋NDJSON に記録する
 from src.core.analytics import DecisionLog  # 何をするか：戦略の意思決定ログ（Parquet＋NDJSONミラー）を扱う
 
 from src.core.exchange import BitflyerExchange, ExchangeError, ServerError, NetworkError, AuthError  # 何をするか：認証/権限エラー(AuthError)を検知して安全停止する
-
-
-def _select_strategy(name: str, cfg, strategy_cfg=None):
-    """何をするか：戦略名から実体を生成（中央ファクトリへ委譲）"""
-    return build_strategy(name, cfg, strategy_cfg=strategy_cfg)
-
-
 def _normalize_strategy_names(
     primary: str,
     strategies: Sequence[str] | str | None,
@@ -57,12 +49,6 @@ def _normalize_strategy_names(
     else:
         names = list(strategies)
     return names or [primary]
-
-
-def _strategy_cfg_for(strategy_cfg, name: str):
-    if isinstance(strategy_cfg, Mapping):
-        return strategy_cfg.get(name)
-    return strategy_cfg
 
 
 def _now_utc() -> datetime:
@@ -611,19 +597,15 @@ def run_live(
             signal.signal(signal.SIGTERM, _on_signal)  # 何をするか：SIGTERM（停止要求）で停止
 
             ob = OrderBook()  # 何をするか：ローカル板（戦略の入力）を用意
-            if len(strategy_list) == 1:
-                strat = _select_strategy(
-                    strategy_list[0],
-                    cfg,
-                    strategy_cfg=_strategy_cfg_for(strategy_cfg, strategy_list[0]),
-                )
+            if hasattr(cfg, "model_dump"):
+                cfg_payload = cfg.model_dump()
+            elif isinstance(cfg, dict):
+                cfg_payload = dict(cfg)
             else:
-                strat = MultiStrategy(
-                    [
-                        _select_strategy(name, cfg, strategy_cfg=_strategy_cfg_for(strategy_cfg, name))
-                        for name in strategy_list
-                    ]
-                )
+                cfg_payload = dict(getattr(cfg, "__dict__", {}))
+            if strategy_list:
+                cfg_payload["strategies"] = list(strategy_list)
+            strat = build_strategy_from_cfg(cfg_payload)  # 何をするか：本番起動でも複数戦略を1プロセスで束ねて回す
             summary_name = strat.name
 
             strategy_names = [
