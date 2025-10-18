@@ -83,6 +83,7 @@ class Config(BaseModel):
     mode_switch: ModeSwitchCfg | None = None
     latency: LatencyCfg | None = None
     features: FeaturesCfg | None = None
+    strategy_cfg: dict[str, Any] | None = None
     strategies: list[str] | None = None
     logging: LoggingCfg | None = None
     # backtest専用

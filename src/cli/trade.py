@@ -109,7 +109,7 @@ def main() -> None:
     load_dotenv(find_dotenv())  # 何をするか：プロジェクト直下の .env を読み込んでから run_live を呼ぶ
     args = _parse_args()
     cfg = load_config(args.config)
-    strategy_cfg = None
+    strategy_cfg = _cfg_get(cfg, "strategy_cfg", None)
 
     raw_cli = getattr(args, "strategy", None)
     if raw_cli:

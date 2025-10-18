@@ -7,6 +7,7 @@ import contextvars
 import uuid  # 何をするか：各子戦略の意思決定に固有の相関IDを割り当てる
 import importlib  # 何をするか：戦略モジュールを動的に読み込むために使う
 import inspect    # 何をするか：モジュール内から StrategyBase のサブクラスを見つけるために使う
+from collections.abc import Mapping
 from typing import Any, Dict, Iterable, List, Sequence  # 返り値の型
 from datetime import datetime  # 戦略判断の時刻
 from src.core.orderbook import OrderBook  # ローカル板
@@ -245,7 +246,7 @@ def _load_strategy_class(module_name: str):
     raise ImportError(f"No StrategyBase subclass found in module: {module_name}")
 
 
-def build_strategy_from_cfg(cfg: dict):
+def build_strategy_from_cfg(cfg: dict, *, strategy_cfg: Any = None):
     # 何をするか：cfg['strategies'] の配列から戦略を作り、複数なら MultiStrategy に束ねて返す
     names = list(cfg.get("strategies", []) or [])
     if not names:
@@ -257,13 +258,30 @@ def build_strategy_from_cfg(cfg: dict):
         if not module_name:
             raise KeyError(f"Unknown strategy name: {name}")  # 何をするか：未登録名を早期に知らせる
         cls = _load_strategy_class(module_name)  # 何をするか：モジュールから戦略クラスを取得
-        try:
-            inst = cls(cfg=cfg)  # 何をするか：設定をキーワード引数で渡して生成（一般形）
-        except TypeError:
+        override = strategy_cfg
+        if isinstance(strategy_cfg, Mapping):
+            override = strategy_cfg.get(name)
+        inst = None
+        candidates = []
+        if override is not None:
+            candidates.extend([
+                ((), {"cfg": cfg, "strategy_cfg": override}),
+                ((), {"strategy_cfg": override}),
+                ((override,), {}),
+            ])
+        candidates.extend([
+            ((cfg,), {}),
+            ((), {"cfg": cfg}),
+            ((), {}),
+        ])
+        for args, kwargs in candidates:
             try:
-                inst = cls(cfg)  # 何をするか：位置引数でcfgを受ける実装へのフォールバック
+                inst = cls(*args, **kwargs)
+                break
             except TypeError:
-                inst = cls()     # 何をするか：設定不要な最小実装へのフォールバック
+                continue
+        if inst is None:
+            raise TypeError(f"failed to construct strategy '{name}' from cfg")
         if not getattr(inst, "strategy_name", None):
             inst.strategy_name = name  # 何をするか：ログ・タグ用に“正式名”を刻む（docsの命名に揃える）
         children.append(inst)

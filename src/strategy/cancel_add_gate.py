@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import List, Dict, Any  # 戻り値の型
+from collections.abc import Mapping
 from datetime import datetime  # 戦略判断のタイムスタンプ
 
 from src.core.orderbook import OrderBook  # C/A 比・MP・Best/Spreadを参照
@@ -17,6 +18,37 @@ class CancelAddGate(StrategyBase):
     """
     name: str = "cancel_add_gate"
 
+    def __init__(self, cfg=None, *, strategy_cfg=None):
+        self.cfg = cfg
+        self._strategy_cfg = strategy_cfg
+
+    @staticmethod
+    def _value_from(node, *keys):
+        current = node
+        for key in keys:
+            if current is None:
+                return None
+            if isinstance(current, Mapping):
+                current = current.get(key)
+            else:
+                current = getattr(current, key, None)
+        return current
+
+    def _resolve_size_default(self, cfg) -> float:
+        override_default = self._value_from(self._strategy_cfg, "size", "default")
+        if override_default is not None:
+            try:
+                return float(override_default)
+            except (TypeError, ValueError):
+                return override_default
+        base_default = self._value_from(cfg, "size", "default")
+        if base_default is not None:
+            try:
+                return float(base_default)
+            except (TypeError, ValueError):
+                return base_default
+        return 0.01
+
     def evaluate(self, ob: OrderBook, now: datetime, cfg) -> List[Dict[str, Any]]:
         # 設定（無ければ文書の最小値にフォールバック）
         feats = getattr(cfg, "features", None)
@@ -24,7 +56,7 @@ class CancelAddGate(StrategyBase):
         theta = getattr(feats, "ca_threshold", 1.3)
         min_sp = getattr(feats, "min_spread_tick", 1)
         ttl_ms = getattr(feats, "ttl_ms", 800)
-        lot = getattr(getattr(cfg, "size", None), "default", 0.01)
+        lot = self._resolve_size_default(cfg)
 
         # Best未確定またはスプレッド不足→撤退（タグ一括取消）
         if ob.best_bid.price is None or ob.best_ask.price is None or ob.spread_ticks() < min_sp:

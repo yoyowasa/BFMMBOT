@@ -114,6 +114,11 @@ class PaperEngine:
         strategies: Sequence[str] | str | None = None,
         strategy_cfg=None,
     ) -> None:
+        if strategy_cfg is None:
+            if isinstance(cfg, Mapping):
+                strategy_cfg = cfg.get("strategy_cfg")
+            else:
+                strategy_cfg = getattr(cfg, "strategy_cfg", None)
         # 設定（製品コード/刻み/ガード閾値）
         self.cfg = cfg
         self.product = getattr(cfg, "product_code", "FX_BTC_JPY") or "FX_BTC_JPY"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import List, Dict, Any  # 返り値の型
+from collections.abc import Mapping
 from datetime import datetime  # 戦略判断時刻
 
 from loguru import logger  # 何をするか：ゲート理由を戦略ログに1行で出す
@@ -16,6 +17,37 @@ class StallThenStrike(StrategyBase):
     """【関数】#1 静止→一撃の最小実装（文書のトリガ/撤退に準拠）"""
     name: str = "stall_then_strike"
 
+    def __init__(self, cfg=None, *, strategy_cfg=None):
+        self.cfg = cfg
+        self._strategy_cfg = strategy_cfg
+
+    @staticmethod
+    def _value_from(node, *keys):
+        current = node
+        for key in keys:
+            if current is None:
+                return None
+            if isinstance(current, Mapping):
+                current = current.get(key)
+            else:
+                current = getattr(current, key, None)
+        return current
+
+    def _resolve_size_default(self, cfg) -> float:
+        override_default = self._value_from(self._strategy_cfg, "size", "default")
+        if override_default is not None:
+            try:
+                return float(override_default)
+            except (TypeError, ValueError):
+                return override_default
+        base_default = self._value_from(cfg, "size", "default")
+        if base_default is not None:
+            try:
+                return float(base_default)
+            except (TypeError, ValueError):
+                return base_default
+        return 0.01
+
     def evaluate(self, ob: OrderBook, now: datetime, cfg) -> List[Dict[str, Any]]:
         engine = locals().get("engine", getattr(self, "engine", None))  # 何をするか：エンジン参照（引数or属性）
         gate = engine.gate_status() if (engine and hasattr(engine, "gate_status")) else {"mode": "healthy", "reason": "na", "limits": {}, "ts_ms": None}  # 何をするか：ゲート状態を取得
@@ -28,7 +60,7 @@ class StallThenStrike(StrategyBase):
         stall_T = getattr(feats, "stall_T_ms", 250)
         min_sp = getattr(feats, "min_spread_tick", 1)
         ttl_ms = getattr(feats, "ttl_ms", 800)
-        lot = getattr(cfg.size, "default", 0.01)
+        lot = self._resolve_size_default(cfg)
         tick = float(getattr(cfg, "tick_size", 1.0))
 
         # Bestが未確定のときは何もしない

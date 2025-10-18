@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os  # 何をするか：APIキー/シークレットを環境変数から読む
 from typing import Any, Sequence  # 何をするか：cfg の型ヒント用
+from collections.abc import Mapping
 from loguru import logger  # 何をするか：進行ログを出す
 from src.strategy.base import build_strategy_from_cfg  # 何をするか：cfg['strategies'] 配列から戦略群を構築する
 import json  # 何をするか：heartbeatをndjsonで書くためにJSONへ直す
@@ -605,7 +606,18 @@ def run_live(
                 cfg_payload = dict(getattr(cfg, "__dict__", {}))
             if strategy_list:
                 cfg_payload["strategies"] = list(strategy_list)
-            strat = build_strategy_from_cfg(cfg_payload)  # 何をするか：本番起動でも複数戦略を1プロセスで束ねて回す
+            effective_strategy_cfg = strategy_cfg
+            if effective_strategy_cfg is None:
+                if isinstance(cfg, Mapping):
+                    effective_strategy_cfg = cfg.get("strategy_cfg")
+                else:
+                    effective_strategy_cfg = getattr(cfg, "strategy_cfg", None)
+            if effective_strategy_cfg is None:
+                effective_strategy_cfg = cfg_payload.get("strategy_cfg")
+            strat = build_strategy_from_cfg(
+                cfg_payload,
+                strategy_cfg=effective_strategy_cfg,
+            )  # 何をするか：本番起動でも複数戦略を1プロセスで束ねて回す
             summary_name = strat.name
 
             strategy_names = [
