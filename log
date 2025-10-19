@@ -130,6 +130,9 @@ Get-Content configs/live.yml
 # 何をするか：心拍から throttle の行だけをライブ表示（レート制限追跡）
 Get-Content logs/runtime/heartbeat.ndjson -Wait | ForEach-Object { if (($_ | ConvertFrom-Json).reason -eq 'throttle') { $_ } }
 
+
+poetry run python -m src.cli.trade --config configs/live.yml
+poetry run python -m src.cli.trade --config configs/paper.yml
 code tunnel --name home-dev
 
 gitから上書き
