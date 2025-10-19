@@ -15,6 +15,7 @@ import os
 import ssl
 
 from typing import AsyncIterator, Dict, Any, Iterable  # 型ヒント
+import certifi  # CA検証を“Mozilla CAバンドル”で統一するために使う
 import websockets  # WebSocket接続（poetryで導入済み）
 from loguru import logger  # 見やすいログ
 from queue import Queue  # 何をするか：非同期→同期ブリッジのキュー
@@ -55,12 +56,10 @@ async def event_stream(
     while True:
         try:
             logger.info(f"WS connecting to {_WS_URL} ...")
-            ssl_ctx = ssl.create_default_context()
-            cafile = os.getenv("BF_SSL_CAFILE")
-            if cafile:
-                ssl_ctx.load_verify_locations(cafile=cafile)
-            elif os.getenv("BF_SSL_INSECURE") in ("1", "true", "TRUE", "yes", "YES"):
-                ssl_ctx = ssl._create_unverified_context()
+            cafile = os.getenv("BF_SSL_CAFILE") or certifi.where()  # 既定=Mozilla CA。必要なら環境変数でCA差し替え
+            ssl_ctx = ssl.create_default_context(cafile=cafile)  # “検証あり”のままWS接続（自己署名チェーンは通さない）
+            if os.getenv("BF_SSL_INSECURE") in ("1", "true", "TRUE", "yes", "YES"):
+                ssl_ctx = ssl._create_unverified_context()  # テスト専用: 検証無効（本番では使わない）
 
             async with websockets.connect(
                 _WS_URL,
