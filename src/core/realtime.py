@@ -11,6 +11,8 @@ import asyncio  # 再接続の待ち・キャンセル制御
 import json  # JSON-RPCの組み立て（送信のみは標準でOK）
 from datetime import datetime, timezone  # 受信刻印(ts)の付与
 import time  # 何をするか：dry-run用ダミーストリームで sleep に使う
+import os
+import ssl
 
 from typing import AsyncIterator, Dict, Any, Iterable  # 型ヒント
 import websockets  # WebSocket接続（poetryで導入済み）
@@ -53,7 +55,19 @@ async def event_stream(
     while True:
         try:
             logger.info(f"WS connecting to {_WS_URL} ...")
-            async with websockets.connect(_WS_URL, ping_interval=20, close_timeout=10) as ws:
+            ssl_ctx = ssl.create_default_context()
+            cafile = os.getenv("BF_SSL_CAFILE")
+            if cafile:
+                ssl_ctx.load_verify_locations(cafile=cafile)
+            elif os.getenv("BF_SSL_INSECURE") in ("1", "true", "TRUE", "yes", "YES"):
+                ssl_ctx = ssl._create_unverified_context()
+
+            async with websockets.connect(
+                _WS_URL,
+                ping_interval=20,
+                close_timeout=10,
+                ssl=ssl_ctx,
+            ) as ws:
                 # 購読を復元
                 for ch in channels:
                     await ws.send(_subscribe_msg(ch))
