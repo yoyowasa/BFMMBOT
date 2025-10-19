@@ -532,17 +532,19 @@ class PaperEngine:
         corr_id = corr_hint or uuid.uuid4().hex  # 何をするか：決定単位で一意な相関IDを決める
         _features["corr_id"] = corr_id  # 何をするか：features_json内に相関IDを残す
 
-        self.decision_log.add(
-            ts=now.isoformat(),
-            strategy=(current_strategy_ctx.get() or self.strat.name),
-            decision=decision,
-            features=_features,
-            expected_edge_bp=None,  # 最小実装では未算出
-            eta_ms=None,            # 最小実装では未算出
-            ca_ratio=feats["ca_ratio"],
-            best_age_ms=feats["best_age_ms"],
-            spread_state=("zero" if feats["spread_tick"] == 0 else "ge1"),
-        )
+        decision_record = {
+            "ts": now.isoformat(),
+            "strategy": (current_strategy_ctx.get() or self.strat.name),
+            "decision": decision,
+            "features": _features,
+            "expected_edge_bp": None,  # 最小実装では未算出
+            "eta_ms": None,            # 最小実装では未算出
+            "ca_ratio": feats["ca_ratio"],
+            "best_age_ms": feats["best_age_ms"],
+            "spread_state": ("zero" if feats["spread_tick"] == 0 else "ge1"),
+        }
+        decision_record.update({"expected_edge_bp": (feats.get("expected_edge_bp") or feats.get("mp_edge_bp") or ((feats["microprice"] - feats["mid"]) / feats["mid"] * 1e4) if "microprice" in feats and "mid" in feats else None), "eta_ms": (feats.get("eta_ms") or feats.get("queue_eta_ms"))})  # decisionログへETAと期待エッジ(bp)を必ず埋める。MPがあれば (MP−mid)/mid×1e4 で簡易推定、ETAはQueue ETAを採用
+        self.decision_log.add(**decision_record)
 
     def _consume_strategy_features(self) -> dict | None:
         getter = getattr(self.strat, "consume_decision_features", None)

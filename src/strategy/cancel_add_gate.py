@@ -54,17 +54,19 @@ class CancelAddGate(StrategyBase):
         feats = getattr(cfg, "features", None)
         win_ms = getattr(feats, "ca_ratio_win_ms", 500)
         theta = getattr(feats, "ca_threshold", 1.3)
-        min_sp = getattr(feats, "min_spread_tick", 1)
+        min_sp_cfg = getattr(cfg, "min_spread_tick", None)
+        min_sp = getattr(feats, "min_spread_tick", 1) if min_sp_cfg is None else min_sp_cfg
         ttl_ms = getattr(feats, "ttl_ms", 800)
         lot = self._resolve_size_default(cfg)
 
         # Best未確定またはスプレッド不足→撤退（タグ一括取消）
-        if ob.best_bid.price is None or ob.best_ask.price is None or ob.spread_ticks() < min_sp:
+        spread_ticks = ob.spread_ticks()
+        if ob.best_bid.price is None or ob.best_ask.price is None or spread_ticks < min_sp:
             return [{"type": "cancel_tag", "tag": "ca_gate"}]
 
         # 直近windowのBest層 C/A 比を取得（adds<=0なら∞扱い）
         ratio = ob.ca_ratio(now, window_ms=win_ms)
-        if ratio <= theta:
+        if ratio <= theta and spread_ticks >= min_sp:  # C/Aゲート: 最低スプレッドtickを設定値で制御（0〜1tick帯は通さない）
             # MP寄り側にリーン：MP≥mid→sell側、MP<mid→buy側
             mid = (ob.best_bid.price + ob.best_ask.price) / 2.0
             mp = ob.microprice()
