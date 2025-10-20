@@ -211,6 +211,64 @@ def _hb_write(hb_path, **fields):
         logger.exception(f"heartbeat write failed: {e}")
 
 
+def _safe_config_dict(source) -> dict[str, Any]:
+    """何をするか：Mapping/モデル/属性オブジェクトを安全にdictへ落とす"""
+    if source is None:
+        return {}
+    if isinstance(source, Mapping):
+        return dict(source)
+    model_dump = getattr(source, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump()
+        except Exception:
+            dumped = None
+        else:
+            if isinstance(dumped, Mapping):
+                return dict(dumped)
+    try:
+        return dict(vars(source))
+    except Exception:
+        return {}
+
+
+def _strategy_cfg_overrides(strategy_cfg, strategies: Sequence[str] | None) -> dict[str, dict[str, Any]]:
+    """何をするか：strategy_cfg から有効戦略ごとの上書きを dict 化する"""
+    overrides: dict[str, dict[str, Any]] = {}
+    if not strategy_cfg or not strategies:
+        return overrides
+
+    mapping_view: Mapping[str, Any] | None
+    if isinstance(strategy_cfg, Mapping):
+        mapping_view = strategy_cfg
+    else:
+        dumped = None
+        model_dump = getattr(strategy_cfg, "model_dump", None)
+        if callable(model_dump):
+            try:
+                dumped = model_dump()
+            except Exception:
+                dumped = None
+        if isinstance(dumped, Mapping):
+            mapping_view = dumped
+        else:
+            mapping_view = getattr(strategy_cfg, "__dict__", None)
+
+    for name in strategies:
+        cfg_node = None
+        if isinstance(strategy_cfg, Mapping):
+            cfg_node = strategy_cfg.get(name)
+        else:
+            cfg_node = getattr(strategy_cfg, name, None)
+            if cfg_node is None and mapping_view:
+                cfg_node = mapping_view.get(name)
+        node_dict = _safe_config_dict(cfg_node)
+        if node_dict:
+            overrides[name] = node_dict
+
+    return overrides
+
+
 def _best_px(side) -> float | None:
     """何をするか：best_bid/best_ask に入るオブジェクト/辞書/数値から“価格(float)”だけを取り出す"""
     if side is None:
@@ -598,14 +656,12 @@ def run_live(
             signal.signal(signal.SIGTERM, _on_signal)  # 何をするか：SIGTERM（停止要求）で停止
 
             ob = OrderBook()  # 何をするか：ローカル板（戦略の入力）を用意
-            if hasattr(cfg, "model_dump"):
-                cfg_payload = cfg.model_dump()
-            elif isinstance(cfg, dict):
+            cfg_payload = _safe_config_dict(cfg)
+            if not cfg_payload and isinstance(cfg, Mapping):
                 cfg_payload = dict(cfg)
-            else:
-                cfg_payload = dict(getattr(cfg, "__dict__", {}))
             if strategy_list:
                 cfg_payload["strategies"] = list(strategy_list)
+            cfg_features = getattr(cfg, "features", None)
             effective_strategy_cfg = strategy_cfg
             if effective_strategy_cfg is None:
                 if isinstance(cfg, Mapping):
@@ -629,6 +685,34 @@ def run_live(
             logger.info(
                 f"live: starting loop product={product_code} strategy={summary_name} strategies={strategy_list}"
             )  # 何をするか：起動ログ
+            try:
+                analytics_dir = Path("logs/analytics")
+                analytics_dir.mkdir(parents=True, exist_ok=True)
+                env_value = getattr(cfg, "env", None)
+                if env_value is None and isinstance(cfg, Mapping):
+                    env_value = cfg.get("env")
+                if env_value is None:
+                    env_value = cfg_payload.get("env")
+                entry: dict[str, Any] = {
+                    "ts": _now_utc().isoformat(),
+                    "env": env_value,
+                    "product": product_code,
+                    "strategies": list(strategy_list),
+                }
+                features_payload = _safe_config_dict(cfg_features)
+                if features_payload:
+                    entry["features"] = features_payload
+                strategy_overrides = _strategy_cfg_overrides(effective_strategy_cfg, strategy_list)
+                if strategy_overrides:
+                    entry["strategy_cfg"] = strategy_overrides
+                cfg_log_path = analytics_dir / "strategy_cfg.ndjson"
+                with cfg_log_path.open("ab") as f:
+                    f.write(orjson.dumps(entry))
+                    f.write(b"\n")
+            except Exception as e:
+                logger.warning(f"live: strategy_cfg analytics append failed: {e}")
+            else:
+                logger.info("live: strategy_cfg analytics appended")
             _hb_write(
                 hb_path,
                 event="start",
