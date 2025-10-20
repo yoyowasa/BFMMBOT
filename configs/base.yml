@@ -36,7 +36,7 @@ health:
 
 features:  # 戦略のしきい値（#1/#2 の主材料）
   stall_T_ms: 250          # #1 静止→一撃：BestがTms静止
-  ca_ratio_win_ms: 500     # #2 C/Aゲート：集計窓（ms）
+  ca_ratio_win_ms: 800     # #2 C/Aゲート：集計窓（ms）
   ca_threshold: 1.1        # #2 C/Aゲート：Cancel/Add 閾値（以下ならOK）
   min_spread_tick: 1       # 最低スプレッド（tick）
   ttl_ms: 800              # オーダーの寿命（ms）
@@ -45,27 +45,27 @@ features:  # 戦略のしきい値（#1/#2 の主材料）
   tiny_prints_N: 20        # Tiny-Prints集計N（OFFの初期値）
   tiny_prints_minCount: 14 # Tiny-Prints発火閾値（OFFの初期値）
   eta_t_window_ms: 800     # Queue ETAの窓（OFFの初期値）
-  stall_then_strike:        # 何をする設定か：#1 静止→一撃 のしきい値を戦略専用でまとめる
-    stall_T_ms: 250         # 何をする設定か：Bestがこのms静止していたら両面エントリー可
-    min_spread_tick: 1      # 何をする設定か：最低スプレッド（tick）。これ未満なら何もしない
-    ttl_ms: 800             # 何をする設定か：置いた注文の寿命（ms）
+  # stall_then_strike:        # 何をする設定か：#1 静止→一撃 のしきい値を戦略専用でまとめる
+  #   stall_T_ms: 250         # 何をする設定か：Bestがこのms静止していたら両面エントリー可
+  #   min_spread_tick: 1      # 何をする設定か：最低スプレッド（tick）。これ未満なら何もしない
+  #   ttl_ms: 800             # 何をする設定か：置いた注文の寿命（ms）
 
-  cancel_add_gate:          # 何をする設定か：#2 キャンセル比ゲートのしきい値セット
-    ca_ratio_win_ms: 500    # 何をする設定か：Cancel/Add 比を測る時間窓（ms）
-    ca_threshold: 1.3       # 何をする設定か：C/A比がこの値以下のときだけエントリー可
-    min_spread_tick: 1      # 何をする設定か：最低スプレッド（tick）
-    ttl_ms: 800             # 何をする設定か：置いた注文の寿命（ms）
+  # cancel_add_gate:          # 何をする設定か：#2 キャンセル比ゲートのしきい値セット
+  #   ca_ratio_win_ms: 500    # 何をする設定か：Cancel/Add 比を測る時間窓（ms）
+  #   ca_threshold: 1.3       # 何をする設定か：C/A比がこの値以下のときだけエントリー可
+  #   min_spread_tick: 1      # 何をする設定か：最低スプレッド（tick）
+  #   ttl_ms: 800             # 何をする設定か：置いた注文の寿命（ms）
 
-  age_microprice:           # 何をする設定か：#3（OFF想定）Age×MP 用の外だし（後日ONに備えて整理）
-    age_ms: 200             # 何をする設定か：Bestの滞留時間（ms）
-    mp_offset_tick: 1.0     # 何をする設定か：Micropriceの寄せ量（tick）
+  # age_microprice:           # 何をする設定か：#3（OFF想定）Age×MP 用の外だし（後日ONに備えて整理）
+  #   age_ms: 200             # 何をする設定か：Bestの滞留時間（ms）
+  #   mp_offset_tick: 1.0     # 何をする設定か：Micropriceの寄せ量（tick）
 
-  tiny_prints_filter:       # 何をする設定か：#5（OFF想定）Tiny-Prints の発火しきい値
-    tiny_prints_N: 20       # 何をする設定か：集計に使う件数N
-    tiny_prints_minCount: 14# 何をする設定か：P20以下がこの回数以上で有効
+  # tiny_prints_filter:       # 何をする設定か：#5（OFF想定）Tiny-Prints の発火しきい値
+  #   tiny_prints_N: 20       # 何をする設定か：集計に使う件数N
+  #   tiny_prints_minCount: 14　# 何をする設定か：P20以下がこの回数以上で有効
 
-  queue_eta_gate:           # 何をする設定か：#6（OFF想定）Queue ETA の観測窓
-    eta_t_window_ms: 800    # 何をする設定か：ETAの時間窓（ms）
+  # queue_eta_gate:           # 何をする設定か：#6（OFF想定）Queue ETA の観測窓
+  #   eta_t_window_ms: 800    # 何をする設定か：ETAの時間窓（ms）
   zero_reopen_pop:  # 何をする設定か：ゼロ→再拡大の“一拍だけ”出す戦略のパラメータ
     min_take_qty: 0.0           # 何をする設定か：利確IOCが当たる相手側Bestの最小数量（0で無効・例 0.01 などに設定）
     max_join_qty: 0.0           # 何をする設定か：自分が並ぶ側Bestの数量がこの値を超えたら見送り（0で無効・例 0.05 など）
