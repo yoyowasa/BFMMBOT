@@ -728,6 +728,60 @@ class PaperEngine:
         logger.info(
             f"paper start: product={self.product} strategy={self.strat.name} strategies={self.strategies}"
         )
+        paper_meta_path = Path("logs/runtime/paper_start.ndjson")
+        paper_meta_path.parent.mkdir(parents=True, exist_ok=True)
+        features_obj = getattr(self.cfg, "features", None)
+        if features_obj is None:
+            _features_common = {}
+        elif isinstance(features_obj, Mapping):
+            _features_common = dict(features_obj)
+        elif hasattr(features_obj, "model_dump"):
+            _features_common = features_obj.model_dump()
+        else:
+            try:
+                _features_common = dict(vars(features_obj))
+            except TypeError:
+                _features_common = {}
+        features_overrides = {}
+        if features_obj is not None:
+            for name in self.strategies:
+                if isinstance(features_obj, Mapping):
+                    override_obj = features_obj.get(name)
+                else:
+                    override_obj = getattr(features_obj, name, None)
+                if override_obj is None:
+                    continue
+                if isinstance(override_obj, Mapping):
+                    override_payload = dict(override_obj)
+                elif hasattr(override_obj, "model_dump"):
+                    override_payload = override_obj.model_dump()
+                else:
+                    try:
+                        override_payload = dict(vars(override_obj))
+                    except TypeError:
+                        continue
+                if isinstance(_features_common, dict):
+                    _features_common.pop(name, None)
+                features_overrides[name] = override_payload
+        try:
+            with paper_meta_path.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    orjson.dumps(
+                        {
+                            "ts": _now_utc().isoformat(),
+                            "event": "start",
+                            "mode": "paper",
+                            "product": self.product,
+                            "strategy": getattr(self.strat, "strategy_name", None) or self.strat.name,
+                            "strategies": list(self.strategies),
+                            "features_common": _features_common,
+                            "features_overrides": features_overrides,
+                        }
+                    ).decode("utf-8")
+                    + "\n"
+                )
+        except Exception:
+            logger.exception("paper start ndjson write failed")
         try:
             async for ev in event_stream(product_code=self.product):
                 now = _parse_iso(ev["ts"])
