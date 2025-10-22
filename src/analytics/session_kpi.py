@@ -87,6 +87,275 @@ def load_yaml(path: Path) -> dict:
         return {}
 
 
+# ---------- オーダー品質（place→partial→fill/cancel を束ねて評価） ----------
+
+def _parse_corr_tag_reason(reason: str | None):
+    """[関数] reason文字列から corr / tag / head(先頭トークン) を抽出する。
+    何をする？ → ライフ連結の鍵（corr）と集計軸（tag）、取消理由の大枠(head)を得ます。"""
+    corr = None
+    tag = None
+    head = None
+    if not reason:
+        return corr, tag, head
+    txt = str(reason)
+    parts = [x.strip() for x in txt.split(";") if x.strip()]
+    head = parts[0] if parts else None
+    for p in parts:
+        if p.startswith("corr="):
+            corr = p.split("=", 1)[1].strip() or None
+        if p.startswith("tag="):
+            tag = p.split("=", 1)[1].strip() or None
+    # 一部のplaceでは先頭に素の tag が置かれるケースを補完
+    if tag is None and parts:
+        if "=" not in parts[0]:
+            tag = parts[0]
+    return corr, tag, head
+
+
+def build_order_lifecycle(orders: list[dict]):
+    """[関数] 同一corrの注文イベントを束ね、place→(partial/fill)*→(fill or cancel)の一連を作る。
+    何をする？ → 1件の注文の滞在時間/成否/TTL超過/総約定サイズなどを求めます。"""
+    by_corr: dict[str, dict] = {}
+    for r in orders:
+        act = r.get("action")
+        ts = parse_ts(r.get("ts"))
+        tif = r.get("tif")
+        ttl_ms = r.get("ttl_ms")
+        px = r.get("px")
+        sz = r.get("sz")
+        corr, tag, head = _parse_corr_tag_reason(r.get("reason"))
+        if corr is None:
+            # corrが無いものは束ねられないのでスキップ（集計に混ぜない）
+            continue
+        node = by_corr.setdefault(
+            corr,
+            {
+                "corr": corr,
+                "tag": tag or "-",
+                "place_ts": None,
+                "tif": None,
+                "ttl_ms": None,
+                "place_sz": None,
+                "fills": [],  # (ts, sz)
+                "cancel_ts": None,
+                "cancel_head": None,  # ttl/kill/window/strategy など先頭トークン
+            },
+        )
+        if act == "place":
+            node["place_ts"] = ts
+            node["tif"] = tif or node.get("tif")
+            node["ttl_ms"] = int(ttl_ms) if ttl_ms is not None else node.get("ttl_ms")
+            node["place_sz"] = float(sz) if sz is not None else node.get("place_sz")
+            if tag and not node.get("tag"):
+                node["tag"] = tag
+        elif act in ("fill", "partial"):
+            if ts is not None and sz is not None:
+                try:
+                    node["fills"].append((ts, float(sz)))
+                except Exception:
+                    pass
+        elif act == "cancel":
+            node["cancel_ts"] = ts
+            node["cancel_head"] = head or node.get("cancel_head")
+    # 事後計算
+    lifecycles = []
+    for corr, node in by_corr.items():
+        place_ts = node.get("place_ts")
+        end_ts = None
+        end_kind = None  # "fill" or "cancel" or None
+        # 最終イベントの時刻
+        last_fill_ts = max((t for (t, _) in node.get("fills") or []), default=None)
+        if node.get("cancel_ts") and (last_fill_ts is None or node["cancel_ts"] > last_fill_ts):
+            end_ts = node["cancel_ts"]
+            end_kind = "cancel"
+        elif last_fill_ts is not None:
+            end_ts = last_fill_ts
+            end_kind = "fill"
+        # 充足（1回でもfill/partialがあればTrue）
+        any_fill = bool(node.get("fills"))
+        # 総約定サイズ
+        total_filled = sum(sz for (_, sz) in node.get("fills") or [])
+        place_sz = node.get("place_sz") or 0.0
+        # FOK成功=総約定サイズが発注サイズ以上、IOC成功=総約定サイズ>0、GTC成功=any_fill
+        tif = (node.get("tif") or "").upper()
+        fok_ok = total_filled >= place_sz - 1e-12 if place_sz else any_fill
+        ioc_ok = total_filled > 0.0
+        gtc_ok = any_fill
+        success = (gtc_ok if tif == "GTC" else (ioc_ok if tif == "IOC" else (fok_ok if tif == "FOK" else any_fill)))
+        # TTL超過（cancelで、place→end が ttl_ms を越えた）
+        ttl_ms = node.get("ttl_ms")
+        dwell_ms = None
+        ttl_over = False
+        if place_ts and end_ts:
+            dwell_ms = int((end_ts - place_ts).total_seconds() * 1000.0)
+            if end_kind == "cancel" and ttl_ms is not None and dwell_ms > int(ttl_ms):
+                ttl_over = True
+        lifecycles.append(
+            {
+                "corr": corr,
+                "tag": node.get("tag") or "-",
+                "tif": tif or "-",
+                "place_ts": place_ts,
+                "end_ts": end_ts,
+                "end_kind": end_kind,
+                "dwell_ms": dwell_ms,
+                "ttl_ms": ttl_ms,
+                "ttl_over": ttl_over,
+                "any_fill": any_fill,
+                "total_filled": total_filled,
+                "place_sz": place_sz,
+                "success": success,
+                "cancel_head": node.get("cancel_head"),
+            }
+        )
+    return lifecycles
+
+
+def summarize_order_quality(lifecycles: list[dict]):
+    """[関数] 注文ライフ(=by corr)を戦略/タグごとに要約する。
+    何をする？ → fill率、TTL超過率、滞在時間(P50/P95)、TIF別成功率、取消理由top3 を短文で出します。"""
+    if not lifecycles:
+        return ["注文イベントに corr が無く、品質集計を実施できませんでした"]
+
+    by_tag: dict[str, list[dict]] = {}
+    for row in lifecycles:
+        by_tag.setdefault(row.get("tag") or "-", []).append(row)
+
+    lines = []
+    for tag, rows in sorted(by_tag.items(), key=lambda kv: len(kv[1]), reverse=True):
+        n = len(rows)
+        if n == 0:
+            continue
+        # fill率 = any_fill / place
+        any_fill_ct = sum(1 for r in rows if r.get("any_fill"))
+        fill_rate = any_fill_ct / n * 100.0
+        # TTL超過
+        ttl_over_ct = sum(1 for r in rows if r.get("ttl_over"))
+        ttl_over_rate = ttl_over_ct / n * 100.0
+        # 滞在時間（ms → s）
+        dwell_vals = [r.get("dwell_ms") for r in rows if r.get("dwell_ms") is not None]
+        dwell_vals.sort()
+        p50 = (dwell_vals[int((len(dwell_vals) - 1) * 0.50)] / 1000.0) if dwell_vals else None
+        p95 = (dwell_vals[int((len(dwell_vals) - 1) * 0.95)] / 1000.0) if dwell_vals else None
+        # TIF別成功
+        by_tif: dict[str, list[bool]] = {}
+        for r in rows:
+            by_tif.setdefault(r.get("tif") or "-", []).append(bool(r.get("success")))
+        tif_bits = []
+        for tif, arr in by_tif.items():
+            if not arr:
+                continue
+            tif_bits.append(f"{tif}成功 {sum(1 for x in arr if x)/len(arr):.0%}（n={len(arr)}）")
+        # 取消理由top3
+        cancels = [r.get("cancel_head") for r in rows if r.get("end_kind") == "cancel" and r.get("cancel_head")]
+        top3 = []
+        if cancels:
+            c_ct = Counter(cancels)
+            top3 = [f"{k}({c_ct[k]/len(cancels):.0%})" for k, _ in c_ct.most_common(3)]
+        # 1行
+        parts = [
+            f"tag={tag}: fill率 {fill_rate:.0f}%, TTL超過 {ttl_over_rate:.0f}%",
+            f"滞在P50 {p50:.2f}s" if p50 is not None else "滞在P50 -",
+            f"滞在P95 {p95:.2f}s" if p95 is not None else "滞在P95 -",
+        ]
+        if tif_bits:
+            parts.append(", ".join(tif_bits))
+        if top3:
+            parts.append("取消理由 top=" + " / ".join(top3))
+        lines.append("- " + ", ".join(parts))
+    return lines
+
+
+def diagnose_order_gate_correlation(lifecycles: list[dict], decisions: list[dict], window_ms: int = 1500, min_bucket_n: int = 30):
+    """[関数] 注文(place)の直前decisionを結び、ca_ratio/eta_msの分位で失敗率の傾向を見る。
+    何をする？ → “CA比が悪いほど失敗多い？”など簡易に傾向を1〜2行で返します。"""
+    # strategy(tag)ごとに decision を時刻ソート
+    per = {}
+    per_ts = {}
+    for d in decisions:
+        s = d.get("strategy")
+        ts = parse_ts(d.get("ts"))
+        if not s or ts is None:
+            continue
+        feats = {
+            "ca_ratio": _safe_float(d.get("ca_ratio")),
+            "eta_ms": _safe_float(d.get("eta_ms")),
+        }
+        per.setdefault(s, []).append((ts, feats))
+    for s in list(per.keys()):
+        per[s].sort(key=lambda x: x[0])
+        per_ts[s] = [t for t, _ in per[s]]
+        if not per_ts[s]:
+            del per[s], per_ts[s]
+
+    # placeに最も近い直前decisionを拾う
+    samples = []  # {tag, fail(bool), ca_ratio, eta_ms}
+    for o in lifecycles:
+        tag = o.get("tag")
+        if tag not in per:
+            continue
+        ts = o.get("place_ts")
+        if ts is None:
+            continue
+        idx = bisect_right(per_ts[tag], ts) - 1
+        if idx < 0:
+            continue
+        dt_ms = (ts - per_ts[tag][idx]).total_seconds() * 1000.0
+        if dt_ms > window_ms:
+            continue
+        feats = per[tag][idx][1]
+        samples.append({
+            "tag": tag,
+            "fail": not bool(o.get("success")),
+            "ca_ratio": feats.get("ca_ratio"),
+            "eta_ms": feats.get("eta_ms"),
+        })
+
+    if not samples:
+        return ["ゲート照合: 対応ゼロ（order.place↔decisionが見つからず）"]
+
+    def _report(key: str, unit: str = ""):
+        vals = [s.get(key) for s in samples if s.get(key) is not None]
+        if len(vals) < min_bucket_n * 2:
+            return None
+        edges = _quartile_edges(vals)
+        if not edges:
+            return None
+        q1, q2, q3 = edges
+        buckets = {}
+        for s in samples:
+            x = s.get(key)
+            if x is None:
+                continue
+            name = _bucket_name(x, q1, q2, q3, unit)
+            st = buckets.setdefault(name, {"n": 0, "fail": 0})
+            st["n"] += 1
+            st["fail"] += 1 if s.get("fail") else 0
+        base_fail = sum(s.get("fail") for s in samples) / len(samples) * 100.0
+        scored = []
+        for name, st in buckets.items():
+            if st["n"] < min_bucket_n:
+                continue
+            fr = st["fail"] / st["n"] * 100.0
+            scored.append((fr - base_fail, fr, st["n"], name))
+        if not scored:
+            return None
+        scored.sort()
+        worst = scored[-1]  # 失敗率が高い
+        best = scored[0]    # 失敗率が低い
+        return f"  ・{key}: {worst[3]}で失敗↑(+{worst[0]:.1f}pt), {best[3]}で失敗↓({best[0]:+.1f}pt)"
+
+    lines = ["- ゲート照合（decision直前→order.place）"]
+    r1 = _report("ca_ratio")
+    if r1:
+        lines.append(r1)
+    r2 = _report("eta_ms", "ms")
+    if r2:
+        lines.append(r2)
+    if len(lines) == 1:
+        lines.append("  ・十分なサンプルがなく判定不可")
+    return lines
+
 # ---------- セッション検出と絞り込み ----------
 
 def detect_session_window(in_dir: Path):
@@ -527,6 +796,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dir", type=Path, required=True, help="NDJSONがあるフォルダ（/mnt/data など）")
     p.add_argument("--config", type=Path, required=False, help="設定YAML（analytics.* を参照）")
+    p.add_argument("--save", action="store_true", help="logs/analytics/SESSION_ID/ にテキストを保存する")
+    p.add_argument("--session-auto", action="store_true", default=True, help="paper_start/heartbeat でセッション範囲を自動検出する")
     args = p.parse_args()
 
     cfg = load_yaml(args.config) if args.config else {}
@@ -566,22 +837,24 @@ def main():
     print(f"- decision  : {fmt(dl_s)} → {fmt(dl_e)}（{dl_n}行）")
 
     # セッション範囲（start/end）を自動検出して、trade/decision をその範囲に絞る
-    s_ts, e_ts = detect_session_window(args.dir)
-    if s_ts is None or e_ts is None:
-        # フォールバック：trade_log の最小・最大 ts を使う（片方だけ欠けても可）
-        t_times = [parse_ts(r.get("ts")) for r in tl if parse_ts(r.get("ts")) is not None]
-        if s_ts is None and t_times:
-            s_ts = min(t_times)
-        if e_ts is None and t_times:
-            e_ts = max(t_times)
-    tl = filter_by_window(tl, s_ts, e_ts)
-    dl = filter_by_window(dl, s_ts, e_ts)
-    ol = filter_by_window(ol, s_ts, e_ts)  # order_log も同じ範囲で絞る（集計の混入防止）
+    s_ts = e_ts = None
+    if args.session_auto:
+        s_ts, e_ts = detect_session_window(args.dir)
+        if s_ts is None or e_ts is None:
+            # フォールバック：trade_log の最小・最大 ts を使う（片方だけ欠けても可）
+            t_times = [parse_ts(r.get("ts")) for r in tl if parse_ts(r.get("ts")) is not None]
+            if s_ts is None and t_times:
+                s_ts = min(t_times)
+            if e_ts is None and t_times:
+                e_ts = max(t_times)
+        tl = filter_by_window(tl, s_ts, e_ts)
+        dl = filter_by_window(dl, s_ts, e_ts)
+        ol = filter_by_window(ol, s_ts, e_ts)  # order_log も同じ範囲で絞る（集計の混入防止）
 
-    print("\n【セッション範囲（自動検出）】")
-    print(f"- start: {fmt(s_ts) if s_ts else '-'}")
-    print(f"- end  : {fmt(e_ts) if e_ts else '-'}")
-    print(f"- orders: {len(ol)} / trades: {len(tl)} / decisions: {len(dl)} （絞り込み後の件数）")
+        print("\n【セッション範囲（自動検出）】")
+        print(f"- start: {fmt(s_ts) if s_ts else '-'}")
+        print(f"- end  : {fmt(e_ts) if e_ts else '-'}")
+        print(f"- orders: {len(ol)} / trades: {len(tl)} / decisions: {len(dl)} （絞り込み後の件数）")
 
     # KPI（trade/decision はセッション範囲で集計）
     tk = kpi_trades(tl)
@@ -648,6 +921,51 @@ def main():
     print("\n【エッジ校正（expected_edge_bp ↔ 実現bp）】")
     for ln in cal_lines:
         print(ln)
+
+    # オーダー品質（corr単位でライフを連結し、戦略/タグごとに要約）
+    lifecycles = build_order_lifecycle(ol)
+    oq_lines = summarize_order_quality(lifecycles)
+    gate_lines = diagnose_order_gate_correlation(lifecycles, dl, window_ms=window_ms, min_bucket_n=max(30, min_bucket_n))
+
+    print("\n【オーダー品質（place→fill/cancel）】")
+    for ln in oq_lines:
+        print(ln)
+    for ln in gate_lines:
+        print(ln)
+
+    # 保存（任意）
+    if args.save:
+        def _sid(a, b):
+            def _safe_str(x):
+                return x.strftime("%Y%m%d_%H%M%S") if x else "unknown"
+            return f"{_safe_str(a)}-{_safe_str(b)}"
+
+        sess_id = _sid(s_ts, e_ts)
+        out_dir = Path("logs") / "analytics" / sess_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # 1) session_summary
+        summary = []
+        summary.append("【トレードKPI】")
+        summary.append(f"- 件数 {tk['n']} / 勝率 {tk['win_rate']:.1f}% / Sharpe擬似 {tk['pseudo_sharpe']:.3f}")
+        summary.append(f"- 正味PnL {tk['net_pnl']:.6f} / DD {tk['mdd']:.6f}")
+        # 在庫サマリ（可能なら）
+        inv_vals = [float(r.get("inventory_after")) for r in tl if r.get("inventory_after") is not None]
+        if inv_vals:
+            summary.append(f"- 在庫: min {min(inv_vals):.6f} / max {max(inv_vals):.6f} / end {inv_vals[-1]:.6f}")
+        # エッジ校正の要点（先頭2〜3行）
+        summary.append("【エッジ校正 要点】")
+        for ln in cal_lines[:3]:
+            summary.append(ln)
+        (out_dir / "session_summary.txt").write_text("\n".join(summary), encoding="utf-8")
+
+        # 2) order_quality
+        oq = ["【オーダー品質】"] + oq_lines + gate_lines
+        (out_dir / "order_quality.txt").write_text("\n".join(oq), encoding="utf-8")
+
+        # 3) edge_calibration
+        ec = ["【エッジ校正（expected vs realized）】"] + cal_lines
+        (out_dir / "edge_calibration.txt").write_text("\n".join(ec), encoding="utf-8")
+        print(f"\n【保存】logs/analytics/{sess_id}/ にサマリを書き出しました")
 
     print(
         "\n【メモ】この集計は“在庫はFillで数える／HTTPは答え合わせ”の原則と、ログ仕様・BT要件に準拠しています。"
