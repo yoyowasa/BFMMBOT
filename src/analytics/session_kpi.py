@@ -73,6 +73,62 @@ def load_yaml(path: Path) -> dict:
         return {}
 
 
+# ---------- セッション検出と絞り込み ----------
+
+def detect_session_window(in_dir: Path):
+    """[関数] セッション開始・終了の自動検出。
+    何をする？ → in_dir内の *paper_start*.ndjson / *heartbeat*.ndjson の ts を読み、
+    start/end を推定して (start_ts, end_ts) を返します。無いときは None にして後段でフォールバック。"""
+    def _safe_first_ts(path: Path):
+        rows = load_ndjson(path)
+        if not rows:
+            return None
+        return parse_ts(rows[0].get("ts")) or parse_ts(rows[0].get("timestamp"))
+
+    def _safe_last_ts(path: Path):
+        rows = load_ndjson(path)
+        if not rows:
+            return None
+        ts_list = []
+        for r in rows:
+            t = parse_ts(r.get("ts")) or parse_ts(r.get("timestamp"))
+            if t is not None:
+                ts_list.append(t)
+        return max(ts_list) if ts_list else None
+
+    start_ts = None
+    end_ts = None
+    # paper_start: 最初の1件の ts を開始候補に
+    for p in sorted(in_dir.glob("*paper_start*.ndjson")):
+        t = _safe_first_ts(p)
+        if t is not None:
+            start_ts = t if start_ts is None else min(start_ts, t)
+    # heartbeat: 最後の ts を終了候補に
+    for p in sorted(in_dir.glob("*heartbeat*.ndjson")):
+        t = _safe_last_ts(p)
+        if t is not None:
+            end_ts = t if end_ts is None else max(end_ts, t)
+    return start_ts, end_ts
+
+
+def filter_by_window(rows: list[dict], start_ts, end_ts):
+    """[関数] ts が start_ts〜end_ts に入る行だけ残す。
+    何をする？ → セッション外のデータを落として、集計の“混入”を防ぎます。"""
+    if not rows:
+        return rows
+    out = []
+    for r in rows:
+        t = parse_ts(r.get("ts")) or parse_ts(r.get("timestamp"))
+        if t is None:
+            continue
+        if (start_ts is not None and t < start_ts):
+            continue
+        if (end_ts is not None and t > end_ts):
+            continue
+        out.append(r)
+    return out
+
+
 # ---------- 品質診断ユーティリティ（意思決定→約定の因果を“短距離”で見る） ----------
 
 def _safe_float(x):
@@ -406,7 +462,25 @@ def main():
     print(f"- trade_log : {fmt(tl_s)} → {fmt(tl_e)}（{tl_n}約定）")
     print(f"- decision  : {fmt(dl_s)} → {fmt(dl_e)}（{dl_n}行）")
 
-    # KPI
+    # セッション範囲（start/end）を自動検出して、trade/decision をその範囲に絞る
+    s_ts, e_ts = detect_session_window(args.dir)
+    if s_ts is None or e_ts is None:
+        # フォールバック：trade_log の最小・最大 ts を使う（片方だけ欠けても可）
+        t_times = [parse_ts(r.get("ts")) for r in tl if parse_ts(r.get("ts")) is not None]
+        if s_ts is None and t_times:
+            s_ts = min(t_times)
+        if e_ts is None and t_times:
+            e_ts = max(t_times)
+    tl = filter_by_window(tl, s_ts, e_ts)
+    dl = filter_by_window(dl, s_ts, e_ts)
+    ol = filter_by_window(ol, s_ts, e_ts)  # order_log も同じ範囲で絞る（集計の混入防止）
+
+    print("\n【セッション範囲（自動検出）】")
+    print(f"- start: {fmt(s_ts) if s_ts else '-'}")
+    print(f"- end  : {fmt(e_ts) if e_ts else '-'}")
+    print(f"- orders: {len(ol)} / trades: {len(tl)} / decisions: {len(dl)} （絞り込み後の件数）")
+
+    # KPI（trade/decision はセッション範囲で集計）
     tk = kpi_trades(tl)
     ok = kpi_orders(ol)
     dk = kpi_decisions(dl)
@@ -474,4 +548,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
