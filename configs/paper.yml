@@ -26,3 +26,6 @@ strategy_cfg:
     size:
       default: 0.007
 
+# analytics:
+#   decision_to_trade_window_ms: 1200
+#   min_bucket_n: 30

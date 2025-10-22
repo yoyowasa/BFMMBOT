@@ -151,3 +151,5 @@ poetry shell
 git add -A
 git commit -m "chore: initial upload"   # ←必ずメッセージを入れる
 git push  
+
+python -m src.analytics.session_kpi --dir /mnt/data --config configs/paper.yml
