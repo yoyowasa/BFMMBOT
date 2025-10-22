@@ -148,10 +148,6 @@ cd "E:\BF-MMBOT"
 poetry shell
 
 
-git add -A         
-
-# コミット
-git commit -m "chore: bulk update after lint & format"
-
-# プッシュ
-git push
+git add -A
+git commit -m "chore: initial upload"   # ←必ずメッセージを入れる
+git push  
