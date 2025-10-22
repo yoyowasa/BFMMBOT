@@ -587,7 +587,15 @@ class PaperEngine:
             lines.append(orjson.dumps(entry).decode("utf-8"))
         if not lines:
             return
-        with self._hb_path.open("a", encoding="utf-8") as fh:
+        # JST日付タグ(YYYYMMDD)で心拍ファイル名を自動決定
+        try:
+            jst = timezone(timedelta(hours=9))
+            tag = now.astimezone(jst).strftime("%Y%m%d")
+            hb_path = Path(f"logs/runtime/{tag}heartbeat.ndjson")
+        except Exception:
+            hb_path = self._hb_path
+        hb_path.parent.mkdir(parents=True, exist_ok=True)
+        with hb_path.open("a", encoding="utf-8") as fh:
             for line in lines:
                 fh.write(line + "\n")
 
@@ -728,7 +736,26 @@ class PaperEngine:
         logger.info(
             f"paper start: product={self.product} strategy={self.strat.name} strategies={self.strategies}"
         )
-        paper_meta_path = Path("logs/runtime/paper_start.ndjson")
+        # JST日付タグでNDJSONログ名を自動付与
+        _date_tag = _now_utc().astimezone(timezone(timedelta(hours=9))).strftime("%Y%m%d")
+        self._date_tag = _date_tag
+        # Heartbeatファイル
+        self._hb_path = Path(f"logs/runtime/{_date_tag}heartbeat.ndjson")
+        self._hb_path.parent.mkdir(parents=True, exist_ok=True)
+        # NDJSONミラー（日付付き）
+        try:
+            if getattr(self, "order_log", None) is not None and getattr(self.order_log, "_mirror", None) is not None:
+                self.order_log._mirror = Path(f"logs/orders/{_date_tag}order_log.ndjson")
+                self.order_log._mirror.parent.mkdir(parents=True, exist_ok=True)
+            if getattr(self, "trade_log", None) is not None and getattr(self.trade_log, "_mirror", None) is not None:
+                self.trade_log._mirror = Path(f"logs/trades/{_date_tag}trade_log.ndjson")
+                self.trade_log._mirror.parent.mkdir(parents=True, exist_ok=True)
+            if getattr(self, "decision_log", None) is not None and getattr(self.decision_log, "_mirror", None) is not None:
+                self.decision_log._mirror = Path(f"logs/analytics/{_date_tag}decision_log.ndjson")
+                self.decision_log._mirror.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        paper_meta_path = Path(f"logs/runtime/{_date_tag}paper_start.ndjson")
         paper_meta_path.parent.mkdir(parents=True, exist_ok=True)
         features_obj = getattr(self.cfg, "features", None)
         if features_obj is None:

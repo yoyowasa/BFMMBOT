@@ -203,7 +203,20 @@ def _hb_write(hb_path, **fields):
 
     # 何をするか：ndjsonとして1行追記
     try:
-        p = Path(hb_path)
+        ts_val = fields.get("ts")
+        if isinstance(ts_val, str):
+            try:
+                now_dt = datetime.fromisoformat(ts_val.replace("Z", "+00:00"))
+            except Exception:
+                now_dt = _now_utc()
+        elif isinstance(ts_val, datetime):
+            now_dt = ts_val
+        else:
+            now_dt = _now_utc()
+        # JST日付タグ(YYYYMMDD)で心拍ファイル名を自動決定
+        jst = timezone(timedelta(hours=9))
+        tag = now_dt.astimezone(jst).strftime("%Y%m%d")
+        p = Path(f"logs/runtime/{tag}heartbeat.ndjson")
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as f:
             f.write(json.dumps(fields, ensure_ascii=False) + "\n")

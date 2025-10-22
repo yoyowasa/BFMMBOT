@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 from bisect import bisect_right  # 直前の意思決定(ts)を2秒以内で探すのに使う
+from math import isfinite  # 実数判定（NaN/infを除外するために使う）
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -31,11 +32,11 @@ def parse_ts(v):
     return None
 
 
-def load_ndjson(path: Path):
+def load_ndjson(path: Path | None):
     """[関数] NDJSONを安全に読み込む（壊れ行はスキップして落ちないように）。
     何をする？ → 1行=1イベントのJSONをPythonの辞書にして並べます。"""
     rows = []
-    if not path.exists():
+    if not path or not path.exists():
         return rows
     with path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -58,6 +59,19 @@ def ts_range(rows, key="ts"):
     if not ts_list:
         return None, None, 0
     return min(ts_list), max(ts_list), len(ts_list)
+
+
+def _find_latest(base: Path, pattern: str):
+    """[関数] ディレクトリ内でパターンにマッチするNDJSONの“更新日時が最新”を返す。
+    何をする？ → 1022など日付接頭辞に依らず、自動で最新ファイルを選びます。"""
+    cands = list(base.glob(pattern))
+    if not cands:
+        return None
+    try:
+        cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    except Exception:
+        cands.sort()
+    return cands[0]
 
 
 def load_yaml(path: Path) -> dict:
@@ -180,9 +194,13 @@ def associate_trades_with_decisions(trades: list[dict], decisions: list[dict], w
             continue
         dt_ms = (ts - per_ts[s][idx]).total_seconds() * 1000.0
         if dt_ms <= window_ms:
+            px = _safe_float(r.get("px")) or _safe_float(r.get("price"))  # 実現bp算出の分母（名目）
+            sz = _safe_float(r.get("sz")) or _safe_float(r.get("size"))   # 実現bp算出の分母（名目）
             pairs.append({
                 "strategy": s,
                 "pnl": pnl,
+                "px": px,   # 実現bp用
+                "sz": sz,   # 実現bp用
                 "win": pnl > 0,
                 "feats": per[s][idx][1],
             })
@@ -277,6 +295,90 @@ def diagnose_quality(pairs: list[dict], min_bucket_n: int = 20):
                 lines.append(f"  ・{key}: {worst[3]} は“要注意” → 勝率 {worst[0]:.1f}pt（{worst[2]}件）")
     return lines
 
+
+# ---------- 期待エッジの校正（expected vs realized） ----------
+
+def _realized_edge_bp(pnl, px, sz):
+    """[関数] 実現エッジ[bp]を計算する。
+    何をする？ → pnl を名目(|px|×|sz|)で割って bp換算し、データ不足は None を返す。"""
+    try:
+        if pnl is None or px is None or sz is None:
+            return None
+        denom = abs(float(px)) * abs(float(sz))
+        if denom <= 0:
+            return None
+        return float(pnl) / denom * 10_000.0
+    except Exception:
+        return None
+
+
+def _quantile_edges(vals: list[float], k: int):
+    """[関数] k分位の境界値（k-1個）を返す。
+    何をする？ → デシル(k=10)や四分位(k=4)の境目を作る。"""
+    v = sorted([x for x in vals if x is not None and isfinite(x)])
+    n = len(v)
+    if n == 0:
+        return None
+    edges = []
+    for j in range(1, k):
+        edges.append(v[int((n - 1) * (j / k))])
+    return edges
+
+
+def calibrate_expected_edge(pairs: list[dict], min_per_bin: int = 15):
+    """[関数] expected_edge_bp の分位ビンごとに、実現bpの平均とバイアス(実現−期待)を要約する。
+    何をする？ → 期待が“盛りすぎ/控えめ”かを短文で返す。データが多ければデシル、少なければ四分位で実施。"""
+    rows = []
+    for r in pairs:
+        ee = r["feats"].get("expected_edge_bp") if r.get("feats") else None
+        rbp = _realized_edge_bp(r.get("pnl"), r.get("px"), r.get("sz"))
+        if ee is None or rbp is None:
+            continue
+        rows.append((float(ee), float(rbp), r.get("strategy", "unknown")))
+    if len(rows) < max(8, min_per_bin * 4):
+        return [
+            "校正対象が不足（decision↔trade対応のうち expected_edge_bp/実現bp が揃った件が少ない）"
+        ]
+
+    K = 10 if len(rows) >= 100 else 4
+    edges = _quantile_edges([ee for ee, _, _ in rows], K)
+    if not edges:
+        return ["分位境界を作れませんでした"]
+
+    def _bin_name(x, edges):
+        idx = 0
+        while idx < len(edges) and x > edges[idx]:
+            idx += 1
+        return ("D" if K == 10 else "Q") + str(idx + 1)
+
+    bucket = {}
+    by_strat = {}
+    for ee, rbp, strat in rows:
+        name = _bin_name(ee, edges)
+        st = bucket.setdefault(name, {"n": 0, "ee": 0.0, "rbp": 0.0})
+        st["n"] += 1
+        st["ee"] += ee
+        st["rbp"] += rbp
+        by_strat.setdefault(strat, 0)
+        by_strat[strat] += 1
+
+    names_sorted = sorted(bucket.keys(), key=lambda s: int(s[1:]))
+    lines = []
+    lines.append(f"- 分位: {('デシル(10分割)' if K==10 else '四分位(4分割)')}・最小{min_per_bin}件/ビンで集計")
+    for name in names_sorted:
+        st = bucket[name]
+        if st["n"] < min_per_bin:
+            continue
+        ee_avg = st["ee"] / st["n"]
+        rbp_avg = st["rbp"] / st["n"]
+        bias = rbp_avg - ee_avg
+        verdict = "≒一致" if abs(bias) < 0.5 else ("期待>実現（楽観）" if bias < 0 else "期待<実現（控えめ）")
+        lines.append(
+            f"  ・{name}: 期待{ee_avg:.2f}bp → 実現{rbp_avg:.2f}bp（差 {bias:+.2f}bp）＝{verdict} [n={st['n']}]"
+        )
+    if len(lines) == 1:
+        return ["有効なビンがありません（閾値 min_per_bin を下げると出ます）"]
+    return lines
 
 # ---------- KPI計算 ----------
 
@@ -433,11 +535,12 @@ def main():
     min_bucket_n = int(analytics_cfg.get("min_bucket_n", 20))
 
     base = args.dir
-    f_heartbeat = base / "1022heartbeat.ndjson"
-    f_paper_start = base / "1022paper_start.ndjson"
-    f_order_log = base / "1022order_log.ndjson"
-    f_trade_log = base / "1022trade_log.ndjson"
-    f_decision = base / "1022decision_log.ndjson"
+    # 日付接頭辞に依存せず、最新のファイルを自動検出
+    f_heartbeat = _find_latest(base, "*heartbeat*.ndjson")
+    f_paper_start = _find_latest(base, "*paper_start*.ndjson")
+    f_order_log = _find_latest(base, "*order_log*.ndjson")
+    f_trade_log = _find_latest(base, "*trade_log*.ndjson")
+    f_decision = _find_latest(base, "*decision_log*.ndjson")
 
     hb = load_ndjson(f_heartbeat)
     ps = load_ndjson(f_paper_start)
@@ -538,6 +641,12 @@ def main():
 
     print("\n【品質診断（戦略の“効き所／要注意”）】")
     for ln in qlines:
+        print(ln)
+
+    # 期待エッジの校正（expected vs realized）：データが多ければデシル、少なければ四分位
+    cal_lines = calibrate_expected_edge(pairs, min_per_bin=max(15, min_bucket_n))  # 運用に合わせて最小件数をYAML値で連動
+    print("\n【エッジ校正（expected_edge_bp ↔ 実現bp）】")
+    for ln in cal_lines:
         print(ln)
 
     print(

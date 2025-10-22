@@ -4,3 +4,7 @@
 """
 __version__ = "0.1.0"  # Poetryのversionと合わせる（文書の最小例に準拠）
 
+try:
+    import src._date_stamped_logs  # noqa: F401
+except Exception:
+    pass
