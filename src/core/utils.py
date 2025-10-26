@@ -52,6 +52,7 @@ class FeaturesCfg(BaseModel):
     stall_T_ms: int | None = None
     ca_ratio_win_ms: int | None = None
     ca_threshold: float | None = None
+    stall_ttl_ms: int | None = None
     min_spread_tick: int | None = None
     ttl_ms: int | None = None
     age_ms: int | None = None
