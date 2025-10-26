@@ -196,6 +196,13 @@ class PaperEngine:
         self._day_start_utc = jst_midnight.astimezone(timezone.utc)  # 【関数】当日JST 0時（UTC）
         self._daily_R, self._R_HWM = 0.0, 0.0  # 【関数】日次PnLとそのHWM（DD計算に使用）
 
+    def _ts_jst(self, dt: datetime) -> str:
+        """ログ用のJST ISO文字列を返す（タイムゾーン未指定ならUTC扱い）。"""
+        if getattr(dt, "tzinfo", None) is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(self._JST).isoformat()
+
+
         # 30秒ミッド履歴（ガード用）：(epoch_sec, mid)
         self._midwin: Deque[Tuple[float, float]] = deque()
 
@@ -555,7 +562,7 @@ class PaperEngine:
         _features["corr_id"] = corr_id  # 何をするか：features_json内に相関IDを残す
 
         decision_record = {
-            "ts": now.isoformat(),
+            "ts": self._ts_jst(now),
             "strategy": (current_strategy_ctx.get() or self.strat.name),
             "decision": decision,
             "features": _features,
@@ -581,7 +588,7 @@ class PaperEngine:
         eff_limit = self.effective_inventory_limit()
         inventory_guard = eff_limit is not None and abs(self.Q) >= float(eff_limit)
         payload = {
-            "ts": now.isoformat(),
+            "ts": self._ts_jst(now),
             "event": event,           # "place" / "fill" / "pause" など直近イベント
             "reason": reason,         # "inventory_guard" / "midmove_guard" / "maintenance" / "funding" など
             "strategy": getattr(self.strat, "strategy_name", None) or self.strat.name,
@@ -817,7 +824,7 @@ class PaperEngine:
                 fh.write(
                     orjson.dumps(
                         {
-                            "ts": _now_utc().isoformat(),
+                            "ts": self._ts_jst(_now_utc()),
                             "event": "start",
                             "mode": "paper",
                             "product": self.product,
@@ -847,7 +854,7 @@ class PaperEngine:
                     if hit:
                         for o in self.sim.cancel_by_tag("stall"):
                             self.order_log.add(
-                                ts=now.isoformat(),
+                                ts=self._ts_jst(now),
                                 action="cancel",
                                 tif=o.tif,
                                 ttl_ms=o.ttl_ms,
@@ -860,7 +867,7 @@ class PaperEngine:
                             )
                         for o in self.sim.cancel_by_tag("ca_gate"):
                             self.order_log.add(
-                                ts=now.isoformat(),
+                                ts=self._ts_jst(now),
                                 action="cancel",
                                 tif=o.tif,
                                 ttl_ms=o.ttl_ms,
@@ -890,7 +897,7 @@ class PaperEngine:
                     if self._in_maintenance(now):
                         for o in self.sim.cancel_by_tag("stall"):
                             self.order_log.add(
-                                ts=now.isoformat(),
+                                ts=self._ts_jst(now),
                                 action="cancel",
                                 tif=o.tif,
                                 ttl_ms=o.ttl_ms,
@@ -903,7 +910,7 @@ class PaperEngine:
                             )
                         for o in self.sim.cancel_by_tag("ca_gate"):
                             self.order_log.add(
-                                ts=now.isoformat(),
+                                ts=self._ts_jst(now),
                                 action="cancel",
                                 tif=o.tif,
                                 ttl_ms=o.ttl_ms,
@@ -921,7 +928,7 @@ class PaperEngine:
                     if self._in_funding_calc(now) or self._in_funding_transfer(now):
                         for o in self.sim.cancel_by_tag("stall"):
                             self.order_log.add(
-                                ts=now.isoformat(),
+                                ts=self._ts_jst(now),
                                 action="cancel",
                                 tif=o.tif,
                                 ttl_ms=o.ttl_ms,
@@ -934,7 +941,7 @@ class PaperEngine:
                             )  # 【関数】Funding窓で停止
                         for o in self.sim.cancel_by_tag("ca_gate"):
                             self.order_log.add(
-                                ts=now.isoformat(),
+                                ts=self._ts_jst(now),
                                 action="cancel",
                                 tif=o.tif,
                                 ttl_ms=o.ttl_ms,
@@ -951,7 +958,7 @@ class PaperEngine:
                     # TTL失効を処理（取消ログ）
                     for o in self.sim.on_time(now):
                         self.order_log.add(
-                            ts=now.isoformat(),
+                            ts=self._ts_jst(now),
                             action="cancel",
                             tif=o.tif,
                             ttl_ms=o.ttl_ms,
@@ -970,7 +977,7 @@ class PaperEngine:
                     if paused:
                         for o in self.sim.cancel_by_tag("stall"):
                             self.order_log.add(
-                                ts=now.isoformat(),
+                                ts=self._ts_jst(now),
                                 action="cancel",
                                 tif=o.tif,
                                 ttl_ms=o.ttl_ms,
@@ -983,7 +990,7 @@ class PaperEngine:
                             )
                         for o in self.sim.cancel_by_tag("ca_gate"):
                             self.order_log.add(
-                                ts=now.isoformat(),
+                                ts=self._ts_jst(now),
                                 action="cancel",
                                 tif=o.tif,
                                 ttl_ms=o.ttl_ms,
@@ -1005,7 +1012,7 @@ class PaperEngine:
                         close_only_mode = True
                         for o in self.sim.cancel_by_tag("stall"):
                             self.order_log.add(
-                                ts=now.isoformat(),
+                                ts=self._ts_jst(now),
                                 action="cancel",
                                 tif=o.tif,
                                 ttl_ms=o.ttl_ms,
@@ -1018,7 +1025,7 @@ class PaperEngine:
                             )  # 何を/なぜ記録したか（在庫上限）
                         for o in self.sim.cancel_by_tag("ca_gate"):
                             self.order_log.add(
-                                ts=now.isoformat(),
+                                ts=self._ts_jst(now),
                                 action="cancel",
                                 tif=o.tif,
                                 ttl_ms=o.ttl_ms,
@@ -1131,7 +1138,7 @@ class PaperEngine:
                                     (getattr(o, "_corr_id", None) or current_corr_ctx.get() or "-"),
                                 )
                                 self.order_log.add(
-                                    ts=now.isoformat(),
+                                    ts=self._ts_jst(now),
                                     action="place",
                                     tif=o.tif,
                                     ttl_ms=o.ttl_ms,
@@ -1157,7 +1164,7 @@ class PaperEngine:
                                         (getattr(o, "_corr_id", None) or current_corr_ctx.get() or "-"),
                                     )
                                     self.order_log.add(
-                                        ts=now.isoformat(),
+                                        ts=self._ts_jst(now),
                                         action="cancel",
                                         tif=o.tif,
                                         ttl_ms=o.ttl_ms,
@@ -1183,7 +1190,7 @@ class PaperEngine:
                     # TTLチェックをもう一度（成約後の期限切れ）
                     for o in self.sim.on_time(now):
                         self.order_log.add(
-                            ts=now.isoformat(),
+                            ts=self._ts_jst(now),
                             action="cancel",
                             tif=o.tif,
                             ttl_ms=o.ttl_ms,
