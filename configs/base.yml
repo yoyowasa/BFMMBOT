@@ -12,14 +12,27 @@ size:  # 取引サイズの下限と既定値
   default: 0.01  # 既定ロット（最初は小さく）
 
 risk:  # リスク上限と非常停止（Kill-Switch）
-  max_inventory: 0.2  # 在庫の絶対上限（BTC）
+  max_inventory: 0.05  # 在庫の絶対上限（BTC）
   inventory_eps: 0.002  # 上限の手前に置く安全マージン（単位=ベース通貨）。この分だけ手前で新規をブロックする
   kill:
     daily_pnl_jpy: -30000  # 日次損益がこの値を下回ったら停止
     max_dd_jpy: -20000     # ドローダウンがこの値を下回ったら停止
 
 guard:  # ガードレール（相場が速すぎる時は出さない）
-  max_mid_move_bp_30s: 25  # 直近30sのミッド変化が25bp超なら停止/縮小
+  max_mid_move_bp_30s: 25
+  feed_health:  # WS/Heartbeat鮮度ガード
+    age_ms:
+      caution: 3000
+      halted: 10000
+    heartbeat_gap_sec:
+      caution: 3
+      halted: 10
+    recover_ok_consecutive: 2
+    cooldown_sec: 10
+  caution:
+    max_order_size: 0.003
+    max_order_rate_per_sec: 2
+  # 直近30sのミッド変化が25bp超なら停止/縮小
 
 mode_switch:  # “窓”の扱い。メンテ時間/ファンディング計算時刻の前後で挙動変更
   maintenance: { start: "04:00:00", end: "04:10:00", action: "pause" }  # JSTの例
@@ -103,8 +116,27 @@ strategies:
   # - zero_reopen_pop      # #7 0→再拡大ポップ：スプレッド0の直後、再拡大の1拍を取る（試験用・普段はOFF）
 
 logging:  # ログ出力の基本設定
-  level: INFO     # paper既定はINFO（paper.ymlでDEBUGに上書き予定）
+  level: DEBUG     # paperデフォルトは詳細ログ
   rotate_mb: 128  # ログローテーションの閾値（MB）
   run_log_template: logs/runtime/run.log  # 何をする設定か：共通run.logの出力先テンプレート
   strategy_log_template: null  # 何をする設定か：戦略専用ログのテンプレート（nullで無効）
   strategy_level: null  # 何をする設定か：戦略専用ログのレベル（nullならlevelを流用）
+strategy_cfg:
+  stall_then_strike:
+    size:
+      default: 0.003
+  cancel_add_gate:
+    size:
+      default: 0.007
+env_overrides:
+  live:
+    env: live
+    size:
+      default: 0.001
+    risk:
+      max_inventory: 0.1
+    guard:
+      max_mid_move_bp_30s: 10
+    logging:
+      level: INFO
+

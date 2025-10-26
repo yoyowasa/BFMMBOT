@@ -125,7 +125,7 @@ def resolve_config_paths(config_path: str | os.PathLike[str]) -> tuple[Path, Pat
 
 # ─────────────────────────────────────────────────────────────
 # 【関数】設定ローダー：base.yml＋指定yml を合成し、Pydantic で型検査した Config を返す
-def load_config(config_path: str | os.PathLike[str]) -> Config:
+def load_config(config_path: str | os.PathLike[str], *, env: str | None = None) -> Config:
     """
     使い方：
       from src.core.utils import load_config
@@ -138,6 +138,20 @@ def load_config(config_path: str | os.PathLike[str]) -> Config:
     base = _read_yaml(base_path) if cfg_path.name != "base.yml" else {}
     override = _read_yaml(cfg_path)
     merged = deep_merge(base, override)
+
+    env_profiles = merged.pop("env_overrides", None)
+    if env_profiles is None:
+        env_profiles = merged.pop("env_profiles", None)
+
+    effective_env = env or merged.get("env")
+    if env is not None:
+        merged["env"] = env
+
+    if isinstance(env_profiles, Mapping) and effective_env:
+        env_override = env_profiles.get(effective_env)
+        if isinstance(env_override, Mapping):
+            merged = deep_merge(merged, env_override)
+
     return Config.model_validate(merged)
 
 

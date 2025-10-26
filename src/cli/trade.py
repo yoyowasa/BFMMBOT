@@ -93,6 +93,11 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run paper trading (real-time)")
     p.add_argument("--config", required=True, help="configs/paper.yml など")
     p.add_argument(
+        "--env",
+        choices=["paper", "live", "backtest"],
+        help=" CLIからenvを直接切り替える。未指定なら設定ファイルのenvを使用。",
+    )
+    p.add_argument(
         "--strategy",
         nargs="*",
         default=None,
@@ -108,7 +113,7 @@ def main() -> None:
     """【関数】エントリ：設定を読み、paperエンジンを走らせる"""
     load_dotenv(find_dotenv())  # 何をするか：プロジェクト直下の .env を読み込んでから run_live を呼ぶ
     args = _parse_args()
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, env=args.env)
     strategy_cfg = _cfg_get(cfg, "strategy_cfg", None)
 
     raw_cli = getattr(args, "strategy", None)
