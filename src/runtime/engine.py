@@ -460,53 +460,35 @@ class PaperEngine:
         return False
 
     def _roll_daily(self, now: datetime) -> None:
-        # 日次ロール: JST日付タグが変わったらNDJSONファイルを日付ごとに切り替える
+        # 日次ロール: JST日付タグの変化に合わせてNDJSONファイルを切り替える
         try:
-            
-jst = timezone(timedelta(hours=9))
-            
-tag = now.astimezone(jst).strftime("%Y%m%d")
+            jst = timezone(timedelta(hours=9))
+            tag = now.astimezone(jst).strftime("%Y%m%d")
         except Exception:
-            
-tag = None
+            tag = None
         prev_tag = getattr(self, "_date_tag", None)
         if tag and tag != prev_tag:
-            
-self._date_tag = tag
-            
-self._hb_path = Path(f"logs/runtime/{tag}heartbeat.ndjson")
-            
-self._hb_path.parent.mkdir(parents=True, exist_ok=True)
-            
-try:
-                
-if getattr(self, "order_log", None) is not None and getattr(self.order_log, "_mirror", None) is not None:
-                    
-self.order_log._mirror = Path(f"logs/orders/{tag}order_log.ndjson")
-                    
-self.order_log._mirror.parent.mkdir(parents=True, exist_ok=True)
-                
-if getattr(self, "trade_log", None) is not None and getattr(self.trade_log, "_mirror", None) is not None:
-                    
-self.trade_log._mirror = Path(f"logs/trades/{tag}trade_log.ndjson")
-                    
-self.trade_log._mirror.parent.mkdir(parents=True, exist_ok=True)
-                
-if getattr(self, "decision_log", None) is not None and getattr(self.decision_log, "_mirror", None) is not None:
-                    
-self.decision_log._mirror = Path(f"logs/analytics/{tag}decision_log.ndjson")
-                    
-self.decision_log._mirror.parent.mkdir(parents=True, exist_ok=True)
-            
-except Exception as e:
-                
-logger.warning(f"ndjson rollover failed: {e}")
+            self._date_tag = tag
+            self._hb_path = Path(f"logs/runtime/{tag}heartbeat.ndjson")
+            self._hb_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if getattr(self, "order_log", None) is not None and getattr(self.order_log, "_mirror", None) is not None:
+                    self.order_log._mirror = Path(f"logs/orders/{tag}order_log.ndjson")
+                    self.order_log._mirror.parent.mkdir(parents=True, exist_ok=True)
+                if getattr(self, "trade_log", None) is not None and getattr(self.trade_log, "_mirror", None) is not None:
+                    self.trade_log._mirror = Path(f"logs/trades/{tag}trade_log.ndjson")
+                    self.trade_log._mirror.parent.mkdir(parents=True, exist_ok=True)
+                if getattr(self, "decision_log", None) is not None and getattr(self.decision_log, "_mirror", None) is not None:
+                    self.decision_log._mirror = Path(f"logs/analytics/{tag}decision_log.ndjson")
+                    self.decision_log._mirror.parent.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                logger.warning(f"ndjson rollover failed: {e}")
         jst = now.astimezone(self._JST)
         jst_mid = jst.replace(hour=0, minute=0, second=0, microsecond=0)
         day_start_utc = jst_mid.astimezone(timezone.utc)
         if day_start_utc != self._day_start_utc:
             self._day_start_utc = day_start_utc
-            self._daily_R, self._R_HWM = 0.0, 0.0  # 新しい日としてリセット
+            self._daily_R, self._R_HWM = 0.0, 0.0  # 新しい一日としてリセット
 
     def _maybe_trigger_kill(self) -> tuple[bool, str | None, float, float]:
         """【関数】Kill判定：Trueなら停止（理由, 日次R, 日次DDを返す）"""
