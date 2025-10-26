@@ -184,6 +184,8 @@ class PaperEngine:
 
         self._hb_path.parent.mkdir(parents=True, exist_ok=True)  # 親フォルダを用意
         self._midguard_paused = False  # 直近の“ミッド変化ガード”状態を持つ
+        # Sliding 30s mid-price window for guard (epoch_sec, mid)
+        self._midwin: Deque[Tuple[float, float]] = deque()
 
 
         # PnL最小モデルの内部状態（自炊Q/A/Rのミニ版）
@@ -203,8 +205,6 @@ class PaperEngine:
         return dt.astimezone(self._JST).isoformat()
 
 
-        # 30秒ミッド履歴（ガード用）：(epoch_sec, mid)
-        self._midwin: Deque[Tuple[float, float]] = deque()
 
     def effective_inventory_limit(self) -> float | None:
         """【関数】新規発注の可否判定に使う実効在庫上限（上限−安全マージン）を返す"""
