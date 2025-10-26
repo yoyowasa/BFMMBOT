@@ -40,6 +40,7 @@ features:  # 戦略のしきい値（#1/#2 の主材料）
   ca_threshold: 1.25       # #2 C/Aゲート：Cancel/Add 閾値（以下ならOK）
   min_spread_tick: 1       # 最低スプレッド（tick）
   ttl_ms: 900              # オーダーの寿命（ms）
+  stall_ttl_ms: 650        # STだけ寿命を短く（初動の一拍を狙って長居しない）
   age_ms: 200              # Age×MP（OFF時も計算は可能）
   mp_offset_tick: 1.0      # Micropriceオフセット（tick）
   tiny_prints_N: 20        # Tiny-Prints集計N（OFFの初期値）
