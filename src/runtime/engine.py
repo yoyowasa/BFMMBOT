@@ -1,4 +1,4 @@
-# src/runtime/engine.py
+﻿# src/runtime/engine.py
 # 役割：リアルタイムの“paper実行”エンジン（WS→ローカル板→戦略→最小シミュ→ログ保存）
 # - 【関数】run_paper：WSイベントを流し込み、#1/#2戦略を評価→発注/取消→Fill反映→ログ保存
 # - 【関数】_guard_midmove_bp：30秒のミッド変化(bps)を監視し、閾値超なら新規停止＋全取消
@@ -460,7 +460,47 @@ class PaperEngine:
         return False
 
     def _roll_daily(self, now: datetime) -> None:
-        """【関数】日次境界（JST）を跨いだら R_day/HWM をリセット"""
+        # 日次ロール: JST日付タグが変わったらNDJSONファイルを日付ごとに切り替える
+        try:
+            
+jst = timezone(timedelta(hours=9))
+            
+tag = now.astimezone(jst).strftime("%Y%m%d")
+        except Exception:
+            
+tag = None
+        prev_tag = getattr(self, "_date_tag", None)
+        if tag and tag != prev_tag:
+            
+self._date_tag = tag
+            
+self._hb_path = Path(f"logs/runtime/{tag}heartbeat.ndjson")
+            
+self._hb_path.parent.mkdir(parents=True, exist_ok=True)
+            
+try:
+                
+if getattr(self, "order_log", None) is not None and getattr(self.order_log, "_mirror", None) is not None:
+                    
+self.order_log._mirror = Path(f"logs/orders/{tag}order_log.ndjson")
+                    
+self.order_log._mirror.parent.mkdir(parents=True, exist_ok=True)
+                
+if getattr(self, "trade_log", None) is not None and getattr(self.trade_log, "_mirror", None) is not None:
+                    
+self.trade_log._mirror = Path(f"logs/trades/{tag}trade_log.ndjson")
+                    
+self.trade_log._mirror.parent.mkdir(parents=True, exist_ok=True)
+                
+if getattr(self, "decision_log", None) is not None and getattr(self.decision_log, "_mirror", None) is not None:
+                    
+self.decision_log._mirror = Path(f"logs/analytics/{tag}decision_log.ndjson")
+                    
+self.decision_log._mirror.parent.mkdir(parents=True, exist_ok=True)
+            
+except Exception as e:
+                
+logger.warning(f"ndjson rollover failed: {e}")
         jst = now.astimezone(self._JST)
         jst_mid = jst.replace(hour=0, minute=0, second=0, microsecond=0)
         day_start_utc = jst_mid.astimezone(timezone.utc)

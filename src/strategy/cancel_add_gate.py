@@ -1,4 +1,4 @@
-# src/strategy/cancel_add_gate.py
+﻿# src/strategy/cancel_add_gate.py
 # 役割：#2 キャンセル比ゲート（Best層の C/A 比が低い＝落ち着いた時だけ片面で出す）
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ class CancelAddGate(StrategyBase):
         self.cfg = cfg
         self._strategy_cfg = strategy_cfg
 
+        self._inventory = 0.0  # 現在の在庫（Fillで更新）
     @staticmethod
     def _value_from(node, *keys):
         current = node
@@ -49,6 +50,26 @@ class CancelAddGate(StrategyBase):
                 return base_default
         return 0.01
 
+    def on_fill(self, ob: OrderBook, fill: Any):
+        """在庫をFillで更新する（BUYで+、SELLで-）。既存のロジックに影響を与えない。"""
+        try:
+            side = getattr(fill, "side", None) if not isinstance(fill, dict) else (fill.get("side") or fill.get("action"))
+            sz = None
+            if isinstance(fill, dict):
+                sz = fill.get("sz") if fill.get("sz") is not None else fill.get("size")
+            else:
+                sz = getattr(fill, "sz", None) if getattr(fill, "sz", None) is not None else getattr(fill, "size", None)
+            qty = float(sz or 0.0)
+            if side is not None and qty:
+                s = str(side).lower()
+                if s in ("buy", "bid", "b"):
+                    self._inventory = float(getattr(self, "_inventory", 0.0)) + qty
+                elif s in ("sell", "ask", "s"): 
+                    self._inventory = float(getattr(self, "_inventory", 0.0)) - qty
+        except Exception:
+            pass
+        return []
+
     def evaluate(self, ob: OrderBook, now: datetime, cfg) -> List[Dict[str, Any]]:
         # 設定（無ければ文書の最小値にフォールバック）
         feats = getattr(cfg, "features", None)
@@ -65,7 +86,48 @@ class CancelAddGate(StrategyBase):
             return [{"type": "cancel_tag", "tag": "ca_gate"}]
 
         # 直近windowのBest層 C/A 比を取得（adds<=0なら∞扱い）
+        # 在庫帯のブレーキ（負けゾーンは新規発注しない）
+        _feats = getattr(cfg, "features", None)
+        _feats = (_feats if _feats is not None else (cfg.get("features") if isinstance(cfg, Mapping) else None))
+        _blk_min = (getattr(_feats, "ca_gate_block_min_abs_inv", None) if _feats is not None else None)
+        if _blk_min is None and isinstance(_feats, Mapping): _blk_min = _feats.get("ca_gate_block_min_abs_inv")
+        _blk_max = (getattr(_feats, "ca_gate_block_max_abs_inv", None) if _feats is not None else None)
+        if _blk_max is None and isinstance(_feats, Mapping): _blk_max = _feats.get("ca_gate_block_max_abs_inv")
+        try:
+            inv_abs = abs(float(getattr(self, "_inventory", 0.0) or 0.0))
+        except Exception:
+            inv_abs = 0.0
+        if _blk_min is not None and _blk_max is not None:
+            try:
+                if inv_abs >= float(_blk_min) and inv_abs < float(_blk_max):
+                    return [{"type": "cancel_tag", "tag": "ca_gate"}]
+            except Exception:
+                pass
+
         ratio = ob.ca_ratio(now, window_ms=win_ms)
+        # 可変しきい値 θ（在庫帯に応じて調整）
+        try:
+            abs_inv = abs(float(getattr(self, "_inventory", 0.0) or 0.0))
+        except Exception:
+            abs_inv = 0.0
+        _rules = None
+        if feats is not None:
+            _rules = getattr(feats, "ca_threshold_by_abs_inv", None)
+            if _rules is None and isinstance(feats, Mapping): _rules = feats.get("ca_threshold_by_abs_inv")
+        if _rules:
+            try:
+                for b in _rules:
+                    _mx = None; _th = None
+                    if isinstance(b, Mapping):
+                        _mx = b.get("max_abs_inv"); _th = b.get("theta")
+                    else:
+                        _mx = getattr(b, "max_abs_inv", None); _th = getattr(b, "theta", None)
+                    if _mx is None or _th is None: continue
+                    if abs_inv <= float(_mx):
+                        theta = float(_th); break
+            except Exception:
+                pass
+
         if ratio <= theta and spread_ticks >= min_sp:  # C/Aゲート: 最低スプレッドtickを設定値で制御（0〜1tick帯は通さない）
             # MP寄り側にリーン：MP≥mid→sell側、MP<mid→buy側
             mid = (ob.best_bid.price + ob.best_ask.price) / 2.0

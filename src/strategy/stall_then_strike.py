@@ -210,6 +210,14 @@ class StallThenStrike(StrategyBase):
             except Exception:
                 buy_filter_mid_change = None
 
+        ttl_st = getattr(feats, "stall_ttl_ms", None)
+        if ttl_st is None:
+            ttl_st = getattr(cfg, "stall_ttl_ms", None)
+        try:
+            ttl_st = int(ttl_st)
+        except Exception:
+            ttl_st = ttl_ms
+
         decision_features = {
             "stall_mid_change_bp": mid_change_bp,
             "stall_ttl_selected_ms": ttl_ms,
@@ -261,7 +269,7 @@ class StallThenStrike(StrategyBase):
                                 price=mid + 1 * tick,
                                 size=lot,
                                 tif="GTC",
-                                ttl_ms=ttl_ms,
+                                ttl_ms=ttl_st,
                                 tag="stall",
                             ),
                         }
@@ -275,7 +283,7 @@ class StallThenStrike(StrategyBase):
                         price=mid - 1 * tick,
                         size=lot,
                         tif="GTC",
-                        ttl_ms=ttl_ms,
+                        ttl_ms=ttl_st,
                         tag="stall",
                     ),
                 },
@@ -286,7 +294,7 @@ class StallThenStrike(StrategyBase):
                         price=mid + 1 * tick,
                         size=lot,
                         tif="GTC",
-                        ttl_ms=ttl_ms,
+                        ttl_ms=ttl_st,
                         tag="stall",
                     ),
                 },

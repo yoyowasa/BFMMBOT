@@ -1,4 +1,4 @@
-# configs/live.yml：本番環境で base.yml を必要最小限だけ“上書き”
+﻿# configs/live.yml：本番環境で base.yml を必要最小限だけ“上書き”
 env: live                  # 何をするか：liveモード指定
 product_code: FX_BTC_JPY   # 何をするか：取引銘柄を指定（WS購読とRESTの対象）
 tick_size: 1               # 何をするか：価格の最小刻み（JPYは1円）
@@ -22,8 +22,8 @@ risk:
 
   max_active_orders: 2     # 何をするか：同時に生きてよい注文の上限
   kill:
-    daily_pnl_jpy: -30000  # 何をするか：当日実現PnLがこの額以下なら Kill（全取消→停止）
-    max_dd_jpy: -20000     # 何をするか：当日HWMからの落差（DD）がこの額以上なら Kill
+    daily_pnl_jpy: -15000  # 何をするか：当日実現PnLがこの額以下なら Kill（全取消→停止）
+    max_dd_jpy: -10000     # 何をするか：当日HWMからの落差（DD）がこの額以上なら Kill
 
 guard:
   max_mid_move_bp_30s: 10  # 何をするか：30秒のミッド変化が25bp(0.25%)以上なら“いまは我慢”
@@ -49,6 +49,13 @@ logging:
   heartbeat_status_sec: 5  # 何をするか：心拍（status）出力間隔
   rotate_mb: 128           # 何をするか：run.log をこのサイズ(MB)でローテーション
 
+features:
+  stall_ttl_ms: 650        # STだけ寿命を短く
+  ca_threshold_by_abs_inv:
+    - {max_abs_inv: 0.02, theta: 1.30}  # small inventory: looser
+    - {max_abs_inv: 0.04, theta: 1.25}  # medium-small: baseline
+    - {max_abs_inv: 0.08, theta: 1.20}  # larger: stricter
+    - {max_abs_inv: 1.00, theta: 1.18}  # very large: safest
 strategy_cfg:
   stall_then_strike:
     size:

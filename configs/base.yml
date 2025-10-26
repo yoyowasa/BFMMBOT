@@ -1,4 +1,4 @@
-# configs/base.yml：共通の土台設定（paper/live/backtest から上書きする前提）
+﻿# configs/base.yml：共通の土台設定（paper/live/backtest から上書きする前提）
 # 役割：
 # - 戦略しきい値（features.*）と、ガード/リスク/窓/ログをひとまとめにする
 # - 自炊ワークフローの整合・安全装置・窓切替がこの数字を読む
@@ -35,16 +35,19 @@ health:
   stale_sec_halt: 10     # 何をする行か：Bestが10秒無更新なら Halted（新規NG・決済のみ許可）
 
 features:  # 戦略のしきい値（#1/#2 の主材料）
-  stall_T_ms: 250          # #1 静止→一撃：BestがTms静止
-  ca_ratio_win_ms: 800     # #2 C/Aゲート：集計窓（ms）
-  ca_threshold: 1.1        # #2 C/Aゲート：Cancel/Add 閾値（以下ならOK）
+  stall_T_ms: 240          # #1 静止→一撃：BestがTms静止
+  ca_ratio_win_ms: 600     # #2 C/Aゲート：集計窓（ms）
+  ca_threshold: 1.25       # #2 C/Aゲート：Cancel/Add 閾値（以下ならOK）
   min_spread_tick: 1       # 最低スプレッド（tick）
-  ttl_ms: 800              # オーダーの寿命（ms）
+  ttl_ms: 900              # オーダーの寿命（ms）
   age_ms: 200              # Age×MP（OFF時も計算は可能）
   mp_offset_tick: 1.0      # Micropriceオフセット（tick）
   tiny_prints_N: 20        # Tiny-Prints集計N（OFFの初期値）
   tiny_prints_minCount: 14 # Tiny-Prints発火閾値（OFFの初期値）
   eta_t_window_ms: 800     # Queue ETAの窓（OFFの初期値）
+  # 在庫帯ブロック（#2 Cancel/Add Gate の安全装置）
+  ca_gate_block_min_abs_inv: 0.04  # C/Aゲートを止め始める在庫の下限|Q|（この帯だけ止める）
+  ca_gate_block_max_abs_inv: 0.06  # C/Aゲートを再開する在庫の上限|Q|
   # stall_then_strike:        # 何をする設定か：#1 静止→一撃 のしきい値を戦略専用でまとめる
   #   stall_T_ms: 250         # 何をする設定か：Bestがこのms静止していたら両面エントリー可
   #   min_spread_tick: 1      # 何をする設定か：最低スプレッド（tick）。これ未満なら何もしない
