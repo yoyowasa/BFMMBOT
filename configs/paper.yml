@@ -1,2 +1,14 @@
 ﻿# configs/paper.yml - base.yml の共通設定をそのまま使い、env だけをpaperに固定します。
 env: paper
+# Overrides for paper environment to improve fill likelihood
+size:
+  default: 0.003
+
+features:
+  stall_ttl_ms: 900
+  ca_gate_block_min_abs_inv: 0.08
+  ca_gate_block_max_abs_inv: 0.10
+strategy_cfg:
+  cancel_add_gate:
+    size:
+      default: 0.003
