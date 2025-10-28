@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, MutableMapping
 from typing import Any
+import math  # 刻み計算で切り下げに使う（在庫連動ロットのため）
 
 
 def _to_mapping(obj: Any) -> Mapping[str, Any]:
@@ -97,3 +98,49 @@ class RiskGate:
             return True
 
         return False
+
+
+def cap_order_size_by_inventory(
+    req_raw: float,
+    abs_q: float,
+    eff_limit: float,
+    min_lot: float,
+    target_ratio: float = 0.90,
+) -> float:
+    """
+    在庫と新規サイズの合計が target_ratio*eff_limit を超えないように、
+    最小ロット刻みで req を【切り下げ】て返す関数。
+    - req_raw : 戦略が希望する元の新規サイズ
+    - abs_q   : いまの在庫の絶対値 |Q|
+    - eff_limit : 実効在庫上限（例：max_inventory * 0.99）
+    - min_lot : 取引所の最小ロット刻み
+    - target_ratio : 目標比（既定=0.90）。( |Q|+req ) / eff_limit ≤ 目標 になるよう制御
+
+    戻り値:
+      ・発注可能なら、刻みを満たしたサイズ（req_raw 以下に切り下げ）
+      ・発注不可なら 0.0（この場合は上流で新規をスキップ/ROだけにする）
+    """
+    # 非常時・異常値の安全側
+    if req_raw <= 0.0 or eff_limit <= 0.0 or min_lot <= 0.0 or target_ratio <= 0.0:
+        return 0.0
+
+    # 1) 目標以内で追加できる“最大許容増分”を計算（負なら新規ゼロ）
+    allowed_add = target_ratio * eff_limit - abs_q
+    if allowed_add <= 0.0:
+        return 0.0
+
+    # 2) ロット刻みに合わせて“切り下げ”し、元の希望サイズとも比較
+    #    （切り上げ禁止＝規約超過や在庫超過を防ぐ）
+    allowed_lots = math.floor(allowed_add / min_lot)
+    if allowed_lots <= 0:
+        return 0.0
+    allowed_size = allowed_lots * min_lot
+
+    # 3) 実際に出すサイズは「元の希望」か「許容サイズ」の小さい方
+    sized = min(req_raw, allowed_size)
+
+    # 4) ごく小さい端数（浮動小数誤差等）を安全に丸め落とし
+    lots = math.floor(sized / min_lot)
+    if lots <= 0:
+        return 0.0
+    return lots * min_lot

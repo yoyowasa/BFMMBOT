@@ -1,4 +1,4 @@
-﻿# configs/base.yml：共通の土台設定（paper/live/backtest から上書きする前提）
+# configs/base.yml：共通の土台設定（paper/live/backtest から上書きする前提）
 # 役割：
 # - 戦略しきい値（features.*）と、ガード/リスク/窓/ログをひとまとめにする
 # - 自炊ワークフローの整合・安全装置・窓切替がこの数字を読む
@@ -14,6 +14,10 @@ size:  # 取引サイズの下限と既定値
 risk:  # リスク上限と非常停止（Kill-Switch）
   max_inventory: 0.05  # 在庫の絶対上限（BTC）
   inventory_eps: 0.002  # 上限の手前に置く安全マージン（単位=ベース通貨）。この分だけ手前で新規をブロックする
+  inv_capping:
+    enabled: true         # 在庫連動ロットの有効/無効（運用でON/OFF）
+    target_ratio: 0.90    # 目標：( |Q|+req ) / eff_limit ≤ この値（例：0.90）
+    eff_limit_margin: 0.99 # 実効上限 = max_inventory × この係数（例：0.99）
   kill:
     daily_pnl_jpy: -30000  # 日次損益がこの値を下回ったら停止
     max_dd_jpy: -20000     # ドローダウンがこの値を下回ったら停止

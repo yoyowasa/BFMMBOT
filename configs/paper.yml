@@ -4,6 +4,10 @@ env: paper
 size:
   default: 0.003
 
+# 在庫上限（paper専用の上書き）
+risk:
+  max_inventory: 0.075
+
 features:
   stall_ttl_ms: 900
   ca_gate_block_min_abs_inv: 0.08
