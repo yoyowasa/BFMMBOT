@@ -1,2 +1,16 @@
-﻿# configs/live.yml - base.yml の共通設定をそのまま使い、env だけをliveに固定します。
+# configs/live.yml - base.yml の既定設定をもとに使い、env を必ず live に固定します。
 env: live
+
+# 既定サイズを最小へ（保険）。strategy_cfg で明示上書きも行う。
+size:
+  default: 0.001
+
+# 戦略別にロットを最小へ明示上書き（最重要）。
+strategy_cfg:
+  stall_then_strike:
+    size:
+      default: 0.001
+  cancel_add_gate:
+    size:
+      default: 0.001
+
