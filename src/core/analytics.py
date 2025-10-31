@@ -1,4 +1,4 @@
-﻿# src/core/analytics.py
+# src/core/analytics.py
 # 役割: 意思決定ログ（features と decision）を Parquet に保存。必要に応じて NDJSON ミラー。
 from __future__ import annotations
 
@@ -107,15 +107,36 @@ class DecisionLog:
                 pass
 
     def flush(self) -> Path:
-        # メモリの rows を Parquet に書き出す
+        """決定ログを Parquet に追記保存（Windows の mmap ロック対策込み）"""
         if not self.rows:
             return self.path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         new_df = pl.DataFrame(self.rows)
         if self.path.exists():
-            old = pl.read_parquet(self.path)
-            new_df = old.vstack(new_df)
-        new_df.write_parquet(self.path)
+            try:
+                old = pl.read_parquet(self.path)
+                combined = old.vstack(new_df)
+                new_df = combined.rechunk()  # ファイル参照を切りやすくする
+                del old, combined
+            except Exception:
+                pass
+        tmp_path = self.path.with_suffix(".parquet.tmp")
+        try:
+            new_df.write_parquet(tmp_path)
+            try:
+                tmp_path.replace(self.path)
+            except Exception:
+                new_df.write_parquet(self.path)
+        except OSError as e:
+            try:
+                from datetime import datetime
+                alt = self.path.with_name(f"{self.path.stem}_{datetime.now().strftime('yyyyMMdd_HHmmss')}.parquet")
+                new_df.write_parquet(alt)
+                logger.warning(f"decision log saved to alt file due to OSError: {alt} err={e}")
+                self.rows.clear()
+                return alt
+            except Exception:
+                raise
         logger.info(f"decision log saved: {self.path} rows={len(new_df)} (+{len(self.rows)})")
         self.rows.clear()
         return self.path

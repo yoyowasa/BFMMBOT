@@ -1,4 +1,4 @@
-﻿# src/runtime/engine.py
+# src/runtime/engine.py
 # 役割：リアルタイムの“paper実行”エンジン（WS→ローカル板→戦略→最小シミュ→ログ保存）
 # - 【関数】run_paper：WSイベントを流し込み、#1/#2戦略を評価→発注/取消→Fill反映→ログ保存
 # - 【関数】_guard_midmove_bp：30秒のミッド変化(bps)を監視し、閾値超なら新規停止＋全取消
@@ -30,6 +30,7 @@ from src.strategy.base import (
 from src.core.risk import RiskGate  # 何をするか：在庫ゲート（市場モードでClose-Onlyを切り替える）
 from src.core.utils import monotonic_ms
 from src.core.risk import cap_order_size_by_inventory  # 在庫と上限に基づき新規サイズを安全側へ切り下げる
+from src.core.risk import inv_capping_preflight  # 在庫前処理（ログ: headroom/shrink/no_room を一元管理）
 
 _CORR_MAP_MAX = 8192  # 何をするか：client_order_id→corr_id の保持件数上限
 _coid_to_corr: OrderedDict[str, str] = OrderedDict()  # 何をするか：corr参照用のLRUマップ
@@ -345,59 +346,6 @@ class PaperEngine:
 
         if self._orig_place is None:
             return None
-        # ---- 在庫連動ロット：place直前で新規サイズを安全側へ切り下げ（Reduce-Onlyは素通し） ----
-        try:
-            if not is_reduce and args:
-                first = args[0]
-                cfg_obj = getattr(self, "cfg", None)
-                risk_node = getattr(cfg_obj, "risk", None) if cfg_obj is not None else None
-                inv_node = getattr(risk_node, "inv_capping", None) if risk_node is not None else None
-                inv_enabled = bool(getattr(inv_node, "enabled", False))
-                if inv_enabled and hasattr(first, "size"):
-                    # eff_limit = max_inventory × eff_limit_margin（YAML設定）
-                    try:
-                        max_inv = float(getattr(risk_node, "max_inventory", None)) if risk_node is not None else None
-                    except Exception:
-                        max_inv = None
-                    try:
-                        margin = float(getattr(inv_node, "eff_limit_margin", 0.99)) if inv_node is not None else 0.99
-                    except Exception:
-                        margin = 0.99
-                    eff_limit = (max_inv * margin) if (max_inv is not None) else None
-                    if eff_limit is not None:
-                        size_node = getattr(cfg_obj, "size", None)
-                        try:
-                            min_lot = float(getattr(size_node, "min", 0.001)) if size_node is not None else 0.001
-                        except Exception:
-                            min_lot = 0.001
-                        try:
-                            req_raw = float(getattr(first, "size", 0.0) or 0.0)
-                        except Exception:
-                            req_raw = 0.0
-                        abs_q = abs(getattr(self, "Q", 0.0))
-                        try:
-                            tgt = float(getattr(inv_node, "target_ratio", 0.90)) if inv_node is not None else 0.90
-                        except Exception:
-                            tgt = 0.90
-                        safe_size = cap_order_size_by_inventory(
-                            req_raw=req_raw,
-                            abs_q=abs_q,
-                            eff_limit=float(eff_limit),
-                            min_lot=min_lot,
-                            target_ratio=tgt,
-                        )
-                        if safe_size <= 0.0:
-                            # 在庫超過を避けるため新規発注をスキップ（ROだけで在庫軽量化）
-                            logger.debug(f"skip place: capped_by_inventory target_ratio={tgt}")
-                            return None
-                        if safe_size < req_raw:
-                            try:
-                                first.size = safe_size
-                            except Exception:
-                                pass
-        except Exception:
-            # 在庫連動ロットの調整中に問題があっても、保守的にそのまま後段へ渡す
-            pass
         if not is_reduce:
             self._last_place_ts_ms = now_ms  # 何をするか：新規発注が通る直前に“最後に出した時刻”を更新（Cautionのレート制御に使う）
         return self._orig_place(*args, **kwargs)
@@ -623,9 +571,29 @@ class PaperEngine:
             size_node = getattr(cfg_obj, "size", None) if cfg_obj is not None else None
 
             max_inv = getattr(risk_node, "max_inventory", None) if risk_node is not None else None
-            inv_enabled = bool(getattr(inv_node, "enabled", False)) if inv_node is not None else False
-            target_ratio = getattr(inv_node, "target_ratio", None) if inv_node is not None else None
-            eff_margin = getattr(inv_node, "eff_limit_margin", None) if inv_node is not None else None
+            # enabled/params は dict/Pydantic 両対応。未設定は既定値（enabled=True, ratio=0.90, margin=0.99）。
+            inv_enabled = True
+            target_ratio = 0.90
+            eff_margin = 0.99
+            try:
+                from collections.abc import Mapping as _Mapping
+                if inv_node is not None:
+                    if isinstance(inv_node, _Mapping):
+                        inv_enabled = bool(inv_node.get("enabled", True))
+                        if inv_node.get("target_ratio") is not None:
+                            target_ratio = float(inv_node.get("target_ratio"))
+                        if inv_node.get("eff_limit_margin") is not None:
+                            eff_margin = float(inv_node.get("eff_limit_margin"))
+                    else:
+                        inv_enabled = bool(getattr(inv_node, "enabled", True))
+                        tr = getattr(inv_node, "target_ratio", None)
+                        if isinstance(tr, (int, float)):
+                            target_ratio = float(tr)
+                        mg = getattr(inv_node, "eff_limit_margin", None)
+                        if isinstance(mg, (int, float)):
+                            eff_margin = float(mg)
+            except Exception:
+                pass
             try:
                 min_lot = float(getattr(size_node, "min", None)) if size_node is not None else None
             except Exception:
@@ -633,7 +601,7 @@ class PaperEngine:
             eff_limit = self.effective_inventory_limit()
 
             _features["inv_capping"] = {
-                "enabled": inv_enabled,
+                "enabled": bool(inv_enabled),
                 "target_ratio": float(target_ratio) if isinstance(target_ratio, (int, float)) else target_ratio,
                 "eff_limit_margin": float(eff_margin) if isinstance(eff_margin, (int, float)) else eff_margin,
                 "max_inventory": float(max_inv) if isinstance(max_inv, (int, float)) else max_inv,
@@ -1174,7 +1142,7 @@ class PaperEngine:
                                 if isinstance(locals().get("features"), dict):  # 何をするか：戦略特徴量が存在する場合
                                     age = features.get("best_age_ms")
                                 elif isinstance(locals().get("decision"), dict):  # 何をするか：決定ペイロードに含まれる場合
-                                    age = decision.get("best_age_ms")
+                                    age = locals().get("decision", {}).get("best_age_ms")  # 未定義NameErrorを避ける
                                 if isinstance(age, (int, float)):
                                     if self._stale_halt_ms is not None and age >= self._stale_halt_ms:
                                         self.risk.set_market_mode("halted")  # 何をする行か：Best静止が閾値超→Haltedに切替
@@ -1211,7 +1179,35 @@ class PaperEngine:
                                             extra = getattr(risk_node, "model_extra", None)
                                             if isinstance(extra, dict):
                                                 inv_node = extra.get("inv_capping")
-                                    inv_enabled = bool(getattr(inv_node, "enabled", False)) if inv_node is not None else False
+                                    # フォールバック：features.inv_capping も参照し、どちらから読んだかを記録
+                                    cfg_path = "risk.inv_capping"
+                                    try:
+                                        feat_node = getattr(self.cfg, "features", None)
+                                        inv_feat = None
+                                        if feat_node is not None:
+                                            inv_feat = getattr(feat_node, "inv_capping", None)
+                                            if inv_feat is None:
+                                                extra_f = getattr(feat_node, "model_extra", None)
+                                                if isinstance(extra_f, dict):
+                                                    inv_feat = extra_f.get("inv_capping")
+                                        if inv_node is None and inv_feat is not None:
+                                            inv_node = inv_feat
+                                            cfg_path = "features.inv_capping"
+                                        elif inv_node is None:
+                                            cfg_path = "undefined"
+                                    except Exception:
+                                        cfg_path = "undefined"
+                                    # inv_capping.enabled は dict/Pydantic 両対応。未設定や欠落時は True（既定で有効）。
+                                    inv_enabled = True
+                                    try:
+                                        from collections.abc import Mapping as _Mapping
+                                        if inv_node is not None:
+                                            if isinstance(inv_node, _Mapping):
+                                                inv_enabled = bool(inv_node.get("enabled", True))
+                                            else:
+                                                inv_enabled = bool(getattr(inv_node, "enabled", True))
+                                    except Exception:
+                                        inv_enabled = True
                                     if not reduce_only and inv_enabled:
                                         try:
                                             max_inv = float(getattr(risk_node, "max_inventory", None)) if risk_node is not None else None
@@ -1234,21 +1230,21 @@ class PaperEngine:
                                                 tgt = float(getattr(inv_node, "target_ratio", 0.90)) if inv_node is not None else 0.90
                                             except Exception:
                                                 tgt = 0.90
-                                            safe_size = cap_order_size_by_inventory(
+                                            # 在庫前処理は core に委譲（ログも一元化）
+                                            safe_size, should_skip = inv_capping_preflight(
                                                 req_raw=req_qty,
                                                 abs_q=abs_q,
                                                 eff_limit=float(eff_for_cap),
                                                 min_lot=min_lot,
                                                 target_ratio=tgt,
+                                                cfg_path=cfg_path,
                                             )
-                                            if safe_size <= 0.0:
-                                                logger.warning(
-                                                    "skip place: capped_by_inventory | r_pre={:.3f} abs_q={:.6f} req_raw={:.6f} eff_limit={:.6f} target={:.2f}",
-                                                    r_pre, abs_q, req_qty, float(eff_for_cap), tgt,
-                                                )
+                                            if should_skip:
                                                 self._heartbeat(now, "pause", reason="inventory_guard")
                                                 continue
-                                            if safe_size < req_qty:
+                                            # 実際に縮小が発生した場合のみサイズを更新
+                                            # 余地があれば安全側サイズで上書きし、どれだけ縮めたかを記録
+                                            if safe_size < (req_qty - 1e-12):
                                                 try:
                                                     o.size = safe_size
                                                 except Exception:
@@ -1257,19 +1253,95 @@ class PaperEngine:
                                 except Exception:
                                     pass
                                 if eff_limit is not None:
-                                    if abs(self.Q) + req_qty > eff_limit:
-                                        if reduce_only or self.would_reduce_inventory(self.Q, side_val, req_qty):
-                                            pass  # 決済方向なのでClose-Only中でも許可
-                                        else:
-                                            logger.debug(
-                                                f"skip place: |Q|+req={abs(self.Q) + req_qty:.6f} > eff_limit={eff_limit:.6f}"
-                                            )
-                                            self._heartbeat(now, "pause", reason="inventory_guard")
-                                            continue
-                                    elif close_only_mode and not (reduce_only or self.would_reduce_inventory(self.Q, side_val, req_qty)):
-                                        logger.debug("skip place: close_only_mode (inventory_guard)")
-                                        self._heartbeat(now, "pause", reason="inventory_guard")
-                                        continue
+                                            # 在庫ガード直前の“在庫連動ロット”前処理：
+                                            # 余地ゼロなら固定文言でスキップし、SKIP_CAP を必ず計上
+                                            risk_node = getattr(self.cfg, "risk", None)
+                                            inv_node = None
+                                            if risk_node is not None:
+                                                inv_node = getattr(risk_node, "inv_capping", None)
+                                                if inv_node is None:
+                                                    extra = getattr(risk_node, "model_extra", None)
+                                                    if isinstance(extra, dict):
+                                                        inv_node = extra.get("inv_capping")
+
+                                            # enabled/ratio/margin は既定値（enabled=True, ratio=0.90, margin=0.99）で防御
+                                            inv_enabled = True
+                                            target_ratio = 0.90
+                                            eff_margin = 0.99
+                                            try:
+                                                from collections.abc import Mapping as _Mapping
+                                                if inv_node is not None:
+                                                    if isinstance(inv_node, _Mapping):
+                                                        inv_enabled = bool(inv_node.get("enabled", True))
+                                                        if inv_node.get("target_ratio") is not None:
+                                                            target_ratio = float(inv_node.get("target_ratio"))
+                                                        if inv_node.get("eff_limit_margin") is not None:
+                                                            eff_margin = float(inv_node.get("eff_limit_margin"))
+                                                    else:
+                                                        inv_enabled = bool(getattr(inv_node, "enabled", True))
+                                                        tr = getattr(inv_node, "target_ratio", None)
+                                                        if isinstance(tr, (int, float)):
+                                                            target_ratio = float(tr)
+                                                        mg = getattr(inv_node, "eff_limit_margin", None)
+                                                        if isinstance(mg, (int, float)):
+                                                            eff_margin = float(mg)
+                                            except Exception:
+                                                pass
+
+                                            # 参照元の可視化（DEBUG）：どの設定から読み取ったか
+                                            try:
+                                                logger.debug(
+                                                    "inv_capping.cfg_path={} enabled={} target_ratio={:.2f} eff_limit_margin={:.2f}",
+                                                    cfg_path, inv_enabled, target_ratio, eff_margin,
+                                                )
+                                            except Exception:
+                                                pass
+
+                                            try:
+                                                max_inv = float(getattr(risk_node, "max_inventory", None)) if risk_node is not None else None
+                                            except Exception:
+                                                max_inv = None
+                                            eff_for_cap = (max_inv * eff_margin) if (max_inv is not None) else eff_limit
+
+                                            abs_q = abs(self.Q)
+                                            req_raw = float(req_qty)
+                                            size_node = getattr(self.cfg, "size", None)
+                                            try:
+                                                min_lot = float(getattr(size_node, "min", 0.001)) if size_node is not None else 0.001
+                                            except Exception:
+                                                min_lot = 0.001
+
+                                            if inv_enabled and (eff_for_cap is not None) and (eff_for_cap > 0):
+                                                # 在庫前処理は core に委譲（ログも一元化）
+                                                safe_size, should_skip = inv_capping_preflight(
+                                                    req_raw=req_raw,
+                                                    abs_q=abs_q,
+                                                    eff_limit=float(eff_for_cap),
+                                                    min_lot=min_lot,
+                                                    target_ratio=target_ratio,
+                                                    cfg_path=cfg_path,
+                                                )
+                                                if should_skip:
+                                                    self._heartbeat(now, "pause", reason="inventory_guard")
+                                                    continue
+                                                # 最終ガード: eff_limit に対しても再チェック（ログは core に統一）
+                                                if (eff_limit is not None) and ((abs(self.Q) + req_qty) > float(eff_limit)):
+                                                    _s, _skip = inv_capping_preflight(
+                                                        req_raw=req_raw,
+                                                        abs_q=abs_q,
+                                                        eff_limit=float(eff_limit),
+                                                        min_lot=min_lot,
+                                                        target_ratio=target_ratio,
+                                                        cfg_path=cfg_path,
+                                                    )
+                                                    if _skip:
+                                                        self._heartbeat(now, "pause", reason="inventory_guard")
+                                                        continue
+                                elif close_only_mode and not (reduce_only or self.would_reduce_inventory(self.Q, side_val, req_qty)):
+                                    logger.debug("skip place: close_only_mode (inventory_guard)")
+                                    self._heartbeat(now, "pause", reason="inventory_guard")
+                                    continue
+                                # 実際にシミュレータへ発注し、placeログを記録
                                 self.sim.place(o, now)
                                 corr_for_log = _coid_to_corr.get(
                                     getattr(o, "client_order_id", ""),

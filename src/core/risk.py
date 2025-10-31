@@ -4,7 +4,54 @@ from __future__ import annotations
 from collections.abc import Mapping, MutableMapping
 from typing import Any
 import math  # 刻み計算で切り下げに使う（在庫連動ロットのため）
+import time  # 60秒ロールアップで現在時刻を使う
 
+
+_INV_CAP_CFG_BANNER_ONCE = False  # 起動バナーを一度だけ出すためのフラグ（モジュール内で共有）
+
+# 60秒ロールアップ用の集計カウンタと設定経路の保持
+_INV_CAP_ROLLUP = {"events": 0, "shrink": 0, "no_room": 0, "last_ts": 0.0}
+_INV_CAP_CFG_PATH_LAST = "undefined"
+_ROLLUP_WINDOW_SEC = 60.0
+
+
+def _inv_cap_rollup_count(kind: str, eff_limit: float, cfg_path: str) -> None:
+    """inv_capping 60秒ロールアップ: 種別(kind)を数え、60秒ごとにINFOでサマリ1行を出す"""
+    # 関数内インポート（他所のトップimportに依存しない）
+    from loguru import logger
+
+    try:
+        now = time.time()
+        # イベント/結果の内訳をカウント
+        if kind == "event":
+            _INV_CAP_ROLLUP["events"] = int(_INV_CAP_ROLLUP.get("events", 0)) + 1
+        elif kind in ("shrink", "no_room"):
+            _INV_CAP_ROLLUP[kind] = int(_INV_CAP_ROLLUP.get(kind, 0)) + 1
+
+        # 直近の設定経路を記録（観測の自己説明）
+        global _INV_CAP_CFG_PATH_LAST
+        _INV_CAP_CFG_PATH_LAST = cfg_path or "undefined"
+
+        last = float(_INV_CAP_ROLLUP.get("last_ts", 0.0) or 0.0)
+        if last == 0.0:
+            _INV_CAP_ROLLUP["last_ts"] = now
+            return
+        if (now - last) >= _ROLLUP_WINDOW_SEC:
+            try:
+                logger.info(
+                    "inv_capping.rollup60s | events={} shrink={} no_room={} eff_limit={:.6f} cfg_path={}",
+                    int(_INV_CAP_ROLLUP.get("events", 0)),
+                    int(_INV_CAP_ROLLUP.get("shrink", 0)),
+                    int(_INV_CAP_ROLLUP.get("no_room", 0)),
+                    float(eff_limit) if eff_limit is not None else 0.0,
+                    _INV_CAP_CFG_PATH_LAST,
+                )
+            except Exception:
+                pass
+            _INV_CAP_ROLLUP.update({"events": 0, "shrink": 0, "no_room": 0, "last_ts": now})
+    except Exception:
+        # ロールアップは可観測の補助なので、失敗しても主処理を邪魔しない
+        pass
 
 def _to_mapping(obj: Any) -> Mapping[str, Any]:
     """【関数】属性/辞書を読み取り専用の辞書風に正規化"""
@@ -21,6 +68,82 @@ class RiskGate:
     """在庫ゲート（max_inventory と安全マージン inventory_eps を扱う）"""
 
     def __init__(self, cfg: Any | None = None) -> None:
+        # 起動時1回だけ：在庫連動ロット(inv_capping)の設定ソースと数値をINFOで自己紹介（可観測性の確保）
+        # RiskGate は起動時に構築されるため、ここでバナーを出すのが最も早い
+        try:
+            global _INV_CAP_CFG_BANNER_ONCE
+            if not _INV_CAP_CFG_BANNER_ONCE and cfg is not None:
+                # 関数内インポート（トップのimport変更に依存しない）
+                from loguru import logger  # ログ出力（INFO）
+
+                # 設定フォールバック：risk.inv_capping が無ければ features.inv_capping を試す
+                cfg_risk = getattr(cfg, "risk", None)
+                cfg_feat = getattr(cfg, "features", None)
+
+                inv_risk = getattr(cfg_risk, "inv_capping", None) if cfg_risk is not None else None
+                if inv_risk is None:
+                    extra_r = getattr(cfg_risk, "model_extra", None) if cfg_risk is not None else None
+                    if isinstance(extra_r, dict):
+                        inv_risk = extra_r.get("inv_capping")
+
+                inv_feat = getattr(cfg_feat, "inv_capping", None) if cfg_feat is not None else None
+                if inv_feat is None:
+                    extra_f = getattr(cfg_feat, "model_extra", None) if cfg_feat is not None else None
+                    if isinstance(extra_f, dict):
+                        inv_feat = extra_f.get("inv_capping")
+
+                cfg_path = "undefined"
+                inv_enabled = False
+                target_ratio = 1.0
+                eff_limit_margin = 1.0
+
+                if inv_risk is not None and getattr(inv_risk, "enabled", None) is not None:
+                    try:
+                        inv_enabled = bool(getattr(inv_risk, "enabled"))
+                        tr = getattr(inv_risk, "target_ratio", None)
+                        if tr is not None:
+                            target_ratio = float(tr)
+                        mg = getattr(inv_risk, "eff_limit_margin", None)
+                        if mg is not None:
+                            eff_limit_margin = float(mg)
+                        cfg_path = "risk.inv_capping"
+                    except Exception:
+                        pass
+                elif inv_feat is not None and getattr(inv_feat, "enabled", None) is not None:
+                    try:
+                        inv_enabled = bool(getattr(inv_feat, "enabled"))
+                        tr = getattr(inv_feat, "target_ratio", None)
+                        if tr is not None:
+                            target_ratio = float(tr)
+                        mg = getattr(inv_feat, "eff_limit_margin", None)
+                        if mg is not None:
+                            eff_limit_margin = float(mg)
+                        cfg_path = "features.inv_capping"
+                    except Exception:
+                        pass
+
+                max_inv_val = None
+                try:
+                    mv = getattr(cfg_risk, "max_inventory", None) if cfg_risk is not None else None
+                    if mv is not None:
+                        max_inv_val = float(mv)
+                except Exception:
+                    max_inv_val = None
+
+                eff_limit = (max_inv_val * eff_limit_margin) if (max_inv_val is not None) else None
+                try:
+                    logger.info(
+                        "inv_capping.cfg_path={} enabled={} target_ratio={:.2f} eff_limit_margin={:.2f} eff_limit={} max_inventory={}",
+                        cfg_path, inv_enabled, target_ratio, eff_limit_margin,
+                        (f"{eff_limit:.6f}" if eff_limit is not None else None),
+                        (f"{max_inv_val:.6f}" if max_inv_val is not None else None),
+                    )
+                except Exception:
+                    pass
+                _INV_CAP_CFG_BANNER_ONCE = True
+        except Exception:
+            # バナー失敗は致命的ではないため握りつぶす
+            pass
         risk_section: Mapping[str, Any] = {}
         cfg_map = _to_mapping(cfg)
         if cfg_map:
@@ -144,3 +267,82 @@ def cap_order_size_by_inventory(
     if lots <= 0:
         return 0.0
     return lots * min_lot
+
+
+def inv_capping_preflight(
+    *,
+    req_raw: float,
+    abs_q: float,
+    eff_limit: float,
+    min_lot: float,
+    target_ratio: float = 0.90,
+    cfg_path: str | None = None,
+) -> tuple[float, bool]:
+    """
+    在庫ガード直前の“在庫連動ロット”前処理。
+    - 入力: req_raw（希望サイズ）, abs_q（現|Q|）, eff_limit（実効上限）, min_lot, target_ratio
+    - 出力: (safe_size, should_skip)
+      should_skip=True の場合は固定文言で DEBUG を記録済み。
+    """
+    # 関数内インポート（トップの import 変更を避ける）
+    from loguru import logger  # 在庫由来スキップの固定文言をDEBUGで残す（集計用）
+
+    try:
+        eff = float(eff_limit)
+        lotsz = float(min_lot)
+        tgt = float(target_ratio)
+        rq = float(req_raw)
+        aq = float(abs_q)
+    except Exception:
+        return 0.0, True
+
+    safe_size = cap_order_size_by_inventory(
+        req_raw=rq,
+        abs_q=aq,
+        eff_limit=eff,
+        min_lot=lotsz,
+        target_ratio=tgt,
+    )
+    r_pre = (aq + rq) / eff if eff > 0 else float("inf")
+    # headroomの観測ログ（target_ratio×eff_limit 基準）
+    target_eff = tgt * eff
+    headroom = max(target_eff - aq, 0.0)
+    try:
+        logger.debug(
+            "inv_capping.headroom | abs_q={:.6f} target_eff={:.6f} headroom={:.6f} cfg_path={}",
+            aq, target_eff, headroom, (cfg_path or "n/a"),
+        )
+    except Exception:
+        pass
+
+    # 観測イベントを1件カウント（60秒でINFO集計）
+    try:
+        _inv_cap_rollup_count("event", eff, (cfg_path or "n/a"))
+    except Exception:
+        pass
+
+    # 余地ゼロ、または丸め後も上限超過 → 固定文言で見送り
+    if (safe_size <= 0.0) or ((aq + safe_size) > eff):
+        logger.debug(
+            "skip place: capped_by_inventory (no_room) | r_pre={:.3f} abs_q={:.6f} req_raw={:.6f} eff_limit={:.6f} target={:.2f} headroom={:.6f} cfg_path={}",
+            r_pre, aq, rq, eff, tgt, headroom, (cfg_path or "n/a"),
+        )
+        # 余地ゼロ件数をカウント（60秒でINFO集計）
+        try:
+            _inv_cap_rollup_count("no_room", eff, (cfg_path or "n/a"))
+        except Exception:
+            pass
+        return 0.0, True
+
+    # 縮小の可視化（DEBUG）
+    if safe_size < (rq - 1e-12):
+        logger.debug(
+            "capped_by_inventory | r_pre={:.3f} -> r_post={:.3f} size:{:.6f}->{:.6f} headroom={:.6f} cfg_path={}",
+            r_pre, (aq + safe_size) / eff if eff > 0 else float("inf"), rq, safe_size, headroom, (cfg_path or "n/a"),
+        )
+        # 実縮小件数をカウント（60秒でINFO集計）
+        try:
+            _inv_cap_rollup_count("shrink", eff, (cfg_path or "n/a"))
+        except Exception:
+            pass
+    return safe_size, False

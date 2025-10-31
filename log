@@ -134,7 +134,7 @@ Get-Content logs/runtime/heartbeat.ndjson -Wait | ForEach-Object { if (($_ | Con
 poetry run python -m src.cli.trade --config configs/live.yml
 poetry run python -m src.cli.trade --config configs/paper.yml
 code tunnel --name home-dev
-
+poetry run python -m src.cli.trade --config configs/live.yml --strategy stall_then_strike --strategy cancel_add_gate
 gitから上書き
 git fetch origin main
 git reset --hard origin/main
