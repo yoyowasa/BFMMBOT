@@ -14,3 +14,22 @@ strategy_cfg:
     size:
       default: 0.001
 
+# 銘柄を明示（FX 販売所）
+product_code: FX_BTC_JPY
+
+# 送信レートを抑制（Canary：1本/秒、同一注文の重複送信を1秒禁止）
+tx:
+  min_interval_ms: 1000
+  place_dedup_ms: 1000
+
+# Kill-Switch（DDは正の値、日次損失は負の閾値）
+risk:
+  kill:
+    daily_pnl_jpy: -30000  # 日次損失の下限（負の値）
+    max_dd_jpy: 20000      # DDの上限（正の値）
+  auto_reduce:              # 本番は“有効＋利益時のみ”で開始
+    enabled: true           # 戦略が無音でも在庫エンジンが薄めを出す
+    profit_only: true       # プラスのときだけ自動決済する（通常時）
+    force_on_risk: true     # -205/Halted/在庫上限違反などは必ず薄める
+    tif: IOC                # 走らせたら即判定（板滞留を避ける）
+    min_step_qty: 0.001     # 取引所の最小ロットに合わせる

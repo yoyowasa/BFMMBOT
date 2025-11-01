@@ -20,6 +20,14 @@ risk:  # リスク上限と非常停止（Kill-Switch）
     eff_limit_margin: 0.99 # 実効上限 = max_inventory × この係数（例：0.99）
   kill:
     daily_pnl_jpy: -30000  # 日次損益がこの値を下回ったら停止
+  
+  # 在庫“自動薄め”の機能ブロック（既定はOFF。envで上書きして使う）
+  auto_reduce:
+    enabled: false
+    profit_only: false
+    force_on_risk: true
+    tif: IOC
+    min_step_qty: 0.001
     max_dd_jpy: -20000     # ドローダウンがこの値を下回ったら停止
 
 guard:  # ガードレール（相場が速すぎる時は出さない）

@@ -7,6 +7,12 @@ size:
 # 在庫上限（paper専用の上書き）
 risk:
   max_inventory: 0.075
+  auto_reduce:                # ペーパーは最初OFF（挙動観察）
+    enabled: false            # A/B時はtrueに変更
+    profit_only: true         # 有効化時は“プラス時のみ”で安全運転
+    force_on_risk: true       # リスク違反時は利益不問で薄める
+    tif: IOC
+    min_step_qty: 0.001
 
 features:
   stall_ttl_ms: 900
