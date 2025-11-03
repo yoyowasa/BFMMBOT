@@ -31,6 +31,9 @@ from src.core.risk import RiskGate  # 何をするか：在庫ゲート（市場
 from src.core.utils import monotonic_ms
 from src.core.risk import cap_order_size_by_inventory  # 在庫と上限に基づき新規サイズを安全側へ切り下げる
 from src.core.risk import inv_capping_preflight  # 在庫前処理（ログ: headroom/shrink/no_room を一元管理）
+from decimal import Decimal  # 在庫・価格を高精度で扱うため
+from src.core.risk import auto_reduce_should_fire  # 「今だけ薄める？」の判定
+from src.core.orders import auto_reduce_build, Order  # Reduce-Only+IOCの仕様とOrder
 
 _CORR_MAP_MAX = 8192  # 何をするか：client_order_id→corr_id の保持件数上限
 _coid_to_corr: OrderedDict[str, str] = OrderedDict()  # 何をするか：corr参照用のLRUマップ
@@ -633,6 +636,89 @@ class PaperEngine:
             if isinstance(extra, Mapping):
                 return dict(extra)
         return None
+
+    def _maybe_auto_reduce(self, now: datetime) -> None:
+        """戦略が無音でも在庫だけで“薄め”を1口（Reduce‑Only+IOC）。板に残さない。"""
+        try:
+            cfg = self.cfg
+            def _get(node, key, default=None):
+                if node is None:
+                    return default
+                try:
+                    from collections.abc import Mapping as _M
+                    if isinstance(node, _M):
+                        return node.get(key, default)
+                except Exception:
+                    pass
+                return getattr(node, key, default)
+
+            ar = _get(_get(cfg, "risk", {}), "auto_reduce", {}) or {}
+            if not bool(_get(ar, "enabled", False)):
+                return
+
+            q = Decimal(str(getattr(self, "Q", 0)))
+            a = Decimal(str(getattr(self, "A", 0)))
+            # best bid/ask → mid
+            bid_px = getattr(getattr(self, "ob", None), "best_bid", None)
+            ask_px = getattr(getattr(self, "ob", None), "best_ask", None)
+            bid_px = None if bid_px is None else getattr(bid_px, "price", None)
+            ask_px = None if ask_px is None else getattr(ask_px, "price", None)
+            mark = None
+            try:
+                if bid_px is not None and ask_px is not None and bid_px > 0 and ask_px > 0:
+                    mark = Decimal(str((bid_px + ask_px) / 2.0))
+            except Exception:
+                mark = None
+
+            mode = str(getattr(self.risk, "market_mode", "healthy")).lower()
+            eff = self.effective_inventory_limit() or 0.0
+            eff_limit = Decimal(str(eff))
+
+            decision = auto_reduce_should_fire(
+                enabled=bool(_get(ar, "enabled", False)),
+                profit_only=bool(_get(ar, "profit_only", True)),
+                force_on_risk=bool(_get(ar, "force_on_risk", True)),
+                q=q, a=a, mark=mark, mode=mode, recent_errors=[], eff_limit=eff_limit,
+            )
+            if not decision.fire:
+                return
+
+            size_node = _get(cfg, "size", {})
+            min_qty = Decimal(str(_get(ar, "min_step_qty", _get(size_node, "min", 0.001))))
+            qty_step = Decimal(str(_get(size_node, "min", 0.001)))
+            tick = Decimal(str(_get(cfg, "tick_size", 1)))
+
+            spec = auto_reduce_build(
+                side=decision.side or ("SELL" if q > 0 else "BUY"), q=q,
+                min_step_qty=min_qty, qty_step=qty_step, tick_size=tick,
+                best_bid=None if bid_px is None else Decimal(str(bid_px)),
+                best_ask=None if ask_px is None else Decimal(str(ask_px)),
+                tif=str(_get(ar, "tif", "IOC")), tag="auto_reduce",
+            )
+            if not spec:
+                return
+
+            # spec → Order（paperシミュ用）。price が無い場合は mid を使う
+            px = spec.get("price")
+            if px is None and mark is None:
+                return
+            o = Order(
+                side=str(spec["side"]).lower(),
+                price=float(px if px is not None else mark),
+                size=float(spec["size"]),
+                tif=str(spec.get("tif", "IOC")),
+                ttl_ms=None,
+                tag=str(spec.get("tag", "auto_reduce")),
+            )
+
+            self.sim.place(o, now)
+            self.order_log.add(
+                ts=self._ts_jst(now), action="place", tif=o.tif, ttl_ms=o.ttl_ms,
+                px=o.price, sz=o.size, reason=o.tag,
+            )
+            self._heartbeat(now, "place", reason=o.tag)
+        except Exception:
+            return
 
     def _heartbeat(self, now: datetime, event: str, reason: str | None = None) -> None:
         """【関数】ハートビート：Q/A/R・日次R・各ガード/窓の状態を1行JSONで追記する"""
@@ -1389,6 +1475,7 @@ class PaperEngine:
                                 current_corr_ctx.reset(corr_token)
 
                 elif ch.startswith("lightning_executions_"):
+                    self._maybe_auto_reduce(now)  # 在庫とモードだけで“薄め”を1口（Reduce‑Only+IOC）
                     # 約定でシミュを進め、Fill明細を受け取る→PnL/ログ反映
                     fills = self.sim.on_executions(ev.get("message") or [], now)
                     for f in fills:

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, MutableMapping
-from typing import Any
+from typing import Any, Optional, Sequence
+from decimal import Decimal  # 高精度で在庫・価格を扱う
+from dataclasses import dataclass  # 判定結果DTO
 import math  # 刻み計算で切り下げに使う（在庫連動ロットのため）
 import time  # 60秒ロールアップで現在時刻を使う
 
@@ -63,6 +65,86 @@ def _to_mapping(obj: Any) -> Mapping[str, Any]:
         return obj.__dict__
     return {}
 
+
+@dataclass(frozen=True)
+class AutoReduceDecision:
+    """自動薄め（Reduce-Only/IOC）の発火判定結果を表す小さな入れ物"""
+    fire: bool            # このティックで発火するか
+    side: Optional[str]   # "SELL"（ロング縮小）/ "BUY"（ショート縮小）/ None
+    reason: str           # なぜその判定か（運用ログに出す説明）
+
+
+def auto_reduce_should_fire(
+    *,
+    enabled: bool,
+    profit_only: bool,
+    force_on_risk: bool,
+    q: Decimal,
+    a: Decimal,
+    mark: Optional[Decimal],
+    mode: str,
+    recent_errors: Sequence[str],
+    eff_limit: Decimal,
+) -> AutoReduceDecision:
+    """
+    在庫と安全装置の“状態だけ”で、自動決済（Reduce‑Only）を今すぐ出すべきかを判定。
+    ルール:
+      1) 機能OFF or フラット(Q=0)なら発火しない
+      2) force_on_risk 有効かつ 以下のいずれかで“損益不問で”発火
+         - |Q| >= eff_limit（在庫上限ヒット）
+         - 直近に "-205"（証拠金不足）を観測
+         - mode == "halted"
+      3) profit_only=True のときは“方向利益”（ロング: mark>=A / ショート: mark<=A）のときだけ発火
+      4) それ以外（profit_only=False）は利益不問で発火
+    戻り: AutoReduceDecision(fire, side, reason)
+    """
+    # 1) 機能OFF/フラット
+    try:
+        if not enabled:
+            return AutoReduceDecision(False, None, "disabled")
+        if q == 0:
+            return AutoReduceDecision(False, None, "flat")
+    except Exception:
+        return AutoReduceDecision(False, None, "invalid_input")
+
+    # 減らす向き（ロング→SELL / ショート→BUY）
+    side = "SELL" if q > 0 else "BUY"
+
+    # 2) リスク違反（強制発火）
+    try:
+        breaching_inv = (abs(q) >= eff_limit)
+    except Exception:
+        breaching_inv = False
+    try:
+        has_margin_reject = any(("-205" in (e or "")) or (" 205" in (e or "")) for e in recent_errors or [])
+    except Exception:
+        has_margin_reject = False
+    risk_mode_block = str(mode or "").lower() == "halted"
+
+    if force_on_risk and (breaching_inv or has_margin_reject or risk_mode_block):
+        reason_bits: list[str] = []
+        if breaching_inv:
+            reason_bits.append(f"|Q|>={eff_limit}")
+        if has_margin_reject:
+            reason_bits.append("margin(-205)")
+        if risk_mode_block:
+            reason_bits.append("mode=halted")
+        return AutoReduceDecision(True, side, "force_on_risk:" + ",".join(reason_bits))
+
+    # 3) 通常: profit_only のときは方向利益のみ
+    if profit_only:
+        if mark is None:
+            return AutoReduceDecision(False, None, "no_mark_for_profit_check")
+        try:
+            pnl_ok = ((mark - a) * (Decimal(1) if q > 0 else Decimal(-1))) >= Decimal("0")
+        except Exception:
+            pnl_ok = False
+        if pnl_ok:
+            return AutoReduceDecision(True, side, "profit_only_ok")
+        return AutoReduceDecision(False, None, "profit_only_block")
+
+    # 4) 利益不問で薄める
+    return AutoReduceDecision(True, side, "profit_not_required")
 
 class RiskGate:
     """在庫ゲート（max_inventory と安全マージン inventory_eps を扱う）"""
