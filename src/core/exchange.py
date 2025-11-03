@@ -194,6 +194,65 @@ class BitflyerExchange:
         )
         return data["child_order_acceptance_id"]
 
+    def place_ioc_reduce_only(
+        self,
+        side: str,
+        size: float,
+        *,
+        product_code: Optional[str] = None,
+        tag: str = "auto_reduce",
+    ) -> str:
+        """
+        在庫を減らすための IOC 成行を 1 回送信する関数。
+        - child_order_type=MARKET + time_in_force=IOC により「即時に当たる分だけ約定→残りはキャンセル」。
+        - tag は運用ログ用の目印（取引所には送らない）。
+        - 刻み/数量の丸めは上位で済ませてから呼ぶこと。
+        返り値: child_order_acceptance_id
+        """
+        s = str(side).upper()
+        if s not in ("BUY", "SELL"):
+            raise ValueError(f"invalid side: {side}")
+        if size is None or float(size) <= 0.0:
+            raise ValueError(f"invalid size: {size}")
+
+        prod = product_code or getattr(self, "product_code", None)
+        if not prod:
+            raise RuntimeError("product_code is not set on Exchange")
+
+        body: Dict[str, Any] = {
+            "product_code": prod,
+            "child_order_type": "MARKET",
+            "side": s,
+            "size": float(size),
+            "time_in_force": "IOC",
+        }
+
+        try:
+            logger.info(
+                "place request: sendchildorder IOC (tag={tag}, side={side}, size={size}, product={prod})",
+                tag=tag, side=s, size=size, prod=prod,
+            )
+        except Exception:
+            pass
+
+        data = self._request(
+            "POST",
+            "/v1/me/sendchildorder",
+            json_body=body,
+            idempotent=False,
+            max_retries=0,
+        )
+
+        try:
+            logger.info(
+                "placed: sendchildorder IOC ok (tag={tag}, side={side}, size={size}, product={prod}, resp={resp})",
+                tag=tag, side=s, size=size, prod=prod, resp=data,
+            )
+        except Exception:
+            pass
+
+        return data.get("child_order_acceptance_id") or ""
+
     def cancel_child_order(
         self,
         *,
@@ -234,6 +293,10 @@ class BitflyerExchange:
             idempotent=True,
             max_retries=3,
         )
+
+    def get_collateral(self) -> Dict[str, Any]:
+        """口座の証拠金情報を取得（collateral/require_collateral/keep_rate 等）。"""
+        return self._request("GET", "/v1/me/getcollateral", idempotent=True, max_retries=3)
 
     def get_positions(self) -> List[Dict[str, Any]]:
         """現在の建玉一覧を返す関数（+BUY/-SELLの合算に使う）"""
