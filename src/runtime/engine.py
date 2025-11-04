@@ -203,6 +203,27 @@ class PaperEngine:
         self._day_start_utc = jst_midnight.astimezone(timezone.utc)  # 【関数】当日JST 0時（UTC）
         self._daily_R, self._R_HWM = 0.0, 0.0  # 【関数】日次PnLとそのHWM（DD計算に使用）
 
+        # 直近N件だけ保持するリングバッファ（errors.recent_buffer_len で上書き可）
+        try:
+            buf_len = 200
+            if isinstance(self.cfg, Mapping):
+                err_cfg = (self.cfg.get("errors") or {})
+                buf_len = int(err_cfg.get("recent_buffer_len", 200) or 200)
+        except Exception:
+            buf_len = 200
+        self.recent_errors = deque(maxlen=buf_len)
+
+        # 保有開始時刻と違反記録（hold超過の連打防止）
+        self._pos_nonzero_since_utc = None  # ポジションがゼロ→非ゼロになった時刻（UTC）
+        self._last_hold_violation_ts = None  # max_hold_minutes の直近違反記録
+
+        # 連打抑止用の状態
+        self._last_place_monotonic = 0.0  # 直近の発注時刻（monotonic）
+        self._dedup_recent: dict[str, float] = {}
+
+        # 取引所送信メソッドの直前にゲートを差し込む（reduce-only/auto_*は常に許可）
+        self._install_order_gates()
+
     def _ts_jst(self, dt: datetime) -> str:
         """ログ用のJST ISO文字列を返す（タイムゾーン未指定ならUTC扱い）。"""
         if getattr(dt, "tzinfo", None) is None:
@@ -637,6 +658,317 @@ class PaperEngine:
                 return dict(extra)
         return None
 
+    def would_reduce_inventory(self, *, side: str, qty: float) -> bool:
+        """
+        これは「この発注が在庫を“減らす向き”か」を判定する関数です。
+        - Q>0（ロング）なら SELL が reduce、Q<0（ショート）なら BUY が reduce、Q=0はどちらも新規。
+        """
+        try:
+            q = float(getattr(self, "Q", 0.0) or 0.0)
+        except Exception:
+            q = 0.0
+        if q == 0.0:
+            return False
+        s = str(side or "").upper()
+        return (q > 0.0 and s == "SELL") or (q < 0.0 and s == "BUY")
+
+    def _place_fingerprint(self, *, side, size, price=None) -> str:
+        """
+        同じ発注を短時間に繰り返さないための“指紋”を作る。
+        タグに依存せず、(side, round(size,8), round(price or 0,2)) で判定。
+        """
+        try:
+            s = (str(side).upper(), f"{float(size):.8f}", f"{float(price or 0):.2f}")
+            return "|".join(s)
+        except Exception:
+            return f"{side}|{size}|{price}"
+
+    def _update_hold_timer_if_needed(self, now: datetime) -> None:
+        """
+        ポジションがゼロ↔非ゼロをまたいだ時に“保有開始時刻”を更新します。
+        - Qが非ゼロで、まだ開始時刻が無ければ now を記録。
+        - Qがゼロに戻ったら開始時刻と違反印をクリア。
+        """
+        try:
+            q = float(getattr(self, "Q", 0.0) or 0.0)
+        except Exception:
+            q = 0.0
+        if q != 0.0 and getattr(self, "_pos_nonzero_since_utc", None) is None:
+            self._pos_nonzero_since_utc = now
+        if q == 0.0:
+            self._pos_nonzero_since_utc = None
+            self._last_hold_violation_ts = None
+
+    def _order_gate_close_only_and_hold(
+        self,
+        *,
+        side: str,
+        size: float,
+        tag: str | None,
+        reduce_only: bool,
+    ) -> bool:
+        """
+        close_only_until_flat と max_hold_minutes をまとめて判定し、通す/止めるを決定。
+        必要なら MARKET+IOC で自動縮小（在庫は増やさない）を行います。
+        ルール:
+        - “決済は常に許可”: reduce_only=True または reduce 向きは常に許可。
+        - close_only_until_flat: 非ゼロ保有中は“増やす向き”をブロック。
+        - max_hold_minutes: しきい値超過で reduce 方向 IOC を一度だけ発火（連打防止）。
+        """
+        # 設定（安全側の既定値）
+        try:
+            risk = (self.cfg.get("risk") if isinstance(self.cfg, Mapping) else getattr(self.cfg, "risk", None)) or {}
+        except Exception:
+            risk = {}
+        close_only_enabled = bool(risk.get("close_only_until_flat", False))
+        try:
+            max_hold_minutes = int(risk.get("max_hold_minutes", 0) or 0)
+        except Exception:
+            max_hold_minutes = 0
+
+        # 保有開始時刻の更新
+        now = datetime.now(timezone.utc)
+        self._update_hold_timer_if_needed(now)
+
+        # 決済は常に許可（reduce-only または reduce 向き）
+        if reduce_only or self.would_reduce_inventory(side=side, qty=size):
+            return True
+
+        # 非ゼロ保有中の新規（増やす向き）はブロック
+        if close_only_enabled and getattr(self, "_pos_nonzero_since_utc", None) is not None:
+            logger.info(
+                "skip place: close_only_until_flat (side={side}, size={size}, tag={tag})",
+                side=side, size=size, tag=(tag or ""),
+            )
+            return False
+
+        # 長時間保有の自動縮小（当たる分だけ約定: MARKET+IOC）
+        if (max_hold_minutes > 0) and (getattr(self, "_pos_nonzero_since_utc", None) is not None):
+            hold_elapsed = now - self._pos_nonzero_since_utc
+            if hold_elapsed >= timedelta(minutes=max_hold_minutes):
+                last = getattr(self, "_last_hold_violation_ts", None)
+                should_fire = (last is None) or ((now - last) >= timedelta(seconds=30))
+                if should_fire:
+                    try:
+                        q = float(getattr(self, "Q", 0.0) or 0.0)
+                    except Exception:
+                        q = 0.0
+                    if q != 0.0:
+                        side_reduce = "SELL" if q > 0.0 else "BUY"
+                        qty = abs(q)
+                        logger.warning(
+                            "max_hold_minutes: auto reduce via IOC (elapsed={mins}m, side={s}, qty={q})",
+                            mins=int(hold_elapsed.total_seconds() // 60), s=side_reduce, q=qty,
+                        )
+                        ex = getattr(self, "exchange", None)
+                        if ex is not None and hasattr(ex, "place_ioc_reduce_only"):
+                            try:
+                                ex.place_ioc_reduce_only(side=side_reduce, size=qty, tag="max_hold_minutes")
+                            except Exception as e:
+                                msg = str(e)
+                                is_205 = ("-205" in msg) or ("Margin amount is insufficient" in msg)
+                                rec = getattr(self, "_record_recent_error", None)
+                                if callable(rec):
+                                    rec(kind="sendchildorder", code=(-205 if is_205 else None), message=msg)
+                                else:
+                                    logger.warning("max_hold_minutes auto-reduce error: {msg}", msg=msg)
+                                if not is_205:
+                                    raise
+                        # PaperEngine では exchange が無ければ何もしない（安全側）
+                    self._last_hold_violation_ts = now
+
+        return True
+
+    def _install_order_gates(self) -> None:
+        """
+        取引所送信メソッドの直前に“ゲート”を差し込む。
+        - reduce_only=True と tag が 'auto_' で始まるものは常に許可。
+        - 戦略コードを改変せずに send_child_order/place_* に適用。
+        """
+        ex = getattr(self, "exchange", None)
+        if ex is None:
+            return
+
+        import inspect  # 局所import（依存最小）
+
+        def _extract(kwargs):
+            side = kwargs.get("side", None)
+            size = kwargs.get("size", None) or kwargs.get("qty", None)
+            tag = kwargs.get("tag", None)
+            reduce_only = bool(kwargs.get("reduce_only", False))
+            return side, size, tag, reduce_only
+
+        def _wrap_sync(orig):
+            def _wrapped_with_gate(*args, **kwargs):
+                side, size, tag, reduce_only = _extract(kwargs)
+                if tag and str(tag).startswith("auto_"):
+                    return orig(*args, **kwargs)
+                if (side is not None) and (size is not None):
+                    allow = self._order_gate_close_only_and_hold(
+                        side=str(side), size=float(size), tag=(str(tag) if tag is not None else None), reduce_only=reduce_only
+                    )
+                    if not allow:
+                        return None
+                    # 連打抑止（reduce 方向は常に許可）
+                    tx_cfg = (self.cfg.get("tx") if isinstance(self.cfg, Mapping) else getattr(self.cfg, "tx", None)) or {}
+                    try:
+                        min_interval_ms = int(tx_cfg.get("min_interval_ms", 0) or 0)
+                        dedup_ms = int(tx_cfg.get("place_dedup_ms", 0) or 0)
+                    except Exception:
+                        min_interval_ms = 0; dedup_ms = 0
+                    reduce_intent = bool(reduce_only or self.would_reduce_inventory(side=str(side), qty=float(size)))
+                    if not reduce_intent:
+                        now_m = time.monotonic()
+                        if min_interval_ms > 0 and (now_m - self._last_place_monotonic) < (min_interval_ms / 1000.0):
+                            logger.info("skip place: rate_limit (tx.min_interval_ms={ms})", ms=min_interval_ms)
+                            return None
+                        self._last_place_monotonic = now_m
+                        if dedup_ms > 0:
+                            fp = self._place_fingerprint(side=side, size=size, price=kwargs.get("price", kwargs.get("px")))
+                            last = self._dedup_recent.get(fp, 0.0)
+                            if (now_m - last) < (dedup_ms / 1000.0):
+                                logger.info("skip place: dedup (place_dedup_ms={ms}, fp={fp})", ms=dedup_ms, fp=fp)
+                                return None
+                            self._dedup_recent[fp] = now_m
+                return orig(*args, **kwargs)
+            _wrapped_with_gate.__name__ = "_wrapped_with_gate"
+            return _wrapped_with_gate
+
+        def _wrap(orig):
+            if inspect.iscoroutinefunction(orig):
+                async def _wrapped_with_gate_async(*args, **kwargs):
+                    side, size, tag, reduce_only = _extract(kwargs)
+                    if tag and str(tag).startswith("auto_"):
+                        return await orig(*args, **kwargs)
+                    if (side is not None) and (size is not None):
+                        allow = self._order_gate_close_only_and_hold(
+                            side=str(side), size=float(size), tag=(str(tag) if tag is not None else None), reduce_only=reduce_only
+                        )
+                        if not allow:
+                            return None
+                        # 連打抑止（reduce 方向は常に許可）
+                        tx_cfg = (self.cfg.get("tx") if isinstance(self.cfg, Mapping) else getattr(self.cfg, "tx", None)) or {}
+                        try:
+                            min_interval_ms = int(tx_cfg.get("min_interval_ms", 0) or 0)
+                            dedup_ms = int(tx_cfg.get("place_dedup_ms", 0) or 0)
+                        except Exception:
+                            min_interval_ms = 0; dedup_ms = 0
+                        reduce_intent = bool(reduce_only or self.would_reduce_inventory(side=str(side), qty=float(size)))
+                        if not reduce_intent:
+                            now_m = time.monotonic()
+                            if min_interval_ms > 0 and (now_m - self._last_place_monotonic) < (min_interval_ms / 1000.0):
+                                logger.info("skip place: rate_limit (tx.min_interval_ms={ms})", ms=min_interval_ms)
+                                return None
+                            self._last_place_monotonic = now_m
+                            if dedup_ms > 0:
+                                fp = self._place_fingerprint(side=side, size=size, price=kwargs.get("price", kwargs.get("px")))
+                                last = self._dedup_recent.get(fp, 0.0)
+                                if (now_m - last) < (dedup_ms / 1000.0):
+                                    logger.info("skip place: dedup (place_dedup_ms={ms}, fp={fp})", ms=dedup_ms, fp=fp)
+                                    return None
+                                self._dedup_recent[fp] = now_m
+                    return await orig(*args, **kwargs)
+                _wrapped_with_gate_async.__name__ = "_wrapped_with_gate"
+                return _wrapped_with_gate_async
+            return _wrap_sync(orig)
+
+        # ラップ対象（存在するものだけ）
+        for name in ("send_child_order", "sendchildorder", "place_limit", "place_market"):
+            if hasattr(ex, name):
+                orig = getattr(ex, name)
+                if getattr(orig, "__name__", "") == "_wrapped_with_gate":
+                    continue
+                setattr(ex, name, _wrap(orig))
+
+    async def auto_flatten_on_start(self) -> None:
+        """
+        起動直後に在庫が0でなければ、減らす方向の MARKET+IOC を1回だけ送って
+        フラットへ最短で寄せる（決済は常に許可、増やさない）。
+        - tag="auto_flatten_on_start" をログに出し、run.log から追跡可能（取引所へは送らない）。
+        - PaperEngine ではシミュレータへIOC相当の注文を1回だけ投入する。
+        """
+        try:
+            cfg_risk = None
+            if isinstance(self.cfg, Mapping):
+                cfg_risk = self.cfg.get("risk")
+            else:
+                cfg_risk = getattr(self.cfg, "risk", None)
+            enabled = True
+            if cfg_risk is not None:
+                node = cfg_risk.get("auto_flatten_on_start") if isinstance(cfg_risk, Mapping) else getattr(cfg_risk, "auto_flatten_on_start", None)
+                if node is not None:
+                    try:
+                        enabled = bool(node.get("enabled")) if isinstance(node, Mapping) else bool(getattr(node, "enabled", True))
+                    except Exception:
+                        enabled = True
+            if not enabled:
+                return
+
+            q = float(getattr(self, "Q", 0.0) or 0.0)
+            if q == 0.0:
+                return
+
+            side = "SELL" if q > 0 else "BUY"
+            qty = abs(q)
+            if qty <= 0.0:
+                return
+
+            # best bid/ask から即時約定を狙う価格をセット（SELL→bid / BUY→ask）
+            bid_px = getattr(getattr(self, "ob", None), "best_bid", None)
+            ask_px = getattr(getattr(self, "ob", None), "best_ask", None)
+            bid_px = None if bid_px is None else getattr(bid_px, "price", None)
+            ask_px = None if ask_px is None else getattr(ask_px, "price", None)
+            px = bid_px if side == "SELL" else ask_px
+            if px is None:
+                return  # 板が無ければ無理はしない
+
+            logger.info("auto_flatten_on_start: try place IOC (side={side}, qty={qty})", side=side, qty=qty)
+
+            # PaperではシミュレータにIOC相当を投入（ttlは使わず、tifはログ用途）
+            o = Order(
+                side=side.lower(),
+                price=float(px),
+                size=float(qty),
+                tif="IOC",
+                ttl_ms=None,
+                tag="auto_flatten_on_start",
+            )
+            now = _now_utc()
+            self.sim.place(o, now)
+            self.order_log.add(
+                ts=self._ts_jst(now), action="place", tif=o.tif, ttl_ms=o.ttl_ms,
+                px=o.price, sz=o.size, reason=o.tag,
+            )
+            self._heartbeat(now, "place", reason=o.tag)
+
+        except Exception:
+            # 起動時の安全装置なので、失敗しても運転継続を優先
+            return
+
+    def _record_recent_error(self, *, kind: str, code: int | None, message: str) -> None:
+        """
+        これは「REST送信エラーを直近N件だけリングバッファに積む」関数です。
+        - 在庫は動かさず“記録だけ”行います（運用の観測・傾向確認用）。
+        - kind: 送信種別の短い識別子（例: "sendchildorder"）
+        - code: 取引所のエラーコード（例: -205）。不明なら None。
+        - message: エラーメッセージ（短縮しない、生ログ追跡のため）
+        """
+        ts = datetime.now(timezone.utc).isoformat()
+        try:
+            item = {"ts": ts, "kind": kind, "code": code, "message": message}
+        except Exception:
+            item = {"ts": ts, "kind": str(kind), "code": code, "message": str(message)}
+        try:
+            self.recent_errors.append(item)
+        except Exception:
+            # バッファ未初期化などの異常は運転継続を優先
+            pass
+        # 運用ログにも1行（grepしやすい固定文言）。-205はキーワードで数えやすく。
+        if code == -205:
+            logger.warning("recent_errors[-205]: {item}", item=item)
+        else:
+            logger.warning("recent_errors: {item}", item=item)
+
     def _maybe_auto_reduce(self, now: datetime) -> None:
         """戦略が無音でも在庫だけで“薄め”を1口（Reduce‑Only+IOC）。板に残さない。"""
         try:
@@ -674,11 +1006,18 @@ class PaperEngine:
             eff = self.effective_inventory_limit() or 0.0
             eff_limit = Decimal(str(eff))
 
+            # recent_errors はリングバッファの message を渡す（-205 等の検知用）
+            recent_msgs: Sequence[str] = []
+            try:
+                recent_msgs = [str(it.get("message", "")) for it in (self.recent_errors or [])]
+            except Exception:
+                recent_msgs = []
+
             decision = auto_reduce_should_fire(
                 enabled=bool(_get(ar, "enabled", False)),
                 profit_only=bool(_get(ar, "profit_only", True)),
                 force_on_risk=bool(_get(ar, "force_on_risk", True)),
-                q=q, a=a, mark=mark, mode=mode, recent_errors=[], eff_limit=eff_limit,
+                q=q, a=a, mark=mark, mode=mode, recent_errors=recent_msgs, eff_limit=eff_limit,
             )
             if not decision.fire:
                 return
@@ -717,6 +1056,78 @@ class PaperEngine:
                 px=o.price, sz=o.size, reason=o.tag,
             )
             self._heartbeat(now, "place", reason=o.tag)
+        except Exception:
+            return
+
+    async def auto_flatten_on_kill(
+        self,
+        *,
+        max_attempts: int = 8,
+        min_step_qty: float = 0.001,
+        sleep_ms_between: int = 300,
+    ) -> None:
+        """
+        起動停止前に在庫が0になるまで（またはごく小さくなるまで）MARKET×IOCを短い間隔で繰り返す。
+        PaperEngine ではシミュレータに IOC 相当の注文を繰り返し投入する。
+        - ロング>0は SELL、ショート<0は BUY（reduce 方向）。
+        - 送信エラーは -205 のみ記録し継続。他は従来どおり上へ。
+        """
+        try:
+            q = float(getattr(self, "Q", 0.0) or 0.0)
+            if q == 0.0:
+                return
+
+            dust_eps = float(min_step_qty) * 0.5
+            for attempt in range(1, int(max_attempts) + 1):
+                q = float(getattr(self, "Q", 0.0) or 0.0)
+                if abs(q) <= dust_eps:
+                    logger.info("auto_flatten_on_kill: done (tiny tail |Q|={q})", q=q)
+                    break
+                side = "SELL" if q > 0.0 else "BUY"
+                qty = abs(q)
+
+                bid_px = getattr(getattr(self, "ob", None), "best_bid", None)
+                ask_px = getattr(getattr(self, "ob", None), "best_ask", None)
+                bid_px = None if bid_px is None else getattr(bid_px, "price", None)
+                ask_px = None if ask_px is None else getattr(ask_px, "price", None)
+                px = bid_px if side == "SELL" else ask_px
+                if px is None:
+                    break
+
+                logger.info(
+                    "auto_flatten_on_kill: attempt {attempt}/{max_attempts} place IOC (side={side}, qty={qty})",
+                    attempt=attempt, max_attempts=max_attempts, side=side, qty=qty,
+                )
+
+                o = Order(
+                    side=side.lower(),
+                    price=float(px),
+                    size=float(qty),
+                    tif="IOC",
+                    ttl_ms=None,
+                    tag="auto_flatten_on_kill",
+                )
+                now = _now_utc()
+                self.sim.place(o, now)
+                self.order_log.add(
+                    ts=self._ts_jst(now), action="place", tif=o.tif, ttl_ms=o.ttl_ms,
+                    px=o.price, sz=o.size, reason=o.tag,
+                )
+                self._heartbeat(now, "place", reason=o.tag)
+
+                try:
+                    await asyncio.sleep(float(sleep_ms_between) / 1000.0)
+                except Exception:
+                    pass
+
+            q = float(getattr(self, "Q", 0.0) or 0.0)
+            if abs(q) > dust_eps:
+                logger.warning(
+                    "auto_flatten_on_kill: remain position |Q|={q} after {max_attempts} attempts",
+                    q=abs(q), max_attempts=max_attempts,
+                )
+            else:
+                logger.info("auto_flatten_on_kill: flattened to zero before shutdown")
         except Exception:
             return
 
