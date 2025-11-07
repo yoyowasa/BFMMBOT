@@ -5,12 +5,7 @@
 
 env: paper  # 既定は paper（各環境ファイルで上書き）  # 文書準拠
 product_code: FX_BTC_JPY  # 対象銘柄は固定（CFD/FX_BTC_JPY）
-tick_size: 1  # 1tick
-
-tx:
-  min_interval_ms: 1000    # 送信間隔の最小値（全体レート制限）
-  place_dedup_ms: 1000     # 同一内容の短時間重複を抑止
-
+tick_size: 1  # 価格刻み（1 tick = 1 JPY）
 
 size:  # 取引サイズの下限と既定値
   min: 0.001     # 最小ロット
@@ -141,15 +136,7 @@ logging:  # ログ出力の基本設定
 strategy_cfg:
   stall_then_strike:
     size:
-      default: 0.001
-    min_requote_interval_ms: 1500
-    buy_momentum_filter:
-      window_ms: 2000
-      threshold_bps: 3.0
-      mode: sell_only
-    ttl_bands:
-      - { threshold_bp: 1.5, ttl_ms: 400, window_ms: 1000 }
-      - { threshold_bp: 5.0,  ttl_ms: 300, window_ms: 1000 }
+      default: 0.003
   cancel_add_gate:
     size:
       default: 0.007
@@ -164,5 +151,4 @@ env_overrides:
       max_mid_move_bp_30s: 10
     logging:
       level: INFO
-
 

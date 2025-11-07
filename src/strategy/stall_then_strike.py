@@ -275,13 +275,12 @@ class StallThenStrike(StrategyBase):
                         }
                     )
                 return actions
-            # SELL → BUY の順で独立発注（SELL偏重の意図）
             return [
                 {
                     "type": "place",
                     "order": Order(
-                        side="sell",
-                        price=mid + 1 * tick,
+                        side="buy",
+                        price=mid - 1 * tick,
                         size=lot,
                         tif="GTC",
                         ttl_ms=ttl_st,
@@ -291,8 +290,8 @@ class StallThenStrike(StrategyBase):
                 {
                     "type": "place",
                     "order": Order(
-                        side="buy",
-                        price=mid - 1 * tick,
+                        side="sell",
+                        price=mid + 1 * tick,
                         size=lot,
                         tif="GTC",
                         ttl_ms=ttl_st,

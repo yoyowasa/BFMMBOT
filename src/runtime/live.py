@@ -38,8 +38,6 @@ from src.core.logs import OrderLog, TradeLog  # 何をするか：orders/trades 
 from src.core.analytics import DecisionLog  # 何をするか：戦略の意思決定ログ（Parquet＋NDJSONミラー）を扱う
 
 from src.core.exchange import BitflyerExchange, ExchangeError, ServerError, NetworkError, AuthError  # 何をするか：認証/権限エラー(AuthError)を検知して安全停止する
-from src.core.risk import auto_reduce_should_fire  # 自動縮小の発火判定（profit_only/force_on_risk 等）
-
 def _normalize_strategy_names(
     primary: str,
     strategies: Sequence[str] | str | None,
@@ -111,6 +109,10 @@ def _mid_from_ob(ob: OrderBook) -> float | None:
     mid_val = getattr(ob, "mid_price", None)
     return float(mid_val) if mid_val is not None else None
 
+def _round_to_tick(px: float, tick: float) -> float:
+    """何をするか：価格をtick単位に丸める（誤差や端数を防ぐ）"""
+    return float(round(px / tick) * tick)
+
 def _round_size(sz: float, step: float) -> float:
     """何をするか：サイズを最小刻み(step)に丸めて端数を防ぐ（0に潰れないよう四捨五入）"""
     if step <= 0.0:
@@ -131,6 +133,24 @@ def _net_inventory_btc(ex: BitflyerExchange) -> float:
         sz = float(p.get("size", 0.0))
         q += sz if side == "BUY" else -sz
     return q
+
+def _seed_live_orders_from_active(ex: BitflyerExchange, live_orders: dict[str, dict]) -> None:
+    """何をするか：取引所に残っている未約定(ACTIVE)注文を見つけて、監視辞書(live_orders)へ投入する"""
+    try:
+        items = ex.list_active_child_orders(count=100)  # 何をするか：ACTIVEな子注文を最大100件取得
+    except ExchangeError:
+        return  # 何をするか：一時失敗は何もしない（次回に回す）
+    for it in items or []:
+        acc = str(it.get("child_order_acceptance_id") or "")
+        if not acc or acc in live_orders:
+            continue  # 何をするか：IDなし/すでに監視中ならスキップ
+        side = str(it.get("side", "")).upper()
+        px = float((it.get("price") or it.get("average_price") or 0.0) or 0.0)
+        sz = float(it.get("size", 0.0) or 0.0)
+        executed = float(it.get("executed_size", 0.0) or 0.0)
+        avg = float(it.get("average_price", 0.0) or 0.0)
+        o = SimpleNamespace(side=side, price=px, size=sz, tag="seed", tif="GTC", ttl_ms=None)  # 何をするか：最小限の“注文情報”を用意
+        live_orders[acc] = {"deadline": None, "order": o, "executed": executed, "avg_price": avg}  # 何をするか：TTLなしで監視（Fillで自然に片付く）
 
 def _seed_inventory_and_avg_px(ex: BitflyerExchange) -> tuple[float | None, float]:
     """何をするか：取引所の建玉一覧から“平均コスト（参考）”と“ネット建玉(BTC)”を取得して初期状態に入れる"""
@@ -501,6 +521,23 @@ def _check_kill(daily_R: float, R_HWM: float, kill_cfg) -> bool:
             return True
     return False
 
+def _refresh_fills(ex: BitflyerExchange, live_orders: dict[str, dict]) -> None:
+    """何をするか：RESTの me/getchildorders で各注文の約定状況を取り込み、完了注文を監視対象から外す"""
+    for acc_id, meta in list(live_orders.items()):
+        try:
+            info_list = ex.get_child_order_by_acceptance_id(acc_id)  # 何をするか：受理IDで照会
+        except ExchangeError:
+            continue  # 何をするか：一時失敗は無視して次回に回す
+        if not info_list:
+            continue
+        info = info_list[0]
+        executed = float(info.get("executed_size", 0.0) or 0.0)
+        outstanding = float(info.get("outstanding_size", 0.0) or 0.0)
+        state = str(info.get("child_order_state", "")).upper()
+        live_orders[acc_id]["executed"] = executed  # 何をするか：累計約定量をローカルに反映
+        if state == "COMPLETED" or (outstanding <= 1e-12 and executed > 0.0):
+            del live_orders[acc_id]  # 何をするか：完了注文は監視から除去
+
 def run_live(
     cfg: Any,
     strategy_name: str,
@@ -536,211 +573,92 @@ def run_live(
         summary_name = primary_strategy
 
     with BitflyerExchange(api_key, api_secret, product_code=product_code) as ex:
-        # 先に最低限の参照を初期化しておく（ネスト関数内の未定義警告を避ける）
-        hb_path: Path = Path("logs/runtime/heartbeat.ndjson")
-        hb_path.parent.mkdir(parents=True, exist_ok=True)
-        orders_dir = Path("logs/orders"); orders_dir.mkdir(parents=True, exist_ok=True)
-        trades_dir = Path("logs/trades"); trades_dir.mkdir(parents=True, exist_ok=True)
-        analytics_dir = Path("logs/analytics"); analytics_dir.mkdir(parents=True, exist_ok=True)
-        order_log = OrderLog(orders_dir / "orders.parquet", mirror_ndjson=orders_dir / "order_log_0001.ndjson")
-        trade_log = TradeLog(trades_dir / "trades.parquet", mirror_ndjson=trades_dir / "trade_log_0001.ndjson")
-        decision_log = DecisionLog(analytics_dir / "decision.parquet", mirror_ndjson=analytics_dir / "decision_log_0001.ndjson")
-        live_orders: dict[str, dict] = {}
-        pnl_state: dict[str, float] = {"pos": 0.0, "avg_px": 0.0}
-        # 直近N件だけ保持するリングバッファ（errors.recent_buffer_len で上書き可）
         try:
-            err_buf_len = 200
-            err_cfg = getattr(cfg, "errors", None)
-            if err_cfg is None and isinstance(cfg, Mapping):
-                err_cfg = cfg.get("errors")
-            if err_cfg is not None:
-                err_buf_len = int(getattr(err_cfg, "recent_buffer_len", None) or (err_cfg.get("recent_buffer_len") if isinstance(err_cfg, Mapping) else 200) or 200)
-        except Exception:
-            err_buf_len = 200
-        recent_errors = deque(maxlen=err_buf_len)
-
-        def _record_recent_error(*, kind: str, code: int | None, message: str) -> None:
-            """REST送信エラーを直近N件だけリングバッファに積む（在庫は動かさない）。"""
-            ts = _now_utc().isoformat()
-            try:
-                item = {"ts": ts, "kind": kind, "code": code, "message": message}
-            except Exception:
-                item = {"ts": ts, "kind": str(kind), "code": code, "message": str(message)}
-            try:
-                recent_errors.append(item)
-            except Exception:
-                pass
-            if code == -205:
-                logger.warning("recent_errors[-205]: {item}", item=item)
+            _ = ex.list_active_child_orders(count=1)
+            if dry_run:
+                logger.info(
+                    f"live(dry-run): exchange OK product={product_code} strategy={summary_name} strategies={strategy_list}"
+                )
+                logger.info("live(dry-run): ここでは発注しません（導線の疎通確認だけ）")
             else:
-                logger.warning("recent_errors: {item}", item=item)
+                # 次ステップで：ここにイベントループ＋戦略呼び出し＋TTL取消などを実装
+                pass
+            live_orders: dict[str, dict] = {}  # 何をするか：受理ID→TTLなどのメタ情報を保持
+            if not bool(getattr(cfg, "cancel_all_on_start", True)):  # 何をするか：起動時に全取消しない運用なら、残っている注文を監視にシード
+                _seed_live_orders_from_active(ex, live_orders)
 
-        # 起動直後のオートフラット（在庫が非ゼロなら reduce 方向に MARKET+IOC を1回送る）
-        def _auto_flatten_on_start() -> None:
+            mid_hist = deque(maxlen=2048)  # 何をするか：ミッド価格の履歴（30秒変化ガード用）
+            max_bp = getattr(getattr(cfg, "guard", None), "max_mid_move_bp_30s", None)  # 何をするか：ミッド変化ガードの閾値
+            inv_limit = getattr(getattr(cfg, "risk", None), "max_inventory", None)  # 何をするか：在庫上限
+            inv_eps_default = 0.0 if inv_limit is None else max(0.0, float(inv_limit) * 0.01)
+            inventory_eps = float(getattr(getattr(cfg, "risk", None), "inventory_eps", inv_eps_default))
+            eff_inv_limit = None if inv_limit is None else max(0.0, float(inv_limit) - float(inventory_eps))
+            _last_tx_at = None  # 何をするか：直近の実発注時刻を覚えておく（TX間隔ガード用）
+
+            canary_m = getattr(cfg, "canary_minutes", None)  # 何をするか：実運転の時間制限（分）。None/0なら無効
+            fee_bps = float(getattr(getattr(cfg, "fees", None), "bps", 0.0) or 0.0)  # 何をするか：手数料(bps)を設定から取得（無ければ0.0）
+            dry_limit_s = getattr(cfg, "dry_run_max_sec", None)  # 何をするか：dry-runの自動停止（秒）。Noneなら無効
+
+            max_active = getattr(getattr(cfg, "risk", None), "max_active_orders", None)  # 何をするか：同時アクティブ注文数の上限（個）
+            max_spread_bp = getattr(getattr(cfg, "guard", None), "max_spread_bp", None)  # 何をするか：スプレッドが広すぎる時の停止しきい値(bp)
+            stale_ms = int(getattr(getattr(cfg, "guard", None), "max_stale_ms", 3000))  # 何をするか：WS/板の鮮度しきい値(ms)。超えたら新規を止める
+            last_ev_at = _now_utc()  # 何をするか：直近イベントの時刻（鮮度ガードの基準）
+            hb_path = Path("logs/runtime/heartbeat.ndjson")  # 何をするか：ハートビートの出力先
+            maint_prev = None  # 何をするか：メンテ窓の前回状態（enter/exit検知用）
+            fund_prev = None   # 何をするか：Funding窓（計算or授受）の前回状態（enter/exit検知用）
+            maint_csv = Path("logs/events/maintenance.csv")  # 何をするか：メンテ窓のイベントCSVのパス
+            fund_csv = Path("logs/events/funding.csv")       # 何をするか：Funding窓のイベントCSVのパス
+            maint_now = False  # 何をするか：参照前の未定義を避けるための初期値（後で毎周回の判定で上書き）
+            fund_now = False   # 何をするか：同上（Funding窓も先にFalseで用意しておく）
+
+            hb_interval_s = int(getattr(getattr(cfg, "logging", None), "heartbeat_status_sec", 5))  # 何をするか：ステータス心拍の間隔（秒）
+            hb_next = _now_utc() + timedelta(seconds=hb_interval_s)  # 何をするか：次に出す時刻
+
+            order_log = OrderLog("logs/orders/order_log.parquet", mirror_ndjson="logs/orders/order_log.ndjson")  # 何をするか：発注/取消イベントを記録
+            trade_log = TradeLog("logs/trades/trade_log.parquet", mirror_ndjson="logs/trades/trade_log.ndjson")  # 何をするか：約定明細とPnLを記録
+            decision_log = DecisionLog("logs/analytics/decision_log.parquet", mirror_ndjson="logs/analytics/decision_log.ndjson")  # 何をするか：意思決定（features/decision）を記録する
+            events_dir = Path("logs/events")  # 何をするか：窓イベントCSVの保存先
+            events_dir.mkdir(parents=True, exist_ok=True)  # 何をするか：フォルダを作成
+            (events_dir / "maintenance.csv").touch(exist_ok=True)  # 何をするか：ファイルを事前作成
+            (events_dir / "funding_schedule.csv").touch(exist_ok=True)  # 何をするか：ファイルを事前作成
+            maint_prev, fund_prev = False, False  # 何をするか：直前の窓状態（入っていたか）を保持
+
+            hb_path.parent.mkdir(parents=True, exist_ok=True)  # 何をするか：保存先フォルダを作る
+
+            halted = False  # 何をするか：Kill 到達後は新規を出さない
+            pnl_state = (lambda a,n: {"pos": n, "avg_px": a})(*_seed_inventory_and_avg_px(ex))  # 何をするか：起動時の建玉(数量/平均建値)を反映してPnL状態を初期化
+            daily_R, R_HWM = 0.0, 0.0  # 何をするか：日次実現PnLとその高値（HWM）
+            _jst = timezone(timedelta(hours=9))  # 何をするか：JST（Killの日次境界に使用）
+            jst_day = _now_utc().astimezone(_jst).date()  # 何をするか：当日のJST日付
+            kill_cfg = getattr(getattr(cfg, "risk", None), "kill", None)  # 何をするか：Killしきい値
+            min_tx_ms = int(getattr(getattr(cfg, "tx", None), "min_interval_ms", 100))  # 何をするか：新規注文を連続で送らない最小間隔（ms）
+            place_dedup_ms = int(getattr(getattr(cfg, "tx", None), "place_dedup_ms", 300))  # 何をするか：同一(side×price×tag)の連打をこのms以内ならスキップ
+            last_place: dict[str, datetime] = {}  # 何をするか：直近に出した(side|price|tag)→時刻 を覚える
+            _last_tx_at = _now_utc() - timedelta(milliseconds=min_tx_ms)  # 何をするか：直近の送信時刻（初期は「今−間隔」で即送れる状態）
+            fee_bps = float(getattr(getattr(cfg, "fees", None), "bps", 0.0))  # 何をするか：手数料のbps設定（未指定は0.0）
+            canary_min = int(getattr(cfg, "canary_minutes", 60))  # 何をするか：最長運転時間（分）。未指定は60分
+            throttle_until: datetime | None = None  # 何をするか：レート制限に当たった時のクールダウン期限
+
             try:
-                # 設定: デフォルト有効、cfg.risk.auto_flatten_on_start.enabled で上書き
-                risk_node = getattr(cfg, "risk", None)
-                af = getattr(risk_node, "auto_flatten_on_start", None)
-                if af is None and isinstance(risk_node, Mapping):
-                    af = risk_node.get("auto_flatten_on_start")
-                enabled = True if af is None else bool(getattr(af, "enabled", True) if not isinstance(af, Mapping) else af.get("enabled", True))
-                if not enabled:
-                    return
+                _ = ex.list_active_child_orders(count=1)  # 何をするか：認証/権限・疎通の最小チェック（実発注なし）
+            except AuthError as e:
+                logger.error(f"live: auth failed → halt: {e}")  # 何をするか：理由をrun.logへ
+                _hb_write(hb_path, event="kill", ts=_now_utc().isoformat(), reason="auth")  # 何をするか：心拍に“auth停止”を記録
+                return  # 何をするか：安全に終了（実運転に入らない）
 
-                q = float(pnl_state.get("pos", 0.0))
-                if q == 0.0:
-                    return
+            sys.excepthook = _mk_excepthook(ex, hb_path, live_orders, sys.excepthook)  # 何をするか：未捕捉例外→全取消&kill停止のフックを登録
+            if getattr(cfg, "cancel_all_on_start", True):  # 何をするか：起動時の安全装置（全取消）設定を確認
+                if dry_run:  # 何をするか：dry-run中は実際に取消しを実行しない（安全にスキップ）
+                    logger.info("live(dry-run): startup safety — skip cancel_all")  # 何をするか：スキップした事実をrun.logへ記録
+                else:
+                    ex.cancel_all_child_orders()  # 何をするか：本運転のみ、残っている全ての子注文を取消
+                    logger.info("live: startup safety — cancel_all issued")  # 何をするか：実行した事実をrun.logへ記録
 
-                side = "SELL" if q > 0 else "BUY"
-                qty = abs(q)
-                if qty <= 0.0:
-                    return
 
-                if dry_run:
-                    logger.info("auto_flatten_on_start[dry_run]: skip place IOC (side={side}, qty={qty})", side=side, qty=qty)
-                    return
+            started_at = _now_utc()  # 何をするか：Canary の開始時刻
+            _JST = timezone(timedelta(hours=9))  # 何をするか：JSTのタイムゾーン
+            day_start_utc = _now_utc().astimezone(_JST).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)  # 何をするか：当日のJST=00:00（UTCに直した時刻）
 
-                logger.info("auto_flatten_on_start: try place IOC (side={side}, qty={qty})", side=side, qty=qty)
-                try:
-                    acc = ex.place_ioc_reduce_only(side=side, size=qty, tag="auto_flatten_on_start")
-                except Exception as e:
-                    msg = str(e)
-                    is_205 = ("-205" in msg) or ("Margin amount is insufficient" in msg)
-                    _record_recent_error(kind="sendchildorder", code=(-205 if is_205 else None), message=msg)
-                    if not is_205:
-                        raise
-                    return
-                if not acc:
-                    return
-
-                # live_orders 登録とロギング
-                now0 = _now_utc()
-                o = SimpleNamespace(side=side, price=None, size=qty, tag="auto_flatten_on_start", tif="IOC", ttl_ms=None, reduce_only=True)
-                live_orders[str(acc)] = {"deadline": None, "order": o, "executed": 0.0, "avg_price": 0.0}
-                order_log.add(ts=now0.isoformat(), action="place", tif="IOC", ttl_ms=None, px=None, sz=qty, reason="auto_flatten_on_start")
-                _hb_write(hb_path, event="place", ts=now0.isoformat(), acc=str(acc), reason="auto_flatten_on_start", tif="IOC", ttl_ms=None, px=None, sz=qty)
-            except Exception:
-                # 起動時の安全装置なので失敗しても運転継続
-                return
-
-        # 停止直前のオートフラット（在庫が0になるまで MARKT+IOC を短い間隔で繰り返し送る）
-        def _auto_flatten_on_kill(max_attempts: int = 8, min_step_qty: float = 0.001, sleep_ms_between: int = 300) -> None:
-            try:
-                if dry_run:
-                    logger.info("auto_flatten_on_kill[dry_run]: skip flatten")
-                    return
-                # 小さな尻尾で打ち切るしきい値
-                dust_eps = float(min_step_qty) * 0.5
-                for attempt in range(1, int(max_attempts) + 1):
-                    try:
-                        q = float(_net_inventory_btc(ex))
-                    except Exception:
-                        q = 0.0
-                    if abs(q) <= dust_eps:
-                        logger.info("auto_flatten_on_kill: done (tiny tail |Q|={q})", q=q)
-                        break
-                    side = "SELL" if q > 0.0 else "BUY"
-                    qty = abs(q)
-                    logger.info(
-                        "auto_flatten_on_kill: attempt {attempt}/{max_attempts} place IOC (side={side}, qty={qty})",
-                        attempt=attempt, max_attempts=max_attempts, side=side, qty=qty,
-                    )
-                    try:
-                        acc = ex.place_ioc_reduce_only(side=side, size=qty, tag="auto_flatten_on_kill")
-                    except Exception as e:
-                        msg = str(e)
-                        is_205 = ("-205" in msg) or ("Margin amount is insufficient" in msg)
-                        _record_recent_error(kind="sendchildorder", code=(-205 if is_205 else None), message=msg)
-                        if not is_205:
-                            raise
-                        time.sleep(float(sleep_ms_between) / 1000.0)
-                        continue
-                    if not acc:
-                        time.sleep(float(sleep_ms_between) / 1000.0)
-                        continue
-
-                    now1 = _now_utc()
-                    o = SimpleNamespace(side=side, price=None, size=qty, tag="auto_flatten_on_kill", tif="IOC", ttl_ms=None, reduce_only=True)
-                    live_orders[str(acc)] = {"deadline": None, "order": o, "executed": 0.0, "avg_price": 0.0}
-                    order_log.add(ts=now1.isoformat(), action="place", tif="IOC", ttl_ms=None, px=None, sz=qty, reason="auto_flatten_on_kill")
-                    _hb_write(hb_path, event="place", ts=now1.isoformat(), acc=str(acc), reason="auto_flatten_on_kill", tif="IOC", ttl_ms=None, px=None, sz=qty)
-                    time.sleep(float(sleep_ms_between) / 1000.0)
-            except Exception:
-                return
-        # 自動縮小（auto-reduce）: 在庫が0でないときに減らす方向だけMARKET+IOCを投げる補助関数
-        throttle_until = None
-        _last_tx_at = None
-        def _maybe_auto_reduce(now: datetime) -> None:
-            """
-            在庫が非ゼロのときだけ reduce 方向へ MARKET×IOC を1回送る（tag=auto_reduce）。
-            - profit_only/force_on_risk/min_step_qty は cfg.risk.auto_reduce に従う（未設定は安全側既定）
-            - -205 は recent_errors に記録のみ。他は従来どおり上へ送出。
-            """
-            nonlocal throttle_until, _last_tx_at
-            try:
-                risk_node = getattr(cfg, "risk", None)
-                ar = getattr(risk_node, "auto_reduce", None)
-                if ar is None and isinstance(risk_node, Mapping):
-                    ar = risk_node.get("auto_reduce")
-                enabled = bool(getattr(ar, "enabled", False) if ar is not None else False)
-                profit_only = bool(getattr(ar, "profit_only", True) if ar is not None else True)
-                force_on_risk = bool(getattr(ar, "force_on_risk", True) if ar is not None else True)
-                min_step_qty = float(getattr(ar, "min_step_qty", 0.001) if ar is not None else 0.001)
-                if not enabled:
-                    return
-
-                q = float(pnl_state.get("pos", 0.0))
-                a = float(pnl_state.get("avg_px", 0.0) or 0.0)
-                if q == 0.0:
-                    return
-
-                try:
-                    bid_px = _best_px(getattr(ob, "best_bid", None))
-                    ask_px = _best_px(getattr(ob, "best_ask", None))
-                    mark = None if (bid_px is None or ask_px is None or ask_px <= 0 or bid_px <= 0) else (bid_px + ask_px) / 2.0
-                except Exception:
-                    mark = None
-
-                side = "SELL" if q > 0 else "BUY"
-                if profit_only and (a and mark is not None):
-                    exp_per_unit = (mark - a) if q > 0 else (a - mark)
-                    if exp_per_unit < 0 and not force_on_risk:
-                        return
-
-                qty = min(abs(q), float(min_step_qty))
-                if qty <= 0.0:
-                    return
-
-                if dry_run:
-                    logger.info("auto_reduce[dry_run]: skip place IOC (side={side}, qty={qty})", side=side, qty=qty)
-                    return
-
-                logger.info("auto_reduce: try place IOC (side={side}, qty={qty})", side=side, qty=qty)
-                try:
-                    acc = ex.place_ioc_reduce_only(side=side, size=qty, tag="auto_reduce")
-                except Exception as e:
-                    msg = str(e)
-                    is_205 = ("-205" in msg) or ("Margin amount is insufficient" in msg)
-                    _record_recent_error(kind="sendchildorder", code=(-205 if is_205 else None), message=msg)
-                    if not is_205:
-                        raise
-                    return
-
-                if not acc:
-                    return
-
-                o = SimpleNamespace(side=side, price=None, size=qty, tag="auto_reduce", tif="IOC", ttl_ms=None, reduce_only=True)
-                live_orders[str(acc)] = {"deadline": None, "order": o, "executed": 0.0, "avg_price": 0.0}
-
-                order_log.add(ts=now.isoformat(), action="place", tif="IOC", ttl_ms=None, px=None, sz=qty, reason="auto_reduce")
-                _hb_write(hb_path, event="place", ts=now.isoformat(), acc=str(acc), reason="auto_reduce", tif="IOC", ttl_ms=None, px=None, sz=qty)
-                _last_tx_at = now
-
-            except RateLimitError as e:
-                logger.error(f"live: exchange RateLimit on auto_reduce → cooldown: {e}")
-                throttle_until = _now_utc() + timedelta(seconds=10)
-            except Exception:
-                return
             stop_event = Event()  # 何をするか：停止フラグ（signal 受信で立てる）
 
             def _on_signal(signum, frame) -> None:
@@ -808,83 +726,6 @@ def run_live(
                 logger.warning(f"live: strategy_cfg analytics append failed: {e}")
             else:
                 logger.info("live: strategy_cfg analytics appended")
-
-            # 起動時に各ロガー/ハートビート/状態を初期化（未定義の防止）
-            hb_path = Path("logs/runtime/heartbeat.ndjson")
-            hb_path.parent.mkdir(parents=True, exist_ok=True)
-
-            # 取引/注文/意思決定のログ（Parquet＋NDJSONミラー）
-            orders_dir = Path("logs/orders"); orders_dir.mkdir(parents=True, exist_ok=True)
-            trades_dir = Path("logs/trades"); trades_dir.mkdir(parents=True, exist_ok=True)
-            analytics_dir.mkdir(parents=True, exist_ok=True)
-            order_log = OrderLog(orders_dir / "orders.parquet", mirror_ndjson=orders_dir / "order_log_0001.ndjson")
-            trade_log = TradeLog(trades_dir / "trades.parquet", mirror_ndjson=trades_dir / "trade_log_0001.ndjson")
-            decision_log = DecisionLog(analytics_dir / "decision.parquet", mirror_ndjson=analytics_dir / "decision_log_0001.ndjson")
-            live_orders: dict[str, dict] = {}
-            mid_hist = deque(maxlen=2048)
-
-            # 運転状態
-            started_at = _now_utc()
-            last_ev_at = started_at
-            hb_interval_s = int(getattr(getattr(cfg, "health", None), "heartbeat_interval_sec", 1) or 1)
-            hb_next = started_at + timedelta(seconds=hb_interval_s)
-            _jst = timezone(timedelta(hours=9))
-            _JST = _jst  # 一部で大文字参照されているためエイリアスを用意
-            jst_day = started_at.astimezone(_jst).date()
-            # JSTの当日0時(UTC)を基準に日付ロールオーバー判定
-            day_start_utc = started_at.astimezone(_JST).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
-            events_dir = Path("logs/runtime"); events_dir.mkdir(parents=True, exist_ok=True)
-            maint_csv = events_dir / "maintenance.csv"
-            fund_csv = events_dir / "funding_schedule.csv"
-
-            # リスク・手数料・在庫上限
-            fee_bps = float(getattr(getattr(cfg, "fees", None), "bps", 0.0) or 0.0)
-            inv_limit = getattr(getattr(cfg, "risk", None), "max_inventory", None)
-            inv_eps_default = 0.0 if inv_limit is None else max(0.0, float(inv_limit) * 0.01)
-            inventory_eps = float(getattr(getattr(cfg, "risk", None), "inventory_eps", inv_eps_default))
-            eff_inv_limit = None if inv_limit is None else max(0.0, float(inv_limit) - float(inventory_eps))
-            kill_cfg = getattr(getattr(cfg, "risk", None), "kill", None)
-
-            # 在庫・平均価格の初期化（取得に失敗したら安全側で0初期化）
-            try:
-                pos0, avg0 = _seed_inventory_and_avg_px(ex)
-                pnl_state = {"pos": float(pos0 or 0.0), "avg_px": float(avg0 or 0.0)}
-            except Exception:
-                pnl_state = {"pos": 0.0, "avg_px": 0.0}
-
-            # 制御用パラメータ（無ければOFF）
-            canary_m = getattr(cfg, "canary_minutes", None)
-            canary_min = float(canary_m or 0.0)
-            dry_limit_s = getattr(cfg, "dry_run_limit_sec", None)
-            max_spread_bp = getattr(getattr(cfg, "features", None), "max_spread_bp", None)
-            max_bp = getattr(getattr(cfg, "guard", None), "max_mid_move_bp_30s", None)
-            max_active = getattr(getattr(cfg, "guard", None), "max_active_orders", None)
-            maint_prev, fund_prev = None, None
-            daily_R, R_HWM = 0.0, 0.0
-            # データ古さガード（ms）。未設定なら無効。
-            try:
-                stale_sec_cfg = getattr(getattr(cfg, "health", None), "stale_sec_warn", None)
-                stale_ms = int(stale_sec_cfg) * 1000 if stale_sec_cfg is not None else 0
-            except Exception:
-                stale_ms = 0
-
-            # 送信レート・重複抑止（ms）
-            try:
-                min_tx_ms = int(getattr(getattr(cfg, "tx", None), "min_interval_ms", 0) or 0)
-            except Exception:
-                min_tx_ms = 0
-            try:
-                place_dedup_ms = int(getattr(getattr(cfg, "tx", None), "place_dedup_ms", 0) or 0)
-            except Exception:
-                place_dedup_ms = 0
-            last_place: dict[str, datetime] = {}
-
-            # 例外時に全取消し→killを記録するフック（保守運転向け）
-            try:
-                sys.excepthook = _mk_excepthook(ex, hb_path, {}, sys.excepthook)
-            except Exception:
-                pass
-
             _hb_write(
                 hb_path,
                 event="start",
@@ -894,12 +735,7 @@ def run_live(
                 strategy=summary_name,
                 strategies=strategy_list,
             )  # 何をするか：起動の合図をrun.logと揃えて心拍に記録
-            atexit.register(_mk_atexit(hb_path))
-
-            # 起動直後オートフラット（ウォームアップ前の安全処理）
-            _auto_flatten_on_start()
-
-  # 何をするか：終了時にstopを1行出す
+            atexit.register(_mk_atexit(hb_path))  # 何をするか：終了時にstopを1行出す
 
 
             for ev in _stream_with_reconnect(product_code, hb_path):  # 何をするか：WSが切れても自動再接続しながらイベントを処理
@@ -914,13 +750,11 @@ def run_live(
                     if live_orders:
                         ex.cancel_all_child_orders()  # 何をするか：生きている注文をお片付け
                         live_orders.clear()
-                    _auto_flatten_on_kill()
                     return  # 何をするか：run_live を安全に終了
 
                 if dry_run and dry_limit_s and (now - started_at).total_seconds() >= float(dry_limit_s):  # 何をするか：dry-runの時間制限を超えたら終了
                     logger.info("live(dry-run): time limit reached → halt")  # 何をするか：終了理由をrun.logに記録
                     _hb_write(hb_path, event="kill", ts=now.isoformat(), reason="dryrun_done", runtime_sec=int((now - started_at).total_seconds()))  # 何をするか：心拍に終了理由と経過秒を記録
-                    _auto_flatten_on_kill()
                     return  # 何をするか：run_live を安全に終了
 
                 # 何をするか：現在の窓状態を判定（メンテ／Funding計算・授受のどれかでもTrue）
@@ -1077,7 +911,6 @@ def run_live(
                             logger.debug(f"pause midmove_guard: {move_bp:.1f}bp ≥ {max_bp}")
 
                 # 何をするか：メンテ/ファンディングの“窓”やガード中は新規を出さず整理だけ
-                _maybe_auto_reduce(now)  # 決済は常に許可：在庫を減らすIOC（tag=auto_reduce）を一回だけ送る
                 if paused_mid or _in_maintenance(now, cfg) or _in_funding_calc(now, cfg) or _in_funding_transfer(now, cfg):
                     reason = "midmove_guard" if paused_mid else ("maintenance" if _in_maintenance(now, cfg) else ("funding" if (_in_funding_calc(now, cfg) or _in_funding_transfer(now, cfg)) else "pause"))  # 何をするか：停止理由を決める
                     _hb_write(hb_path, event="pause", ts=now.isoformat(), reason=reason)  # 何をするか：停止を記録
@@ -1157,7 +990,6 @@ def run_live(
                             ex.cancel_all_child_orders()  # 何をするか：生きている注文を全て取消
                             live_orders.clear()
                         _hb_write(hb_path, event="kill", ts=now.isoformat(), daily_pnl_jpy=daily_R, dd_jpy=R_HWM - daily_R)  # 何をするか：心拍にKillを記録
-                        _auto_flatten_on_kill()
                         return  # 何をするか：run_live を終了（安全停止）
 
                     for _acc_id, _meta in list(live_orders.items()):  # 何をするか：全部さばけた注文を監視から外す（TTLや二重取消を防ぐ）
@@ -1362,7 +1194,6 @@ def run_live(
                 if throttled:
                     continue
 
-
-
-
-
+        except (AuthError, RateLimitError, ServerError, NetworkError, ExchangeError) as e:
+            logger.error(f"live: exchange 疎通に失敗しました: {e}")
+            raise
