@@ -467,6 +467,4 @@ class StallThenStrike(StrategyBase):
             if current_ts_ms is not None:
                 self._last_cancel_ts_ms = current_ts_ms
         self._set_decision_features(decision_features)
-        if stall_orders:
-            return [{"type": "cancel_tag", "tag": "stall"}]
-        return []
+        return [{"type": "cancel_tag", "tag": "stall"}]
