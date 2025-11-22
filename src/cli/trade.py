@@ -81,7 +81,6 @@ def _setup_text_logs(cfg, strategy: str) -> list[int]:
 
 from src.core.utils import load_config  # 【関数】設定ローダー（base＋上書き）:contentReference[oaicite:12]{index=12}
 from src.runtime.engine import PaperEngine  # 【関数】paperエンジン（本ステップ）
-from src.runtime.live import run_live  # 何をするか：本番（live）の最小導線（疎通確認）を呼び出す
 try:
     from src.runtime.engine import run_paper  # 何をするか：標準のペーパー入口（無い環境もあるのでtryで受ける）
 except Exception:
@@ -103,6 +102,12 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         choices=["stall_then_strike", "cancel_add_gate", "age_microprice", "zero_reopen_pop"],
         help="どの戦略で動かすか（省略時は config[strategies] を使用する）",
+    )
+    p.add_argument(
+        "--duration-min",
+        type=float,
+        default=None,
+        help="paper実行の最大稼働時間（分）。指定すると経過後に自動停止する",
     )
     p.add_argument("--dry-run", action="store_true", help="何をするか：liveでも実発注せず疎通確認だけ行う（安全テスト）")
     p.add_argument("--paper", action="store_true", help="何をするか：取引所へ発注せず、板に当たれば fills をシミュレートする")
@@ -187,6 +192,8 @@ def main() -> None:
                     except TypeError:
                         rp(cfg, selected_strategy)  # 互換：さらに古いシグネチャ（strategyのみ）の場合
             else:
+                # 遅延インポート（live環境のみ読み込む）
+                from src.runtime.live import run_live
                 run_live(
                     cfg,
                     selected_strategy,
@@ -204,10 +211,30 @@ def main() -> None:
             strategies=normalized_strategies,
             strategy_cfg=strategy_cfg,
         )
-        try:
-            asyncio.run(engine.run_paper())
-        except KeyboardInterrupt:
-            pass
+        duration_min = getattr(args, "duration_min", None)
+        if duration_min is not None and duration_min > 0:
+            # 何をするか：指定分数が経過したら run_paper をキャンセルして自動停止する
+            async def _run_with_timeout() -> None:
+                task = asyncio.create_task(engine.run_paper())
+                try:
+                    await asyncio.wait_for(task, timeout=duration_min * 60.0)
+                except asyncio.TimeoutError:
+                    logger.info(f"paper timeout reached ({duration_min:.2f} min) - cancelling")
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+            try:
+                asyncio.run(_run_with_timeout())
+            except KeyboardInterrupt:
+                pass
+        else:
+            try:
+                asyncio.run(engine.run_paper())
+            except KeyboardInterrupt:
+                pass
     finally:
         for sink_id in sink_ids:
             logger.remove(sink_id)

@@ -1,0 +1,66 @@
+
+                                self._heartbeat(now, "place", reason=o.tag)  # ハートビート：発注を要約
+
+                            elif act.get("type") == "cancel_tag":
+                                tag_val = act.get("tag")
+                                if not tag_val:
+                                    continue
+                                for o in self.sim.cancel_by_tag(tag_val):
+                                    corr_val = getattr(o, "_corr_id", None)
+                                    if corr_token is None and corr_val is not None:
+                                        corr_token = current_corr_ctx.set(corr_val)
+                                    corr_for_log = _coid_to_corr.get(
+                                        getattr(o, "client_order_id", ""),
+                                        (getattr(o, "_corr_id", None) or current_corr_ctx.get() or "-"),
+                                    )
+                                    self.order_log.add(
+                                        ts=self._ts_jst(now),
+                                        action="cancel",
+                                        tif=o.tif,
+                                        ttl_ms=o.ttl_ms,
+                                        px=o.price,
+                                        sz=o.remaining,
+                                        reason=(
+                                            f"strategy; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; corr={corr_for_log}"
+                                        ),
+                                    )
+                        finally:
+                            if corr_token is not None:
+                                current_corr_ctx.reset(corr_token)
+
+                elif ch.startswith("lightning_executions_"):
+                    self._maybe_auto_reduce(now=monotonic())  # 在庫とモードだけで“薄め”を1口（Reduce‑Only+IOC）
+                    # 約定でシミュを進め、Fill明細を受け取る→PnL/ログ反映
+                    fills = self.sim.on_executions(ev.get("message") or [], now)
+                    for f in fills:
+                        self._apply_fill_and_log(
+                            ts_iso=f["ts"], side=f["side"], px=float(f["price"]),
+                            sz=float(f["size"]), tag=f["tag"],
+                            order=f.get("order"),
+                        )
+                    # TTLチェックをもう一度（成約後の期限切れ）
+                    for o in self.sim.on_time(now):
+                        self.order_log.add(
+                            ts=self._ts_jst(now),
+                            action="cancel",
+                            tif=o.tif,
+                            ttl_ms=o.ttl_ms,
+                            px=o.price,
+                            sz=o.remaining,
+                            reason=(
+                                f"ttl; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                            ),
+                        )
+
+        except asyncio.CancelledError:
+            logger.info("paper cancelled")
+            raise
+        except KeyboardInterrupt:
+            logger.info("Ctrl+C - stopping paper")
+        finally:
+            # ログの確定保存
+            self.order_log.flush()
+            self.trade_log.flush()
+            self.decision_log.flush()
+            logger.info(f"paper end: realized_pnl={self.R}, open_orders={len(self.sim.open)}")

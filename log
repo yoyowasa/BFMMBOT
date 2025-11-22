@@ -133,8 +133,12 @@ Get-Content logs/runtime/heartbeat.ndjson -Wait | ForEach-Object { if (($_ | Con
 
 poetry run python -m src.cli.trade --config configs/live.yml
 poetry run python -m src.cli.trade --config configs/paper.yml
+poetry run python -m src.cli.trade --config configs/paper.yml --env paper `
+  --strategy stall_then_strike cancel_add_gate --duration-min 30
+poetry run python -m src.cli.trade --config configs/live.yml --strategy cancel_add_gate --dry-run
+poetry run python -m src.cli.trade --config configs/live.yml --strategy stall_then_strike --dry-run
+
 code tunnel --name home-dev
-poetry run python -m src.cli.trade --config configs/live.yml --strategy stall_then_strike --strategy cancel_add_gate
 gitから上書き
 git fetch origin main
 git reset --hard origin/main
@@ -144,8 +148,8 @@ git --no-pager diff --name-status origin/main
 git --no-pager log -1 --oneline
 git --no-pager log -1 --oneline origin/main
 
-cd "E:\BF-MMBOT"
-poetry shell
+cd E:\BF-MMBOT
+.\.venv\Scripts\Activate.ps1
 
 
 git add -A
@@ -153,3 +157,5 @@ git commit -m "chore: initial upload"   # ←必ずメッセージを入れる
 git push  
 
 python -m src.analytics.session_kpi --dir /mnt/data --config configs/paper.yml
+
+taskkill /IM python.exe /F

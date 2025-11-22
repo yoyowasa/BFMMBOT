@@ -1,40 +1,54 @@
 # src/core/simulator.py
-# 役割：最小の約定シミュレータ（録画の executions を見て、自分の指値がタッチしたら Fill とみなす）
+# 役割: 最小の約定シミュレータ。board/exec を受けて open 注文を管理し、Fill/Cancel を返す。
 from __future__ import annotations
 
-from datetime import datetime, timezone  # 時刻・TTL判定
-from typing import List, Dict, Any  # 型ヒント
-from loguru import logger  # 進捗ログ
+from datetime import datetime  # 時刻・TTL判定
+from typing import List, Dict, Any
+from loguru import logger
 
-from src.core.orders import Order  # 注文モデル
+from src.core.orders import Order
+
 
 class MiniSimulator:
-    """【関数】最小シミュレータ
-    - 役割: open注文の集合を持ち、TTLや executions に応じて Fill/Cancel を進める
-    - 簡略化: 価格タッチ＝Fill とみなす（キュー順位は後続で強化）
+    """最小シミュレータ
+    - open 注文を保持し、TTL や executions に応じて Fill/Cancel を処理する。
+    - 価格が当たったら Fill とみなす簡易版。
     """
+
     def __init__(self) -> None:
-        self.open: List[Order] = []   # 未約定の注文
-        self.placed = 0               # Place件数（要約用）
-        self.cancelled = 0            # Cancel件数（要約用）
-        self.filled = 0               # Fill件数（要約用）
+        self.open: List[Order] = []
+        self.placed = 0
+        self.cancelled = 0
+        self.filled = 0
 
     def _parse_iso(self, ts: str) -> datetime:
-        """【関数】ISO文字列→datetime（'Z' も +00:00 に正規化）"""
+        """ISO 文字列を datetime（timezone UTC）へ."""
         return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
     def place(self, order: Order, now: datetime) -> None:
-        """【関数】注文を板に置く（作成時刻を刻む）"""
+        """注文を板に置く（作成時刻を刻む）。"""
         order.created_ts = now
         self.open.append(order)
         self.placed += 1
 
+    @staticmethod
+    def _tag_matches(order_tag: str | None, query: str | None) -> bool:
+        """タグ一致を緩く判定（base と base|corr:xxx のような付加情報付きも拾う）。"""
+        if not query:
+            return False
+        if order_tag == query:
+            return True
+        try:
+            return str(order_tag).startswith(f"{query}|")
+        except Exception:
+            return False
+
     def cancel_by_tag(self, tag: str) -> list[Order]:
-        """【関数】タグで一括キャンセルして、取消した注文リストを返す"""
+        """タグで一括キャンセルして、取消した注文リストを返す。"""
         cancelled: list[Order] = []
         kept: list[Order] = []
         for o in self.open:
-            if o.tag == tag:
+            if self._tag_matches(getattr(o, "tag", None), tag):
                 self.cancelled += 1
                 cancelled.append(o)
                 continue
@@ -42,13 +56,12 @@ class MiniSimulator:
         self.open = kept
         return cancelled
 
-
     def has_open_tag(self, tag: str) -> bool:
-        """【関数】あるタグの未約定が残っているかを確認（重複発注防止のゲート）"""
-        return any(o.tag == tag for o in self.open)
+        """指定タグの未約定注文が残っているかを確認（重複発注防止のゲート）。"""
+        return any(self._tag_matches(getattr(o, "tag", None), tag) for o in self.open)
 
     def on_time(self, now: datetime) -> list[Order]:
-        """【関数】TTLチェック：期限切れを返す（ログ用）"""
+        """TTL チェックを行い、期限切れを返す（ログ用）。"""
         if not self.open:
             return []
         expired: list[Order] = []
@@ -65,9 +78,7 @@ class MiniSimulator:
         return expired
 
     def on_executions(self, prints: list[dict[str, Any]], now: datetime) -> list[dict[str, Any]]:
-        """【関数】約定適用：Fillイベントの明細を返す（ログ/PnL用）
-        返す要素：{'ts', 'side', 'price', 'size', 'order', 'tag', 'partial'}
-        """
+        """紁E���E適用し、成立した Fill イベント明細を返す（PnL/ログ用）。"""
         fills: list[dict[str, Any]] = []
         for p in prints:
             try:
@@ -100,4 +111,3 @@ class MiniSimulator:
                 if o.remaining <= 0:
                     self.open.remove(o)
         return fills
-

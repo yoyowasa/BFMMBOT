@@ -1,0 +1,78 @@
+            logger.info("live: before stop_event")
+            stop_event = Event()  # 何をするか：停止フラグ（signal 受信で立てる）
+            logger.info("live: stop_event ready")  # 前段初期化の通過ログ（可視化）
+
+            def _on_signal(signum, frame) -> None:
+                logger.warning(f"signal received: {signum} → cancel all & halt")  # 何をするか：受信をログ
+                stop_event.set()  # 何をするか：イベントループに停止を伝える
+
+            signal.signal(signal.SIGINT, _on_signal)   # 何をするか：Ctrl+C（SIGINT）で停止
+            signal.signal(signal.SIGTERM, _on_signal)  # 何をするか：SIGTERM（停止要求）で停止
+            logger.info("live: signals ready")  # 前段初期化の通過ログ（可視化）
+            # Windows の Ctrl+Break（SIGBREAK）にも反応させ、安全停止へ誘導
+            if hasattr(signal, "SIGBREAK"):
+                try:
+                    signal.signal(signal.SIGBREAK, _on_signal)
+                except Exception:
+                    pass
+
+            ob = OrderBook()  # 何をするか：ローカル板（戦略の入力）を用意
+            logger.info("live: ob ready")  # 前段初期化の通過ログ（可視化）
+            cfg_payload = _safe_config_dict(cfg)
+            if not cfg_payload and isinstance(cfg, Mapping):
+                cfg_payload = dict(cfg)
+            if strategy_list:
+                cfg_payload["strategies"] = list(strategy_list)
+            cfg_features = getattr(cfg, "features", None)
+            effective_strategy_cfg = strategy_cfg
+            if effective_strategy_cfg is None:
+                if isinstance(cfg, Mapping):
+                    effective_strategy_cfg = cfg.get("strategy_cfg")
+                else:
+                    effective_strategy_cfg = getattr(cfg, "strategy_cfg", None)
+            if effective_strategy_cfg is None:
+                effective_strategy_cfg = cfg_payload.get("strategy_cfg")
+            strat = build_strategy_from_cfg(
+                cfg_payload,
+                strategy_cfg=effective_strategy_cfg,
+            )  # 何をするか：本番起動でも複数戦略を1プロセスで束ねて回す
+            logger.info("live: strategy built")  # 前段初期化の通過ログ（可視化）
+            summary_name = strat.name
+
+            strategy_names = [
+                getattr(child, "strategy_name", getattr(child, "name", "unknown"))
+                for child in getattr(strat, "children", [])
+            ] or [getattr(strat, "strategy_name", getattr(strat, "name", "unknown"))]
+            strategy_list = strategy_names
+            summary_name = getattr(strat, "strategy_name", summary_name)
+            logger.info(
+                f"live: starting loop product={product_code} strategy={summary_name} strategies={strategy_list}"
+            )  # 何をするか：起動ログ
+            try:
+                analytics_dir = Path("logs/analytics")
+                analytics_dir.mkdir(parents=True, exist_ok=True)
+                env_value = getattr(cfg, "env", None)
+                if env_value is None and isinstance(cfg, Mapping):
+                    env_value = cfg.get("env")
+                if env_value is None:
+                    env_value = cfg_payload.get("env")
+                entry: dict[str, Any] = {
+                    "ts": _now_utc().isoformat(),
+                    "env": env_value,
+                    "product": product_code,
+                    "strategies": list(strategy_list),
+                }
+                features_payload = _safe_config_dict(cfg_features)
+                if features_payload:
+                    entry["features"] = features_payload
+                strategy_overrides = _strategy_cfg_overrides(effective_strategy_cfg, strategy_list)
+                if strategy_overrides:
+                    entry["strategy_cfg"] = strategy_overrides
+                cfg_log_path = analytics_dir / "strategy_cfg.ndjson"
+                with cfg_log_path.open("ab") as f:
+                    f.write(orjson.dumps(entry))
+                    f.write(b"\n")
+            except Exception as e:
+                logger.warning(f"live: strategy_cfg analytics append failed: {e}")
+            else:
+                logger.info("live: strategy_cfg analytics appended")

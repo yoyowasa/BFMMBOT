@@ -1,0 +1,121 @@
+                self.logger.debug(
+                    "auto_reduce: profit_only overridden due to stale board (age_ms=%s >= %s)",
+                    stale_age_ms,
+                    override_ms,
+                )
+
+        def _best_px(book, attr: str):
+            node = getattr(book, attr, None) if book is not None else None
+            px = getattr(node, "price", None)
+            try:
+                val = float(px)
+            except Exception:
+                return None
+            return val if val > 0 else None
+
+        bid_px = _best_px(ob, "best_bid")
+        ask_px = _best_px(ob, "best_ask")
+        mid = 0.0
+        if bid_px is not None and ask_px is not None:
+            mid = (bid_px + ask_px) / 2.0
+        elif bid_px is not None:
+            mid = bid_px
+        elif ask_px is not None:
+            mid = ask_px
+
+        # profit_only の簡易判定
+        if profit_only:
+            if mid <= 0.0 or a <= 0.0:
+                return
+            if (q > 0.0 and mid < a) or (q < 0.0 and mid > a):
+                return
+
+        tif = str(ar.get("tif", "IOC")).upper()
+        px_for_sim = None
+        if side == "SELL":
+            px_for_sim = bid_px or ask_px or (mid if mid > 0 else None) or (a if a > 0 else None)
+        else:
+            px_for_sim = ask_px or bid_px or (mid if mid > 0 else None) or (a if a > 0 else None)
+
+        # 発火理由を明示（Guard中か／profit_onlyの自動解除有無）
+        try:
+            self.logger.debug(
+                "auto_reduce: fire reason=%s (profit_only_overridden=%s)",
+                ("inventory_guard" if guard_on else "normal"),
+                profit_overridden,
+            )
+        except Exception:
+            pass
+
+        try:
+            ex = getattr(self, "exchange", None)
+            if hasattr(ex, "sendchildorder"):
+                self.logger.info(f"auto_reduce: try place (REST) side={side} qty={step:.6f} tif={tif} tag=auto_reduce")
+                ex.sendchildorder(
+                    side=side,
+                    size=step,
+                    price=None,
+                    time_in_force=tif,
+                    reduce_only=True,
+                    tag="auto_reduce",
+                )
+            elif hasattr(self, "_place"):
+                self.logger.info(f"auto_reduce: try place (engine) side={side} qty={step:.6f} tif={tif} tag=auto_reduce")
+                self._place(
+                    side=side,
+                    qty=step,
+                    price=None,
+                    tif=tif,
+                    reduce_only=True,
+                    tag="auto_reduce",
+                )
+            elif hasattr(getattr(self, "sim", None), "place") and px_for_sim is not None:
+                order = Order(
+                    side=side.lower(),
+                    price=float(px_for_sim),
+                    size=step,
+                    tif=tif,
+                    ttl_ms=None,
+                    tag="auto_reduce",
+                )
+                setattr(order, "reduce_only", True)
+                ts_dt = datetime.now(timezone.utc)
+                self.logger.info(f"auto_reduce: try place (sim) side={side} qty={step:.6f} tif={tif} tag=auto_reduce")
+                self.sim.place(order, ts_dt)
+                self.order_log.add(
+                    ts=self._ts_jst(ts_dt),
+                    action="place",
+                    tif=order.tif,
+                    ttl_ms=order.ttl_ms,
+                    px=order.price,
+                    sz=order.size,
+                    reason=order.tag,
+                )
+                self._heartbeat(ts_dt, "place", reason=order.tag)
+            else:
+                self.logger.info(f"auto_reduce: skip (no place path) side={side} qty={step:.6f}")
+                return
+            self._ar_last_ts = now  # 発火時刻を更新
+        except Exception as e:
+            self.logger.warning(f"auto_reduce: place failed: {e}")
+    def _heartbeat(self, now: datetime, event: str, reason: str | None = None) -> None:
+        """【関数】ハートビート：Q/A/R・日次R・各ガード/窓の状態を1行JSONで追記する"""
+        eff_limit = self.effective_inventory_limit()
+        inventory_guard = eff_limit is not None and abs(self.Q) >= float(eff_limit)
+        payload = {
+            "ts": self._ts_jst(now),
+            "event": event,           # "place" / "fill" / "pause" など直近イベント
+            "reason": reason,         # "inventory_guard" / "midmove_guard" / "maintenance" / "funding" など
+            "strategy": getattr(self.strat, "strategy_name", None) or self.strat.name,
+            "Q": self.Q,              # 現在在庫（+ロング/−ショート）
+            "A": self.A,              # 平均建値
+            "R": self.R,              # 累計実現PnL
+            "R_day": self._daily_R,   # 日次実現PnL
+            "guard": {                # ガードのON/OFF（Trueで“新規停止中”）
+                "inventory": inventory_guard,
+                "midmove": self._midguard_paused,
+            },
+            "window": {
+                "maint": self._in_maintenance(now),
+                "funding": self._in_funding_calc(now) or self._in_funding_transfer(now),
+            },

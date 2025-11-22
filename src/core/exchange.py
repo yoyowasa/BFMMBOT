@@ -163,6 +163,7 @@ class BitflyerExchange:
         time_in_force: str = "GTC",
         minute_to_expire: Optional[int] = None,
         child_order_type: str = "LIMIT",
+        reduce_only: Optional[bool] = None,
     ) -> str:
         """
         新規注文（子注文）を出す関数。
@@ -184,6 +185,8 @@ class BitflyerExchange:
             body["minute_to_expire"] = minute_to_expire
         if time_in_force:
             body["time_in_force"] = time_in_force
+        if reduce_only is not None:
+            body["reduce_only"] = bool(reduce_only)
 
         data = self._request(
             "POST",

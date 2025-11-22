@@ -1,28 +1,26 @@
-﻿# src/strategy/cancel_add_gate.py
-# 役割：#2 キャンセル比ゲート（Best層の C/A 比が低い＝落ち着いた時だけ片面で出す）
+# src/strategy/cancel_add_gate.py
+# 役割: #2 キャンセル比ゲート（C/A比が低い静かな板だけ片側で出すMM）。毒性上昇や条件外なら即撤退。
 from __future__ import annotations
 
-from typing import List, Dict, Any  # 戻り値の型
+from typing import List, Dict, Any
 from collections.abc import Mapping
-from datetime import datetime  # 戦略判断のタイムスタンプ
+from datetime import datetime
 
-from src.core.orderbook import OrderBook  # C/A 比・MP・Best/Spreadを参照
-from src.core.orders import Order  # 指値の表現
+from src.core.orderbook import OrderBook  # C/A比・Best/Spreadを参照
+from src.core.orders import Order  # 置く指値
 from src.strategy.base import StrategyBase  # 共通IF
 
+
 class CancelAddGate(StrategyBase):
-    """【関数】#2 キャンセル比ゲートの最小実装
-    - トリガ：ca_ratio(window_ms) ≤ θ かつ spread_tick ≥ 1
-    - 動作：トリガ成立中のみ片面でリーン（MP寄り側）。条件外はタグ("ca_gate")を一括取消。
-    参照：features.ca_ratio_win_ms / ca_threshold / min_spread_tick / ttl_ms / size.default。:contentReference[oaicite:3]{index=3} :contentReference[oaicite:4]{index=4}
-    """
+    """#2 キャンセル比ゲートの最小実装"""
+
     name: str = "cancel_add_gate"
 
     def __init__(self, cfg=None, *, strategy_cfg=None):
         self.cfg = cfg
         self._strategy_cfg = strategy_cfg
-
         self._inventory = 0.0  # 現在の在庫（Fillで更新）
+
     @staticmethod
     def _value_from(node, *keys):
         current = node
@@ -50,8 +48,34 @@ class CancelAddGate(StrategyBase):
                 return base_default
         return 0.01
 
+    def _resolve_taker_z_thresh(self):
+        # strategy_cfg > features.ca_taker_zscore_threshold の順で拾う
+        cand = self._value_from(self._strategy_cfg, "taker_zscore_threshold")
+        if cand is None:
+            feats = getattr(self.cfg, "features", None)
+            if feats is not None:
+                cand = getattr(feats, "ca_taker_zscore_threshold", None)
+                if cand is None and isinstance(feats, Mapping):
+                    cand = feats.get("ca_taker_zscore_threshold")
+        try:
+            return float(cand)
+        except Exception:
+            return None
+
+    def _taker_zscore(self):
+        # エンジン側に毒性zscoreがあれば拾う（無ければNone）
+        eng = getattr(self, "engine", None)
+        for attr in ("taker_zscore", "toxicity_zscore", "recent_taker_zscore"):
+            val = getattr(eng, attr, None)
+            if val is not None:
+                try:
+                    return float(val)
+                except Exception:
+                    continue
+        return None
+
     def on_fill(self, ob: OrderBook, fill: Any):
-        """在庫をFillで更新する（BUYで+、SELLで-）。既存のロジックに影響を与えない。"""
+        """在庫をFillで更新（BUYは+／SELLは-）。撤退は共通リスク側へ委譲。"""
         try:
             side = getattr(fill, "side", None) if not isinstance(fill, dict) else (fill.get("side") or fill.get("action"))
             sz = None
@@ -64,14 +88,13 @@ class CancelAddGate(StrategyBase):
                 s = str(side).lower()
                 if s in ("buy", "bid", "b"):
                     self._inventory = float(getattr(self, "_inventory", 0.0)) + qty
-                elif s in ("sell", "ask", "s"): 
+                elif s in ("sell", "ask", "s"):
                     self._inventory = float(getattr(self, "_inventory", 0.0)) - qty
         except Exception:
             pass
         return []
 
     def evaluate(self, ob: OrderBook, now: datetime, cfg) -> List[Dict[str, Any]]:
-        # 設定（無ければ文書の最小値にフォールバック）
         feats = getattr(cfg, "features", None)
         win_ms = getattr(feats, "ca_ratio_win_ms", 500)
         theta = getattr(feats, "ca_threshold", 1.3)
@@ -79,73 +102,91 @@ class CancelAddGate(StrategyBase):
         min_sp = getattr(feats, "min_spread_tick", 1) if min_sp_cfg is None else min_sp_cfg
         ttl_ms = getattr(feats, "ttl_ms", 800)
         lot = self._resolve_size_default(cfg)
+        z_thresh = self._resolve_taker_z_thresh()
 
-        # Best未確定またはスプレッド不足→撤退（タグ一括取消）
         spread_ticks = ob.spread_ticks()
+        decision_features: Dict[str, Any] = {
+            "ca_ratio_win_ms": win_ms,
+            "ca_threshold": theta,
+            "spread_tick": spread_ticks,
+        }
+
+        # Best未確定 or スプレッド不足 → 即撤退
         if ob.best_bid.price is None or ob.best_ask.price is None or spread_ticks < min_sp:
+            self._set_decision_features(decision_features)
             return [{"type": "cancel_tag", "tag": "ca_gate"}]
 
-        # 直近windowのBest層 C/A 比を取得（adds<=0なら∞扱い）
-        # 在庫帯のブレーキ（負けゾーンは新規発注しない）
-        _feats = getattr(cfg, "features", None)
-        _feats = (_feats if _feats is not None else (cfg.get("features") if isinstance(cfg, Mapping) else None))
-        _blk_min = (getattr(_feats, "ca_gate_block_min_abs_inv", None) if _feats is not None else None)
-        if _blk_min is None and isinstance(_feats, Mapping): _blk_min = _feats.get("ca_gate_block_min_abs_inv")
-        _blk_max = (getattr(_feats, "ca_gate_block_max_abs_inv", None) if _feats is not None else None)
-        if _blk_max is None and isinstance(_feats, Mapping): _blk_max = _feats.get("ca_gate_block_max_abs_inv")
+        # 在庫帯ブロック
+        feats_node = getattr(cfg, "features", None)
+        feats_node = feats_node if feats_node is not None else (cfg.get("features") if isinstance(cfg, Mapping) else None)
+        blk_min = getattr(feats_node, "ca_gate_block_min_abs_inv", None) if feats_node is not None else None
+        if blk_min is None and isinstance(feats_node, Mapping):
+            blk_min = feats_node.get("ca_gate_block_min_abs_inv")
+        blk_max = getattr(feats_node, "ca_gate_block_max_abs_inv", None) if feats_node is not None else None
+        if blk_max is None and isinstance(feats_node, Mapping):
+            blk_max = feats_node.get("ca_gate_block_max_abs_inv")
         try:
             inv_abs = abs(float(getattr(self, "_inventory", 0.0) or 0.0))
         except Exception:
             inv_abs = 0.0
-        if _blk_min is not None and _blk_max is not None:
+        if blk_min is not None and blk_max is not None:
             try:
-                if inv_abs >= float(_blk_min) and inv_abs < float(_blk_max):
+                if inv_abs >= float(blk_min) and inv_abs < float(blk_max):
+                    decision_features["ca_block_band"] = True
+                    self._set_decision_features(decision_features)
                     return [{"type": "cancel_tag", "tag": "ca_gate"}]
             except Exception:
                 pass
 
         ratio = ob.ca_ratio(now, window_ms=win_ms)
-        # 可変しきい値 θ（在庫帯に応じて調整）
+        decision_features["ca_ratio"] = ratio
+
+        # 在庫帯ごとのしきい値補正
         try:
             abs_inv = abs(float(getattr(self, "_inventory", 0.0) or 0.0))
         except Exception:
             abs_inv = 0.0
-        _rules = None
+        rules = None
         if feats is not None:
-            _rules = getattr(feats, "ca_threshold_by_abs_inv", None)
-            if _rules is None and isinstance(feats, Mapping): _rules = feats.get("ca_threshold_by_abs_inv")
-        if _rules:
+            rules = getattr(feats, "ca_threshold_by_abs_inv", None)
+            if rules is None and isinstance(feats, Mapping):
+                rules = feats.get("ca_threshold_by_abs_inv")
+        if rules:
             try:
-                for b in _rules:
-                    _mx = None; _th = None
-                    if isinstance(b, Mapping):
-                        _mx = b.get("max_abs_inv"); _th = b.get("theta")
-                    else:
-                        _mx = getattr(b, "max_abs_inv", None); _th = getattr(b, "theta", None)
-                    if _mx is None or _th is None: continue
-                    if abs_inv <= float(_mx):
-                        theta = float(_th); break
+                for b in rules:
+                    mx = b.get("max_abs_inv") if isinstance(b, Mapping) else getattr(b, "max_abs_inv", None)
+                    th = b.get("theta") if isinstance(b, Mapping) else getattr(b, "theta", None)
+                    if mx is None or th is None:
+                        continue
+                    if abs_inv <= float(mx):
+                        theta = float(th)
+                        break
             except Exception:
                 pass
+        decision_features["ca_threshold_effective"] = theta
 
-        if ratio <= theta and spread_ticks >= min_sp:  # C/Aゲート: 最低スプレッドtickを設定値で制御（0〜1tick帯は通さない）
-            # MP寄り側にリーン：MP≥mid→sell側、MP<mid→buy側
-            mid = (ob.best_bid.price + ob.best_ask.price) / 2.0
-            mp = ob.microprice()
-            if mp is None:
-                # MP計算不可なら中立：とりあえず買い側に寄せる
-                side = "buy"
-            else:
-                side = "sell" if mp >= mid else "buy"
+        taker_z = self._taker_zscore()
+        if taker_z is not None:
+            decision_features["taker_zscore"] = taker_z
+        if z_thresh is not None:
+            decision_features["taker_zscore_threshold"] = z_thresh
 
-            # 価格は「その側のBest」に置く（tickずれ防止の最小実装）
-            if side == "buy":
-                px = ob.best_bid.price
-            else:
-                px = ob.best_ask.price
+        # 撤退条件: C/A超過 or taker zscore高騰
+        if ratio > theta or (z_thresh is not None and taker_z is not None and taker_z >= z_thresh):
+            self._set_decision_features(decision_features)
+            return [{"type": "cancel_tag", "tag": "ca_gate"}]
 
-            return [{"type": "place", "order": Order(side=side, price=px, size=lot,
-                                                    tif="GTC", ttl_ms=ttl_ms, tag="ca_gate")}]
+        # 条件維持: 片側だけ提示（Microprice寄り）
+        mid = (ob.best_bid.price + ob.best_ask.price) / 2.0
+        mp = ob.microprice()
+        if mp is None:
+            side = "buy"
+        else:
+            side = "sell" if mp >= mid else "buy"
 
-        # 条件外（比が悪化）→タグ一括取消
-        return [{"type": "cancel_tag", "tag": "ca_gate"}]
+        px = ob.best_bid.price if side == "buy" else ob.best_ask.price
+        self._set_decision_features(decision_features)
+        return [{
+            "type": "place",
+            "order": Order(side=side, price=px, size=lot, tif="GTC", ttl_ms=ttl_ms, tag="ca_gate"),
+        }]

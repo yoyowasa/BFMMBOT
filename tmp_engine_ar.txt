@@ -1,0 +1,281 @@
+        decision_record = {
+            "ts": self._ts_jst(now),
+            "strategy": (current_strategy_ctx.get() or self.strat.name),
+            "decision": decision,
+            "features": _features,
+            "expected_edge_bp": None,  # 最小実装では未算出
+            "eta_ms": None,            # 最小実装では未算出
+            "ca_ratio": feats["ca_ratio"],
+            "best_age_ms": feats["best_age_ms"],
+            "spread_state": ("zero" if feats["spread_tick"] == 0 else "ge1"),
+        }
+        decision_record.update({"expected_edge_bp": (feats.get("expected_edge_bp") or feats.get("mp_edge_bp") or ((feats["microprice"] - feats["mid"]) / feats["mid"] * 1e4) if "microprice" in feats and "mid" in feats else None), "eta_ms": (feats.get("eta_ms") or feats.get("queue_eta_ms"))})  # decisionログへETAと期待エッジ(bp)を必ず埋める。MPがあれば (MP−mid)/mid×1e4 で簡易推定、ETAはQueue ETAを採用
+        self.decision_log.add(**decision_record)
+
+    def _consume_strategy_features(self) -> dict | None:
+        getter = getattr(self.strat, "consume_decision_features", None)
+        if callable(getter):
+            extra = getter()
+            if isinstance(extra, Mapping):
+                return dict(extra)
+        return None
+
+    def _maybe_auto_reduce(self, now: float) -> None:
+        """これは「inventory_guard/Caution/Halted 中は在庫を減らす向きに reduce-only+IOC を最小ロットで出す」関数です。"""
+        cfg = getattr(self, "cfg", {}) or {}
+        risk = (cfg.get("risk", {}) if isinstance(cfg, dict) else getattr(cfg, "risk", {})) or {}
+        ar = (risk.get("auto_reduce", {}) if isinstance(risk, dict) else getattr(risk, "auto_reduce", {})) or {}
+        if not bool(ar.get("enabled", False)):
+            return  # 機能OFF
+        profit_only_cfg = bool(ar.get("profit_only", True))
+        try:
+            override_ms = float(ar.get("board_stale_override_ms", 0) or 0.0)
+        except Exception:
+            override_ms = 0.0
+        profit_only = profit_only_cfg
+
+        # クールダウン（連打防止）
+        try:
+            cd_ms = int(ar.get("cooldown_ms", 1500))
+        except Exception:
+            cd_ms = 1500
+        last_ts = getattr(self, "_ar_last_ts", 0.0) or 0.0
+        if (now - last_ts) * 1000.0 < cd_ms:
+            return
+
+        # 在庫を読み、position が無ければ Q/A を使う
+        def _as_float(val) -> float:
+            try:
+                return float(val)
+            except Exception:
+                return 0.0
+
+        pos = getattr(self, "position", None)
+        if pos is not None:
+            q = _as_float(getattr(pos, "q", 0.0))
+            a = _as_float(getattr(pos, "a", 0.0))
+        else:
+            q = _as_float(getattr(self, "Q", 0.0))
+            a = _as_float(getattr(self, "A", 0.0))
+
+        if q == 0.0:
+            return
+
+        # guard/モード判定
+        mode = str(getattr(self, "market_mode", getattr(self.risk, "market_mode", "healthy"))).lower()
+        guard_on = bool(getattr(self.risk, "inventory_guard", False) or getattr(self.risk, "inventory_guard_active", False))
+        force_on_risk = bool(ar.get("force_on_risk", True))
+        if not (guard_on or (force_on_risk and mode in ("caution", "halted"))):
+            return  # 平常時は出さない
+
+        side = "SELL" if q > 0.0 else "BUY"
+        try:
+            min_step_cfg = float(ar.get("min_step_qty", 0.001))
+        except Exception:
+            min_step_cfg = 0.001
+        step = float(min(abs(q), max(min_step_cfg, 0.0)))
+        if step <= 0.0:
+            return
+
+        # Guard中は利益条件を自動無効化（必ず薄めを試す）。監査用にフラグ保持。
+        profit_overridden = False
+        if guard_on and profit_only:
+            profit_only = False
+            profit_overridden = True
+
+        # 板からmidを概算しておく
+        ob = getattr(self, "orderbook", None) or getattr(self, "ob", None)
+        stale_age_ms = None
+        if profit_only and guard_on and override_ms > 0 and ob is not None:
+            try:
+                age_fn = getattr(ob, "best_age_ms", None)
+                raw_age = age_fn() if callable(age_fn) else None
+                if raw_age is None:
+                    raw_age = getattr(ob, "_best_age_ms", None)
+                if raw_age is not None:
+                    stale_age_ms = float(raw_age)
+            except Exception:
+                stale_age_ms = None
+            if stale_age_ms is not None and stale_age_ms >= override_ms:
+                profit_only = False
+                self.logger.debug(
+                    "auto_reduce: profit_only overridden due to stale board (age_ms=%s >= %s)",
+                    stale_age_ms,
+                    override_ms,
+                )
+
+        def _best_px(book, attr: str):
+            node = getattr(book, attr, None) if book is not None else None
+            px = getattr(node, "price", None)
+            try:
+                val = float(px)
+            except Exception:
+                return None
+            return val if val > 0 else None
+
+        bid_px = _best_px(ob, "best_bid")
+        ask_px = _best_px(ob, "best_ask")
+        mid = 0.0
+        if bid_px is not None and ask_px is not None:
+            mid = (bid_px + ask_px) / 2.0
+        elif bid_px is not None:
+            mid = bid_px
+        elif ask_px is not None:
+            mid = ask_px
+
+        # profit_only の簡易判定
+        if profit_only:
+            if mid <= 0.0 or a <= 0.0:
+                return
+            if (q > 0.0 and mid < a) or (q < 0.0 and mid > a):
+                return
+
+        tif = str(ar.get("tif", "IOC")).upper()
+        px_for_sim = None
+        if side == "SELL":
+            px_for_sim = bid_px or ask_px or (mid if mid > 0 else None) or (a if a > 0 else None)
+        else:
+            px_for_sim = ask_px or bid_px or (mid if mid > 0 else None) or (a if a > 0 else None)
+
+        # 発火理由を明示（Guard中か／profit_onlyの自動解除有無）
+        try:
+            self.logger.debug(
+                "auto_reduce: fire reason=%s (profit_only_overridden=%s)",
+                ("inventory_guard" if guard_on else "normal"),
+                profit_overridden,
+            )
+        except Exception:
+            pass
+
+        try:
+            ex = getattr(self, "exchange", None)
+            if hasattr(ex, "sendchildorder"):
+                self.logger.info(f"auto_reduce: try place (REST) side={side} qty={step:.6f} tif={tif} tag=auto_reduce")
+                ex.sendchildorder(
+                    side=side,
+                    size=step,
+                    price=None,
+                    time_in_force=tif,
+                    reduce_only=True,
+                    tag="auto_reduce",
+                )
+            elif hasattr(self, "_place"):
+                self.logger.info(f"auto_reduce: try place (engine) side={side} qty={step:.6f} tif={tif} tag=auto_reduce")
+                self._place(
+                    side=side,
+                    qty=step,
+                    price=None,
+                    tif=tif,
+                    reduce_only=True,
+                    tag="auto_reduce",
+                )
+            elif hasattr(getattr(self, "sim", None), "place") and px_for_sim is not None:
+                order = Order(
+                    side=side.lower(),
+                    price=float(px_for_sim),
+                    size=step,
+                    tif=tif,
+                    ttl_ms=None,
+                    tag="auto_reduce",
+                )
+                setattr(order, "reduce_only", True)
+                ts_dt = datetime.now(timezone.utc)
+                self.logger.info(f"auto_reduce: try place (sim) side={side} qty={step:.6f} tif={tif} tag=auto_reduce")
+                self.sim.place(order, ts_dt)
+                self.order_log.add(
+                    ts=self._ts_jst(ts_dt),
+                    action="place",
+                    tif=order.tif,
+                    ttl_ms=order.ttl_ms,
+                    px=order.price,
+                    sz=order.size,
+                    reason=order.tag,
+                )
+                self._heartbeat(ts_dt, "place", reason=order.tag)
+            else:
+                self.logger.info(f"auto_reduce: skip (no place path) side={side} qty={step:.6f}")
+                return
+            self._ar_last_ts = now  # 発火時刻を更新
+        except Exception as e:
+            self.logger.warning(f"auto_reduce: place failed: {e}")
+    def _heartbeat(self, now: datetime, event: str, reason: str | None = None) -> None:
+        """【関数】ハートビート：Q/A/R・日次R・各ガード/窓の状態を1行JSONで追記する"""
+        eff_limit = self.effective_inventory_limit()
+        inventory_guard = eff_limit is not None and abs(self.Q) >= float(eff_limit)
+        payload = {
+            "ts": self._ts_jst(now),
+            "event": event,           # "place" / "fill" / "pause" など直近イベント
+            "reason": reason,         # "inventory_guard" / "midmove_guard" / "maintenance" / "funding" など
+            "strategy": getattr(self.strat, "strategy_name", None) or self.strat.name,
+            "Q": self.Q,              # 現在在庫（+ロング/−ショート）
+            "A": self.A,              # 平均建値
+            "R": self.R,              # 累計実現PnL
+            "R_day": self._daily_R,   # 日次実現PnL
+            "guard": {                # ガードのON/OFF（Trueで“新規停止中”）
+                "inventory": inventory_guard,
+                "midmove": self._midguard_paused,
+            },
+            "window": {
+                "maint": self._in_maintenance(now),
+                "funding": self._in_funding_calc(now) or self._in_funding_transfer(now),
+            },
+        }
+        child_names = ([
+            getattr(child, "strategy_name", None) or getattr(child, "name", "unknown")
+            for child in getattr(self.strat, "children", [])
+        ] or [payload["strategy"]])
+        lines = []
+        for child_name in child_names:
+            entry = dict(payload)
+            entry["strategy"] = child_name
+            lines.append(orjson.dumps(entry).decode("utf-8"))
+        if not lines:
+            return
+        # JST日付タグ(YYYYMMDD)で心拍ファイル名を自動決定
+        try:
+            jst = timezone(timedelta(hours=9))
+            tag = now.astimezone(jst).strftime("%Y%m%d")
+            hb_path = Path(f"logs/runtime/{tag}heartbeat.ndjson")
+        except Exception:
+            hb_path = self._hb_path
+        hb_path.parent.mkdir(parents=True, exist_ok=True)
+        with hb_path.open("a", encoding="utf-8") as fh:
+            for line in lines:
+                fh.write(line + "\n")
+        if inventory_guard:
+            # Guardが立っている間はハートビートだけでも自動薄めを回して在庫を安全側へ戻す
+            self._maybe_auto_reduce(now=monotonic())
+
+    # ─────────────────────────────────────────────────────────────
+    def _apply_fill_and_log(
+        self,
+        ts_iso: str,
+        side: str,
+        px: float,
+        sz: float,
+        tag: str,
+        *,
+        order=None,
+    ) -> None:
+        """【関数】Fillを在庫Q/A/Rに適用し、orders/tradesへ記録（最小PnL）"""
+        # 1) orders：fill行
+        reason_tag = tag if tag is not None else "-"
+        order_tag = getattr(order, "tag", getattr(order, "_strategy", "-"))
+        corr_for_log = _coid_to_corr.get(
+            getattr(order, "client_order_id", "") if order is not None else "",
+            (getattr(order, "_corr_id", None) if order is not None else None)
+            or current_corr_ctx.get()
+            or "-",
+        )
+        if (
+            order is not None
+            and getattr(order, "client_order_id", None)
+            and getattr(order, "_corr_id", None)
+        ):
+            _coid_to_corr[order.client_order_id] = order._corr_id
+            if len(_coid_to_corr) > _CORR_MAP_MAX:
+                _coid_to_corr.popitem(last=False)
+        self.order_log.add(
+            ts=ts_iso,
+            action="fill",
+            tif="GTC",

@@ -1,0 +1,51 @@
+    ) -> None:
+        if strategy_cfg is None:
+            if isinstance(cfg, Mapping):
+                strategy_cfg = cfg.get("strategy_cfg")
+            else:
+                strategy_cfg = getattr(cfg, "strategy_cfg", None)
+        # 設定（製品コード/刻み/ガード閾値）
+        self.cfg = cfg
+        self.logger = logger
+        self._ar_last_ts = 0.0  # これは「auto_reduceの前回発火時刻（秒）」です
+        self.product = getattr(cfg, "product_code", "FX_BTC_JPY") or "FX_BTC_JPY"
+        self.tick = float(getattr(cfg, "tick_size", 1.0))
+        self.max_inv = getattr(getattr(cfg, "risk", None), "max_inventory", None)
+        inv_eps_default = 0.0 if self.max_inv is None else max(0.0, float(self.max_inv) * 0.01)
+        self.inventory_eps = float(getattr(getattr(cfg, "risk", None), "inventory_eps", inv_eps_default))
+        self.guard_bp = None
+        if getattr(cfg, "guard", None) is not None:
+            self.guard_bp = getattr(cfg.guard, "max_mid_move_bp_30s", None)
+            self.kill_daily = getattr(getattr(getattr(cfg, "risk", None), "kill", None), "daily_pnl_jpy", None)  # 【関数】Kill: 日次PnL閾値
+            self.kill_dd = getattr(getattr(getattr(cfg, "risk", None), "kill", None), "max_dd_jpy", None)        # 【関数】Kill: 日次DD閾値
+            self.halted = False  # 【関数】Kill発火後は停止
+        self.risk = RiskGate(cfg)  # 何をする行か：設定を元に在庫ゲートを構築（市場モード連携の受け皿）
+        setattr(self.risk, "engine", self)  # RiskGate から現在在庫やモードを参照できるようにつないでおく
+        health_cfg = getattr(cfg, "health", None)  # 何をする行か：Best静止しきい値（healthセクション）を安全に取得
+        self._stale_warn_ms = None  # 何をする行か：Best静止でCautionへ入る閾値(ms)
+        self._stale_halt_ms = None  # 何をする行か：Best静止でHaltedへ入る閾値(ms)
+        if health_cfg is not None:  # 何をする行か：healthセクションが定義されているときのみ閾値を読み込む
+            warn_sec = getattr(health_cfg, "stale_sec_warn", None)  # 何をする行か：Cautionへ入る秒数を読む
+            halt_sec = getattr(health_cfg, "stale_sec_halt", None)  # 何をする行か：Haltedへ入る秒数を読む
+            self._stale_warn_ms = float(warn_sec) * 1000.0 if warn_sec is not None else None  # 何をする行か：秒→ms換算
+            self._stale_halt_ms = float(halt_sec) * 1000.0 if halt_sec is not None else None  # 何をする行か：秒→ms換算
+
+        # 戦略（#1/#2/#3）を選択
+        self.strategies = self._normalize_strategy_names(strategy_name, strategies)
+        if len(self.strategies) == 1:
+            selected = self.strategies[0]
+            cfg_override = self._strategy_cfg_for(strategy_cfg, selected)
+            self.strat = build_strategy(selected, cfg, strategy_cfg=cfg_override)
+        else:
+            children = [
+                build_strategy(name, cfg, strategy_cfg=self._strategy_cfg_for(strategy_cfg, name))
+                for name in self.strategies
+            ]
+            self.strat = MultiStrategy(children)
+
+        self._attach_strategy_context(self.strat)
+
+
+        # ローカル板・シミュ・ログ器
+        self.ob = OrderBook(tick_size=self.tick)
+        self.sim = MiniSimulator()

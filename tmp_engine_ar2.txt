@@ -1,0 +1,301 @@
+            tif="GTC",
+            ttl_ms=None,
+            px=px,
+            sz=sz,
+            reason=f"{reason_tag}; tag={order_tag}; corr={corr_for_log}",
+        )
+        dt = _parse_iso(ts_iso)  # 【関数】この約定時刻で窓フラグを判定するためにdatetime化
+        is_maint = self._in_maintenance(dt)  # 【関数】メンテ窓か？
+        is_fund = self._in_funding_calc(dt) or self._in_funding_transfer(dt)  # 【関数】Funding窓か？
+
+        # 2) PnL更新（最小）：ショート買い戻し/ロング利確を片側ずつ
+        realized = 0.0
+        if side == "sell":
+            if self.Q > 0:
+                matched = min(sz, self.Q)
+                realized += (px - self.A) * matched
+                self.Q -= matched
+                if sz > matched:
+                    self.A = px
+                    self.Q -= (sz - matched)
+            else:
+                self.A = (self.A * abs(self.Q) + px * sz) / (abs(self.Q) + sz) if self.Q < 0 else px
+                self.Q -= sz
+        else:  # buy
+            if self.Q < 0:
+                matched = min(sz, -self.Q)
+                realized += (self.A - px) * matched
+                self.Q += matched
+                if sz > matched:
+                    self.A = px
+                    self.Q += (sz - matched)
+            else:
+                self.A = (self.A * self.Q + px * sz) / (self.Q + sz) if self.Q > 0 else px
+                self.Q += sz
+        self.R += realized
+        self._daily_R += realized  # 【関数】日次PnLを更新
+        self._R_HWM = max(self._R_HWM, self._daily_R)  # 【関数】HWM更新（DD計算用）
+
+        # 3) trades：約定行
+        order_strategy = None
+        if order is not None:
+            order_strategy = getattr(order, "_strategy", None)
+        strategy_name = (
+            current_strategy_ctx.get()
+            or order_strategy
+            or getattr(self.strat, "strategy_name", None)
+            or self.strat.name
+        )
+
+        corr_for_trade = corr_for_log if corr_for_log != "-" else _coid_to_corr.get(
+            getattr(order, "client_order_id", "") if order is not None else "",
+            current_corr_ctx.get() or "-",
+        )
+        tag_payload = "" if tag is None else str(tag)
+        if corr_for_trade and corr_for_trade != "-":
+            if tag_payload:
+                if f"corr:{corr_for_trade}" not in tag_payload:
+                    tag_payload = f"{tag_payload}|corr:{corr_for_trade}"
+            else:
+                tag_payload = f"corr:{corr_for_trade}"
+        final_tag = tag_payload or ("" if tag is None else str(tag))
+        self.trade_log.add(
+            ts=ts_iso, side=side, px=px, sz=sz, pnl=realized,
+            strategy=strategy_name, tag=final_tag,
+            inventory_after=self.Q,
+            window_funding=is_fund, window_maint=is_maint  # 【関数】どの窓中の約定かを明示
+        )
+        self._heartbeat(dt, "fill", reason=tag)  # ハートビート：約定を要約
+
+    def _log_window_event(self, window_type: str, action: str, ts: datetime) -> None:
+        """役割：メンテ/ファンディング等の“窓”の入退を1行CSVで記録する"""
+        events_dir = Path("logs") / "events"  # 役割：イベントログの保存先
+        events_dir.mkdir(parents=True, exist_ok=True)  # 役割：ディレクトリを必ず作成
+
+        # 役割：窓の種類ごとに出力ファイル名を選ぶ（仕様：maintenance.csv / funding_schedule.csv）
+        if window_type == "maintenance":
+            outfile = events_dir / "maintenance.csv"
+        elif window_type == "funding":
+            outfile = events_dir / "funding_schedule.csv"
+        else:
+            outfile = events_dir / f"{window_type}.csv"
+
+        is_new = not outfile.exists()  # 役割：ファイルが無いときはヘッダ行を書く
+
+        # 役割：ts を UTC ISO8601 に正規化（naive なら UTC を付与して保存）
+        if getattr(ts, "tzinfo", None) is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        ts_iso = ts.astimezone(timezone.utc).isoformat()
+
+        # 役割：CSV へ追記（列：ts, window, action）
+        with outfile.open("a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if is_new:
+                w.writerow(["ts", "window", "action"])
+            w.writerow([ts_iso, window_type, action])
+
+
+    # ─────────────────────────────────────────────────────────────
+    async def run_paper(self) -> None:
+        """【関数】paper実行の本体：WS→板→戦略→シミュ→ログ（Ctrl+Cで安全終了）
+        - 文書の 8.3 ペーパー運用の最小形。:contentReference[oaicite:10]{index=10}
+        """
+        logger.info(
+            f"paper start: product={self.product} strategy={self.strat.name} strategies={self.strategies}"
+        )
+        # JST日付タグでNDJSONログ名を自動付与
+        _date_tag = _now_utc().astimezone(timezone(timedelta(hours=9))).strftime("%Y%m%d")
+        self._date_tag = _date_tag
+        # Heartbeatファイル
+        self._hb_path = Path(f"logs/runtime/{_date_tag}heartbeat.ndjson")
+        self._hb_path.parent.mkdir(parents=True, exist_ok=True)
+        # NDJSONミラー（日付付き）
+        try:
+            if getattr(self, "order_log", None) is not None and getattr(self.order_log, "_mirror", None) is not None:
+                self.order_log._mirror = Path(f"logs/orders/{_date_tag}order_log.ndjson")
+                self.order_log._mirror.parent.mkdir(parents=True, exist_ok=True)
+            if getattr(self, "trade_log", None) is not None and getattr(self.trade_log, "_mirror", None) is not None:
+                self.trade_log._mirror = Path(f"logs/trades/{_date_tag}trade_log.ndjson")
+                self.trade_log._mirror.parent.mkdir(parents=True, exist_ok=True)
+            if getattr(self, "decision_log", None) is not None and getattr(self.decision_log, "_mirror", None) is not None:
+                self.decision_log._mirror = Path(f"logs/analytics/{_date_tag}decision_log.ndjson")
+                self.decision_log._mirror.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        paper_meta_path = Path(f"logs/runtime/{_date_tag}paper_start.ndjson")
+        paper_meta_path.parent.mkdir(parents=True, exist_ok=True)
+        features_obj = getattr(self.cfg, "features", None)
+        if features_obj is None:
+            _features_common = {}
+        elif isinstance(features_obj, Mapping):
+            _features_common = dict(features_obj)
+        elif hasattr(features_obj, "model_dump"):
+            _features_common = features_obj.model_dump()
+        else:
+            try:
+                _features_common = dict(vars(features_obj))
+            except TypeError:
+                _features_common = {}
+        features_overrides = {}
+        if features_obj is not None:
+            for name in self.strategies:
+                if isinstance(features_obj, Mapping):
+                    override_obj = features_obj.get(name)
+                else:
+                    override_obj = getattr(features_obj, name, None)
+                if override_obj is None:
+                    continue
+                if isinstance(override_obj, Mapping):
+                    override_payload = dict(override_obj)
+                elif hasattr(override_obj, "model_dump"):
+                    override_payload = override_obj.model_dump()
+                else:
+                    try:
+                        override_payload = dict(vars(override_obj))
+                    except TypeError:
+                        continue
+                if isinstance(_features_common, dict):
+                    _features_common.pop(name, None)
+                features_overrides[name] = override_payload
+        try:
+            with paper_meta_path.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    orjson.dumps(
+                        {
+                            "ts": self._ts_jst(_now_utc()),
+                            "event": "start",
+                            "mode": "paper",
+                            "product": self.product,
+                            "strategy": getattr(self.strat, "strategy_name", None) or self.strat.name,
+                            "strategies": list(self.strategies),
+                            "features_common": _features_common,
+                            "features_overrides": features_overrides,
+                        }
+                    ).decode("utf-8")
+                    + "\n"
+                )
+        except Exception:
+            logger.exception("paper start ndjson write failed")
+        try:
+            async for ev in event_stream(product_code=self.product):
+                now = _parse_iso(ev["ts"])
+                ch = ev.get("channel", "")
+
+                if ch.startswith("lightning_board_"):
+                    # ローカル板更新
+                    self._last_heartbeat_ms = int(now.timestamp() * 1000)  # 何をするか：最新board受信時刻を記録しHB間隔を測る
+                    # 日次境界（JST）を跨いだら R_day/HWM をリセット
+                    self._roll_daily(now)
+
+                    # Kill-Switch 判定（trueで全キャンセル→停止）
+                    hit, why, rday, dd = self._maybe_trigger_kill()
+                    if hit:
+                        for o in self.sim.cancel_by_tag("stall"):
+                            self.order_log.add(
+                                ts=self._ts_jst(now),
+                                action="cancel",
+                                tif=o.tif,
+                                ttl_ms=o.ttl_ms,
+                                px=o.price,
+                                sz=o.remaining,
+                                reason=(
+                                    f"kill; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                    f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                                ),
+                            )
+                        for o in self.sim.cancel_by_tag("ca_gate"):
+                            self.order_log.add(
+                                ts=self._ts_jst(now),
+                                action="cancel",
+                                tif=o.tif,
+                                ttl_ms=o.ttl_ms,
+                                px=o.price,
+                                sz=o.remaining,
+                                reason=(
+                                    f"kill; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                    f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                                ),
+                            )
+                        self.halted = True
+                        logger.error(f"Kill-Switch({why}) fired: R_day={rday:.2f}, DD={dd:.2f} → stopping")
+                        return  # 安全停止（finallyでログflush）  # 文書の“Kill到達で停止”に準拠
+
+                    self.ob.update_from_event(ev)
+                    # 窓の現在状態を判定（true/false）し、前回から変わったらCSVに記録
+                    maint_now = self._in_maintenance(now)
+                    fund_now = self._in_funding_calc(now) or self._in_funding_transfer(now)
+                    if maint_now != self._maint_prev:
+                        self._log_window_event("maintenance", "enter" if maint_now else "exit", now)  # 役割：メンテ窓の出入りを記録
+                        self._maint_prev = maint_now
+                    if fund_now != self._fund_prev:
+                        self._log_window_event("funding", "enter" if fund_now else "exit", now)  # 役割：Funding窓の出入りを記録
+                        self._fund_prev = fund_now
+
+                    # メンテ窓：新規禁止＋同タグ一括Cancel（reason="window"）
+                    if self._in_maintenance(now):
+                        for o in self.sim.cancel_by_tag("stall"):
+                            self.order_log.add(
+                                ts=self._ts_jst(now),
+                                action="cancel",
+                                tif=o.tif,
+                                ttl_ms=o.ttl_ms,
+                                px=o.price,
+                                sz=o.remaining,
+                                reason=(
+                                    f"window; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                    f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                                ),
+                            )
+                        for o in self.sim.cancel_by_tag("ca_gate"):
+                            self.order_log.add(
+                                ts=self._ts_jst(now),
+                                action="cancel",
+                                tif=o.tif,
+                                ttl_ms=o.ttl_ms,
+                                px=o.price,
+                                sz=o.remaining,
+                                reason=(
+                                    f"window; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                    f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                                ),
+                            )
+                            self._heartbeat(now, "pause", reason="maintenance")
+                        continue  # このboardイベントでは新規Placeを行わない
+                    
+                    # Funding窓（計算 or 授受）：新規禁止＋同タグ一括Cancel（reason="funding"）
+                    if self._in_funding_calc(now) or self._in_funding_transfer(now):
+                        for o in self.sim.cancel_by_tag("stall"):
+                            self.order_log.add(
+                                ts=self._ts_jst(now),
+                                action="cancel",
+                                tif=o.tif,
+                                ttl_ms=o.ttl_ms,
+                                px=o.price,
+                                sz=o.remaining,
+                                reason=(
+                                    f"funding; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                    f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                                ),
+                            )  # 【関数】Funding窓で停止
+                        for o in self.sim.cancel_by_tag("ca_gate"):
+                            self.order_log.add(
+                                ts=self._ts_jst(now),
+                                action="cancel",
+                                tif=o.tif,
+                                ttl_ms=o.ttl_ms,
+                                px=o.price,
+                                sz=o.remaining,
+                                reason=(
+                                    f"funding; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                    f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                                ),
+                            )  # 【関数】Funding窓で停止
+                            self._heartbeat(now, "pause", reason="funding")
+                        continue  # このboardイベントでは新規Placeを行わない
+
+                    # TTL失効を処理（取消ログ）
+                    for o in self.sim.on_time(now):
+                        self.order_log.add(
+                            ts=self._ts_jst(now),
+                            action="cancel",
+                            tif=o.tif,

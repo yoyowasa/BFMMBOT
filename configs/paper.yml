@@ -1,4 +1,4 @@
-﻿# configs/paper.yml - base.yml の共通設定をそのまま使い、env だけをpaperに固定します。
+# configs/paper.yml - base.yml の共通設定をそのまま使い、env だけをpaperに固定します。
 env: paper
 # Overrides for paper environment to improve fill likelihood
 size:
@@ -7,10 +7,11 @@ size:
 # 在庫上限（paper専用の上書き）
 risk:
   max_inventory: 0.075
-  auto_reduce:                # ペーパーは最初OFF（挙動観察）
-    enabled: false            # A/B時はtrueに変更
-    profit_only: true         # 有効化時は“プラス時のみ”で安全運転
-    force_on_risk: true       # リスク違反時は利益不問で薄める
+  auto_reduce:                # これは「在庫を減らすIOC」を自動制御する設定です
+    enabled: true            # A/B検証環境では常時ON
+    profit_only: false       # 含み損でも target_eff 超過なら reduce-only を試行して在庫を軽くする
+    board_stale_override_ms: 600000  # Bestが10分止まったらGuard中のみprofit_onlyを一時解除する閾値(ms)
+    force_on_risk: true       # リスク制御が指示した時は必ず発動対象
     tif: IOC
     min_step_qty: 0.001
 

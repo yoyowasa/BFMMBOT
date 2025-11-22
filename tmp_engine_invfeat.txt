@@ -1,0 +1,181 @@
+            _features["tags"] = tags  # 何をするか：タグ情報があれば features_json に配列で書き込む
+
+        corr_hint = current_corr_ctx.get()
+        if not corr_hint:
+            corr_hint = next(
+                (getattr(o, "_corr_id", None) for o in orders if getattr(o, "_corr_id", None)),
+                None,
+            )
+        corr_id = corr_hint or uuid.uuid4().hex  # 何をするか：決定単位で一意な相関IDを決める
+        _features["corr_id"] = corr_id  # 何をするか：features_json内に相関IDを残す
+
+        # 設定スナップショット（分析用に毎回埋め込む）
+        try:
+            cfg_obj = getattr(self, "cfg", None)
+            risk_node = getattr(cfg_obj, "risk", None) if cfg_obj is not None else None
+            inv_node = getattr(risk_node, "inv_capping", None) if risk_node is not None else None
+            size_node = getattr(cfg_obj, "size", None) if cfg_obj is not None else None
+
+            max_inv = getattr(risk_node, "max_inventory", None) if risk_node is not None else None
+            # enabled/params は dict/Pydantic 両対応。未設定は既定値（enabled=True, ratio=0.90, margin=0.99）。
+            inv_enabled = True
+            target_ratio = 0.90
+            eff_margin = 0.99
+            try:
+                from collections.abc import Mapping as _Mapping
+                if inv_node is not None:
+                    if isinstance(inv_node, _Mapping):
+                        inv_enabled = bool(inv_node.get("enabled", True))
+                        if inv_node.get("target_ratio") is not None:
+                            target_ratio = float(inv_node.get("target_ratio"))
+                        if inv_node.get("eff_limit_margin") is not None:
+                            eff_margin = float(inv_node.get("eff_limit_margin"))
+                    else:
+                        inv_enabled = bool(getattr(inv_node, "enabled", True))
+                        tr = getattr(inv_node, "target_ratio", None)
+                        if isinstance(tr, (int, float)):
+                            target_ratio = float(tr)
+                        mg = getattr(inv_node, "eff_limit_margin", None)
+                        if isinstance(mg, (int, float)):
+                            eff_margin = float(mg)
+            except Exception:
+                pass
+            try:
+                min_lot = float(getattr(size_node, "min", None)) if size_node is not None else None
+            except Exception:
+                min_lot = None
+            eff_limit = self.effective_inventory_limit()
+
+            _features["inv_capping"] = {
+                "enabled": bool(inv_enabled),
+                "target_ratio": float(target_ratio) if isinstance(target_ratio, (int, float)) else target_ratio,
+                "eff_limit_margin": float(eff_margin) if isinstance(eff_margin, (int, float)) else eff_margin,
+                "max_inventory": float(max_inv) if isinstance(max_inv, (int, float)) else max_inv,
+                "eff_limit": float(eff_limit) if eff_limit is not None else None,
+                "min_lot": min_lot,
+                "abs_q": abs(getattr(self, "Q", 0.0)),
+            }
+        except Exception:
+            pass
+
+        decision_record = {
+            "ts": self._ts_jst(now),
+            "strategy": (current_strategy_ctx.get() or self.strat.name),
+            "decision": decision,
+            "features": _features,
+            "expected_edge_bp": None,  # 最小実装では未算出
+            "eta_ms": None,            # 最小実装では未算出
+            "ca_ratio": feats["ca_ratio"],
+            "best_age_ms": feats["best_age_ms"],
+            "spread_state": ("zero" if feats["spread_tick"] == 0 else "ge1"),
+        }
+        decision_record.update({"expected_edge_bp": (feats.get("expected_edge_bp") or feats.get("mp_edge_bp") or ((feats["microprice"] - feats["mid"]) / feats["mid"] * 1e4) if "microprice" in feats and "mid" in feats else None), "eta_ms": (feats.get("eta_ms") or feats.get("queue_eta_ms"))})  # decisionログへETAと期待エッジ(bp)を必ず埋める。MPがあれば (MP−mid)/mid×1e4 で簡易推定、ETAはQueue ETAを採用
+        self.decision_log.add(**decision_record)
+
+    def _consume_strategy_features(self) -> dict | None:
+        getter = getattr(self.strat, "consume_decision_features", None)
+        if callable(getter):
+            extra = getter()
+            if isinstance(extra, Mapping):
+                return dict(extra)
+        return None
+
+    def _maybe_auto_reduce(self, now: float) -> None:
+        """これは「inventory_guard/Caution/Halted 中は在庫を減らす向きに reduce-only+IOC を最小ロットで出す」関数です。"""
+        cfg = getattr(self, "cfg", {}) or {}
+        risk = (cfg.get("risk", {}) if isinstance(cfg, dict) else getattr(cfg, "risk", {})) or {}
+        ar = (risk.get("auto_reduce", {}) if isinstance(risk, dict) else getattr(risk, "auto_reduce", {})) or {}
+        if not bool(ar.get("enabled", False)):
+            return  # 機能OFF
+        profit_only_cfg = bool(ar.get("profit_only", True))
+        try:
+            override_ms = float(ar.get("board_stale_override_ms", 0) or 0.0)
+        except Exception:
+            override_ms = 0.0
+        profit_only = profit_only_cfg
+
+        # クールダウン（連打防止）
+        try:
+            cd_ms = int(ar.get("cooldown_ms", 1500))
+        except Exception:
+            cd_ms = 1500
+        last_ts = getattr(self, "_ar_last_ts", 0.0) or 0.0
+        if (now - last_ts) * 1000.0 < cd_ms:
+            return
+
+        # 在庫を読み、position が無ければ Q/A を使う
+        def _as_float(val) -> float:
+            try:
+                return float(val)
+            except Exception:
+                return 0.0
+
+        pos = getattr(self, "position", None)
+        if pos is not None:
+            q = _as_float(getattr(pos, "q", 0.0))
+            a = _as_float(getattr(pos, "a", 0.0))
+        else:
+            q = _as_float(getattr(self, "Q", 0.0))
+            a = _as_float(getattr(self, "A", 0.0))
+
+        if q == 0.0:
+            return
+
+        # guard/モード判定
+        mode = str(getattr(self, "market_mode", getattr(self.risk, "market_mode", "healthy"))).lower()
+        guard_on = bool(getattr(self.risk, "inventory_guard", False) or getattr(self.risk, "inventory_guard_active", False))
+        force_on_risk = bool(ar.get("force_on_risk", True))
+        if not (guard_on or (force_on_risk and mode in ("caution", "halted"))):
+            return  # 平常時は出さない
+
+        side = "SELL" if q > 0.0 else "BUY"
+        try:
+            min_step_cfg = float(ar.get("min_step_qty", 0.001))
+        except Exception:
+            min_step_cfg = 0.001
+        step = float(min(abs(q), max(min_step_cfg, 0.0)))
+        if step <= 0.0:
+            return
+
+        # Guard中は利益条件を自動無効化（必ず薄めを試す）。監査用にフラグ保持。
+        profit_overridden = False
+        if guard_on and profit_only:
+            profit_only = False
+            profit_overridden = True
+
+        # 板からmidを概算しておく
+        ob = getattr(self, "orderbook", None) or getattr(self, "ob", None)
+        stale_age_ms = None
+        if profit_only and guard_on and override_ms > 0 and ob is not None:
+            try:
+                age_fn = getattr(ob, "best_age_ms", None)
+                raw_age = age_fn() if callable(age_fn) else None
+                if raw_age is None:
+                    raw_age = getattr(ob, "_best_age_ms", None)
+                if raw_age is not None:
+                    stale_age_ms = float(raw_age)
+            except Exception:
+                stale_age_ms = None
+            if stale_age_ms is not None and stale_age_ms >= override_ms:
+                profit_only = False
+                self.logger.debug(
+                    "auto_reduce: profit_only overridden due to stale board (age_ms=%s >= %s)",
+                    stale_age_ms,
+                    override_ms,
+                )
+
+        def _best_px(book, attr: str):
+            node = getattr(book, attr, None) if book is not None else None
+            px = getattr(node, "price", None)
+            try:
+                val = float(px)
+            except Exception:
+                return None
+            return val if val > 0 else None
+
+        bid_px = _best_px(ob, "best_bid")
+        ask_px = _best_px(ob, "best_ask")
+        mid = 0.0
+        if bid_px is not None and ask_px is not None:
+            mid = (bid_px + ask_px) / 2.0
+        elif bid_px is not None:

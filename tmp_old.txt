@@ -1,0 +1,37 @@
+        def _on_signal(signum, frame) -> None:
+                logger.warning(f"signal received: {signum} → cancel all & halt")  # 何をするか：受信をログ
+                stop_event.set()  # 何をするか：イベントループに停止を伝える
+
+            signal.signal(signal.SIGINT, _on_signal)   # 何をするか：Ctrl+C（SIGINT）で停止
+            signal.signal(signal.SIGTERM, _on_signal)  # 何をするか：SIGTERM（停止要求）で停止
+            logger.info("live: signals ready")  # 前段初期化の通過ログ（可視化）
+            # Windows の Ctrl+Break（SIGBREAK）にも反応させ、安全停止へ誘導
+            if hasattr(signal, "SIGBREAK"):
+                try:
+                    signal.signal(signal.SIGBREAK, _on_signal)
+                except Exception:
+                    pass
+
+            ob = OrderBook()  # 何をするか：ローカル板（戦略の入力）を用意
+            logger.info("live: ob ready")  # 前段初期化の通過ログ（可視化）
+            cfg_payload = _safe_config_dict(cfg)
+            if not cfg_payload and isinstance(cfg, Mapping):
+                cfg_payload = dict(cfg)
+            if strategy_list:
+                cfg_payload["strategies"] = list(strategy_list)
+            cfg_features = getattr(cfg, "features", None)
+            effective_strategy_cfg = strategy_cfg
+            if effective_strategy_cfg is None:
+                if isinstance(cfg, Mapping):
+                    effective_strategy_cfg = cfg.get("strategy_cfg")
+                else:
+                    effective_strategy_cfg = getattr(cfg, "strategy_cfg", None)
+            if effective_strategy_cfg is None:
+                effective_strategy_cfg = cfg_payload.get("strategy_cfg")
+            strat = build_strategy_from_cfg(
+                cfg_payload,
+                strategy_cfg=effective_strategy_cfg,
+            )  # 何をするか：本番起動でも複数戦略を1プロセスで束ねて回す
+            logger.info("live: strategy built")  # 前段初期化の通過ログ（可視化）
+            summary_name = strat.name
+

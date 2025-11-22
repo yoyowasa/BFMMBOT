@@ -6,11 +6,14 @@ version = "0.1.0"
 description = "bitFlyer CFD (FX_BTC_JPY) simple MM engine"  # 何を作るかの説明
 authors = ["you <you@example.com>"]  # あなたの名前とメールに置き換え可
 readme = "README.md"
-packages = [{ include = "src" }]  # src配下をパッケージとして扱う
+packages = [
+  { include = "src" },
+  { include = "tools" },
+]
 license = "MIT"
 
 [tool.poetry.dependencies]  # 実行に必要なライブラリ
-python = "^3.11"  # Windowsでも3.11固定（文書準拠）
+python = ">=3.11,<3.12"  # Windowsでも3.11固定（文書準拠）
 websockets = "^12.0"   # WebSocket購読（board/executions）
 httpx = "^0.27.0"      # REST/HTTPクライアント（整合やスナップ取得）
 pydantic = "^2.8.0"    # スキーマ/型検証（状態・イベント）
@@ -36,6 +39,9 @@ target-version = ["py311"]
 
 [tool.ruff]  # Lintルール（必要に応じて後で詳細化）
 line-length = 100
+
+[tool.poetry.scripts]
+monitor-hb = "tools.monitor_heartbeat:main"
 
 [build-system]  # Poetryビルドバックエンド指定
 requires = ["poetry-core>=1.8.0"]

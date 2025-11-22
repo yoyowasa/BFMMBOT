@@ -1,0 +1,141 @@
+        eps_raw = risk_section.get("inventory_eps") if isinstance(risk_section, Mapping) else None
+        self.inventory_eps = float(eps_raw) if eps_raw is not None else default_eps
+        self.market_mode = "healthy"  # 何をする行か：板の健康状態（healthy/caution/halted）を覚える
+        self.inventory_guard_active = False  # 在庫ガードの現在状態（engineから更新される）
+
+    def set_market_mode(self, mode: str):
+        # 【関数】市場モードを受け取り、ゲートの振る舞いを切り替える（healthy/caution/halted）
+        self.market_mode = mode
+
+    def effective_inventory_limit(self) -> float | None:
+        """【関数】新規発注の実効上限（max_inventory − inventory_eps）を返す"""
+        if self.max_inventory is None:
+            return None
+        limit = float(self.max_inventory) - float(self.inventory_eps)
+        return max(0.0, limit)
+
+    def _current_inventory_from_context(self) -> float:
+        """RiskGate 自身または紐付く engine から現在在庫を推定する。取得できなければ 0.0 を返す。"""
+        candidates = [
+            getattr(self, "position", None),
+            getattr(getattr(self, "engine", None), "position", None),
+            getattr(self, "engine", None),
+        ]
+        for source in candidates:
+            if source is None:
+                continue
+            for attr in ("q", "Q"):
+                val = getattr(source, attr, None)
+                if val is None:
+                    continue
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    continue
+        return 0.0
+
+    def would_reduce_inventory(self, current_inventory: float | None, side: str | None, request_qty: float) -> bool:
+        """※関数：現在の在庫|Q|が縮む(=決済方向)かどうかを判定"""
+        if current_inventory is None:
+            current_inventory = self._current_inventory_from_context()
+        if side is None:
+            return False
+        try:
+            side_norm = str(side).strip().lower()
+        except Exception:
+            return False
+        if side_norm not in {"buy", "sell"}:
+            return False
+        try:
+            qty = float(request_qty)
+        except (TypeError, ValueError):
+            return False
+        if qty <= 0.0:
+            return False
+        delta = qty if side_norm == "buy" else -qty
+        return abs(current_inventory + delta) <= abs(current_inventory)
+
+    def can_place(
+        self,
+        current_inventory: float,
+        request_qty: float,
+        side: str | None = None,
+        reduce_only: bool = False,
+        best_age_ms: float | None = None,
+        **kwargs,
+    ) -> bool:
+        """【関数】新規発注の許可/不許可を判定する（在庫・安全装置の入口）。best_age_msは任意で健康判定に利用。"""
+        if self.market_mode in ("caution", "halted"):  # 何をする行か：市場モードが注意/停止ならClose-Onlyを適用
+            if reduce_only or (side and self.would_reduce_inventory(current_inventory, side, float(request_qty))):
+                return True   # 何をする行か：在庫を減らす（決済）なら常に許可
+            return False      # 何をする行か：在庫が増える方向の新規はブロック
+
+        try:
+            qty = abs(float(request_qty))
+        except (TypeError, ValueError):
+            return False
+
+        eff_limit = self.effective_inventory_limit()
+        if eff_limit is None:
+            return True
+
+        if abs(current_inventory) + qty <= eff_limit:
+            return True
+
+        if reduce_only or (side and self.would_reduce_inventory(current_inventory, side, float(request_qty))):
+            return True
+
+        return False
+
+    def inventory_guard_allows(self, *, side: str | None, qty: float) -> bool:
+        """inventory_guard がONの際も、決済方向であれば通すことを判定する。"""
+        guard_on = bool(getattr(self, "inventory_guard_active", False))
+        if not guard_on:
+            return True
+        if not side:
+            return False
+        return self.would_reduce_inventory(None, side, qty)
+
+    def market_mode_allows(self, side: str | None, qty: float) -> bool:
+        """market_modeがCaution/Paused/Haltedの間は決済方向のみ通す。"""
+        cfg_map = _to_mapping(getattr(self, "cfg", None))
+        safety_map = _to_mapping(cfg_map.get("safety")) if cfg_map else {}
+        close_only = bool(safety_map.get("market_mode_close_only", True))
+
+        mode = (
+            getattr(self, "market_mode", None)
+            or getattr(getattr(self, "engine", None), "market_mode", None)
+            or "healthy"
+        )
+        mode = str(mode or "healthy").strip().lower()
+
+        if mode in ("", "none", "healthy"):
+            return True
+
+        if not close_only:
+            return False
+
+        if not side:
+            return False
+
+        return self.would_reduce_inventory(None, side, qty)
+
+
+def cap_order_size_by_inventory(
+    req_raw: float,
+    abs_q: float,
+    eff_limit: float,
+    min_lot: float,
+    target_ratio: float = 0.90,
+) -> float:
+    """
+    在庫と新規サイズの合計が target_ratio*eff_limit を超えないように、
+    最小ロット刻みで req を【切り下げ】て返す関数。
+    - req_raw : 戦略が希望する元の新規サイズ
+    - abs_q   : いまの在庫の絶対値 |Q|
+    - eff_limit : 実効在庫上限（例：max_inventory * 0.99）
+    - min_lot : 取引所の最小ロット刻み
+    - target_ratio : 目標比（既定=0.90）。( |Q|+req ) / eff_limit ≤ 目標 になるよう制御
+
+    戻り値:
+      ・発注可能なら、刻みを満たしたサイズ（req_raw 以下に切り下げ）

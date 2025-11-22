@@ -1,0 +1,71 @@
+                                sz=o.remaining,
+                                reason=(
+                                    f"guard; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                    f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                                ),
+                            )
+                            self._heartbeat(now, "pause", reason="midmove_guard")  # 直近イベントを要約（ミッド変化ガードで停止）
+                        continue  # 新規は出さない
+                    
+                    # 戦略評価→意思決定ログ→アクション適用
+                    # 在庫上限ガード：|Q| が上限以上なら新規はClose-Onlyに切り替え、既存の指値は整理
+                    eff_limit = self.effective_inventory_limit()
+                    close_only_mode = False
+                    if eff_limit is not None and abs(self.Q) >= eff_limit:
+                        close_only_mode = True
+                        for o in self.sim.cancel_by_tag("stall"):
+                            self.order_log.add(
+                                ts=self._ts_jst(now),
+                                action="cancel",
+                                tif=o.tif,
+                                ttl_ms=o.ttl_ms,
+                                px=o.price,
+                                sz=o.remaining,
+                                reason=(
+                                    f"risk; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                    f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                                ),
+                            )  # 何を/なぜ記録したか（在庫上限）
+                        for o in self.sim.cancel_by_tag("ca_gate"):
+                            self.order_log.add(
+                                ts=self._ts_jst(now),
+                                action="cancel",
+                                tif=o.tif,
+                                ttl_ms=o.ttl_ms,
+                                px=o.price,
+                                sz=o.remaining,
+                                reason=(
+                                    f"risk; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
+                                    f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
+                                ),
+                            )  # 何を/なぜ記録したか（在庫上限）
+                        logger.warning(f"risk guard: |Q|>={eff_limit} → new orders paused")  # 画面でも分かるように一言
+                        self._heartbeat(now, "pause", reason="inventory_guard")  # ハートビート：在庫上限で停止
+                    if hasattr(self, "risk"):
+                        self.risk.inventory_guard_active = close_only_mode
+                    if close_only_mode:
+                        # Guard中（Close-Only）ならboard更新だけでも自動薄めを試行して在庫を減らす
+                        self._maybe_auto_reduce(now=monotonic())
+
+                    actions = self.strat.evaluate(self.ob, now, self.cfg)
+                    feats_win = getattr(getattr(self.cfg, "features", None), "ca_ratio_win_ms", 500)  # 何をする行か：CA比率集計窓(ms)を取得
+                    features = {
+                        "best_age_ms": self.ob.best_age_ms(now),  # 何をする行か：Best静止時間(ms)を記録
+                        "ca_ratio": self.ob.ca_ratio(now, window_ms=feats_win),  # 何をする行か：C/A比率を記録
+                        "spread_tick": self.ob.spread_ticks(),  # 何をする行か：現在スプレッド(tick)を記録
+                    }
+                    self._record_decision(now, actions, features=features)
+                    for act in actions:
+                        corr_from_action = act.get("_corr_id") if isinstance(act, dict) else None
+                        corr_token = None
+                        if corr_from_action is not None:
+                            corr_token = current_corr_ctx.set(corr_from_action)
+                        try:
+                            if act.get("type") == "place":
+                                # 同タグの重複を最小抑止
+                                if self.sim.has_open_tag(act["order"].tag):
+                                    continue
+                                o = act["order"]
+                                corr_value = (
+                                    corr_from_action
+                                    or getattr(o, "_corr_id", None)

@@ -1,35 +1,44 @@
-# configs/live.yml - base.yml の既定設定をもとに使い、env を必ず live に固定します。
+# configs/live.yml - live環境用の上書き設定
 env: live
 
-# 既定サイズを最小へ（保険）。strategy_cfg で明示上書きも行う。
+# 既定サイズを最小に（戦略別にも明示上書き）
 size:
   default: 0.001
 
-# 戦略別にロットを最小へ明示上書き（最重要）。
+# 戦略別の上書き（ロットとしきい値を明示）
 strategy_cfg:
   stall_then_strike:
     size:
       default: 0.001
+    take_profit_ticks: 1.0    # Live: 薄利利確の目標tick
+    stop_ticks: 2.0           # Live: 逆行撤退tick
   cancel_add_gate:
     size:
       default: 0.001
+    ca_ratio_win_ms: 600      # Live: C/A比の計測窓ms
+    ca_threshold: 1.25        # Live: C/A比閾値
+    taker_zscore_threshold: 3.0  # Live: 連続成行毒性zscore閾値（nullで無効）
 
-# 銘柄を明示（FX 販売所）
+# 銘柄
 product_code: FX_BTC_JPY
 
-# 送信レートを抑制（Canary：1本/秒、同一注文の重複送信を1秒禁止）
+# 送信レートを抑制（1本/秒、同一内容は1秒禁止）
 tx:
   min_interval_ms: 1000
   place_dedup_ms: 1000
 
-# Kill-Switch（DDは正の値、日次損失は負の閾値）
+# Kill-Switch と在庫薄め（ライブは利益時のみ有効）
 risk:
+  max_active_orders: 1         # 同時アクティブ注文を1本までに制限
   kill:
-    daily_pnl_jpy: -30000  # 日次損失の下限（負の値）
-    max_dd_jpy: 20000      # DDの上限（正の値）
-  auto_reduce:              # 本番は“有効＋利益時のみ”で開始
-    enabled: true           # 戦略が無音でも在庫エンジンが薄めを出す
-    profit_only: true       # プラスのときだけ自動決済する（通常時）
-    force_on_risk: true     # -205/Halted/在庫上限違反などは必ず薄める
-    tif: IOC                # 走らせたら即判定（板滞留を避ける）
-    min_step_qty: 0.001     # 取引所の最小ロットに合わせる
+    daily_pnl_jpy: -30000      # 日次損失の下限
+    max_dd_jpy: 20000          # 最大ドローダウン
+  auto_reduce:                 # 在庫“薄め”は利益時のみ有効
+    enabled: true
+    profit_only: true
+    force_on_risk: true
+    tif: IOC
+    min_step_qty: 0.001
+
+logging:
+  heartbeat_status_sec: 2

@@ -13,7 +13,9 @@ from datetime import datetime, timezone, timedelta  # ts解析と現在時刻 JS
 from typing import Deque, Optional, Sequence, Tuple  # 型ヒント
 import csv  # 役割：窓イベントをCSVに1行追記するために使用
 import time  # 何をするか：現在時刻(ms)を取得してHB間隔を測る
+from time import monotonic  # これは「auto_reduceのクールダウン用タイマー」です
 from loguru import logger  # 実行ログ
+from functools import wraps  # 再入防止デコレータ用（_maybe_auto_reduce の重複呼び出し抑止）
 from pathlib import Path  # ハートビートNDJSONのファイル出力に使用
 import orjson  # 1行JSON化（高速）
 from src.core.realtime import event_stream  # 【関数】WS購読（board/executions）:contentReference[oaicite:2]{index=2}
@@ -31,9 +33,7 @@ from src.core.risk import RiskGate  # 何をするか：在庫ゲート（市場
 from src.core.utils import monotonic_ms
 from src.core.risk import cap_order_size_by_inventory  # 在庫と上限に基づき新規サイズを安全側へ切り下げる
 from src.core.risk import inv_capping_preflight  # 在庫前処理（ログ: headroom/shrink/no_room を一元管理）
-from decimal import Decimal  # 在庫・価格を高精度で扱うため
-from src.core.risk import auto_reduce_should_fire  # 「今だけ薄める？」の判定
-from src.core.orders import auto_reduce_build, Order  # Reduce-Only+IOCの仕様とOrder
+from src.core.orders import Order  # Reduce-Only+IOCの仕様とOrder
 
 _CORR_MAP_MAX = 8192  # 何をするか：client_order_id→corr_id の保持件数上限
 _coid_to_corr: OrderedDict[str, str] = OrderedDict()  # 何をするか：corr参照用のLRUマップ
@@ -82,6 +82,46 @@ def _eval_feed_health(cfg: dict | object,
 
     return "healthy", "ok"
 
+
+def _cfg_pick(root, dotted, default=None):
+    # ドット区切りパス（例: "risk.auto_reduce.enabled"）をたどって
+    # dict / Pydantic(BaseModel) / SimpleNamespace などを安全に横断して値を取り出すユーティリティ。
+    cur = root
+    for key in dotted.split("."):
+        if cur is None:
+            return default
+        if isinstance(cur, dict):
+            # dict は通常どおりキーでたどる
+            cur = cur.get(key)
+        else:
+            # Pydantic v2 では未知のキーが model_extra に入るので、まずそこを見る
+            extra = getattr(cur, "model_extra", None)
+            if isinstance(extra, dict) and key in extra:
+                cur = extra[key]
+            else:
+                # なければ通常の属性アクセスを試す
+                cur = getattr(cur, key, None)
+    return default if cur is None else cur
+
+
+def _ar_non_reentrant(fn):
+    """関数目的：auto_reduceの再入（再帰/重複呼び出し）を1回に制限するデコレータ。
+    実行中に同じ関数が再度呼ばれたらノーオペで戻す。"""
+    @wraps(fn)
+    def _wrap(self, *args, **kwargs):
+        # いま実行中なら再入をブロック（目的：sim.place()→on_fill→_maybe_auto_reduce() の再帰ループ遮断）
+        if getattr(self, "_ar_locked", False):
+            logger.debug("auto_reduce: skip reentry_guard_on")
+            return  # ノーオペで即終了（決済フローを壊さない）
+        # ロックを立ててから本体を実行
+        self._ar_locked = True  # このフラグは本インスタンス内だけで有効
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            # 例外時でも必ず解放（目的：ロック取りっぱなしを防ぐ）
+            self._ar_locked = False
+    return _wrap
+
 def _parse_iso(ts: str) -> datetime:
     """【関数】ISO→datetime（'Z'も+00:00に正規化）"""
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
@@ -127,6 +167,8 @@ class PaperEngine:
                 strategy_cfg = getattr(cfg, "strategy_cfg", None)
         # 設定（製品コード/刻み/ガード閾値）
         self.cfg = cfg
+        self.logger = logger
+        self._ar_last_ts = 0.0  # これは「auto_reduceの前回発火時刻（秒）」です
         self.product = getattr(cfg, "product_code", "FX_BTC_JPY") or "FX_BTC_JPY"
         self.tick = float(getattr(cfg, "tick_size", 1.0))
         self.max_inv = getattr(getattr(cfg, "risk", None), "max_inventory", None)
@@ -139,6 +181,7 @@ class PaperEngine:
             self.kill_dd = getattr(getattr(getattr(cfg, "risk", None), "kill", None), "max_dd_jpy", None)        # 【関数】Kill: 日次DD閾値
             self.halted = False  # 【関数】Kill発火後は停止
         self.risk = RiskGate(cfg)  # 何をする行か：設定を元に在庫ゲートを構築（市場モード連携の受け皿）
+        setattr(self.risk, "engine", self)  # RiskGate から現在在庫やモードを参照できるようにつないでおく
         health_cfg = getattr(cfg, "health", None)  # 何をする行か：Best静止しきい値（healthセクション）を安全に取得
         self._stale_warn_ms = None  # 何をする行か：Best静止でCautionへ入る閾値(ms)
         self._stale_halt_ms = None  # 何をする行か：Best静止でHaltedへ入る閾値(ms)
@@ -181,10 +224,11 @@ class PaperEngine:
         self.trade_log = TradeLog("logs/trades/trade_log.parquet", mirror_ndjson="logs/trades/trade_log.ndjson")  # NDJSONミラー有効化
         self.decision_log = DecisionLog("logs/analytics/decision_log.parquet", mirror_ndjson="logs/analytics/decision_log.ndjson")  # NDJSONミラー有効化
         self._hb_path = Path("logs/runtime/heartbeat.ndjson")  # 【関数】ハートビート出力先（NDJSON）
+        self._hb_path.parent.mkdir(parents=True, exist_ok=True)  # 先にフォルダを用意
         self._events_dir = Path("logs/events")  # 役割：窓イベントのCSVフォルダ
+        self._events_dir.mkdir(parents=True, exist_ok=True)  # 先にフォルダを作成（touch前に必要）
         (self._events_dir / "maintenance.csv").touch(exist_ok=True)  # 初回起動でも tail できるよう空ファイルを作る
         (self._events_dir / "funding_schedule.csv").touch(exist_ok=True)  # 同上
-        self._events_dir.mkdir(parents=True, exist_ok=True)  # 役割：フォルダを作成
         self._maint_prev, self._fund_prev = False, False  # 役割：直前の窓状態（enter/exit検出用）
 
         self._hb_path.parent.mkdir(parents=True, exist_ok=True)  # 親フォルダを用意
@@ -516,65 +560,69 @@ class PaperEngine:
 
     # ─────────────────────────────────────────────────────────────
     def _record_decision(self, now: datetime, actions, features: dict | None = None) -> None:
-        """【関数】意思決定ログへ記録（featuresと結論の一行）"""
-        # 特徴量を収集
-        feats_win = getattr(getattr(self.cfg, "features", None), "ca_ratio_win_ms", 500)
-        feats = features if isinstance(features, dict) else {
-            "best_age_ms": self.ob.best_age_ms(now),
-            "ca_ratio": self.ob.ca_ratio(now, window_ms=feats_win),
-            "spread_tick": self.ob.spread_ticks(),
+        """【関数】意思決定ログへ記録：featuresと結論を1行で追加"""
+        try:
+            logger.info(f"decision record path={__file__} features_in={features}")
+        except Exception:
+            pass
+        feats_win = getattr(getattr(self.cfg, 'features', None), 'ca_ratio_win_ms', 500)
+        # ベースの特徴量をまず埋める
+        feats = {
+            'best_age_ms': self.ob.best_age_ms(now),
+            'ca_ratio': self.ob.ca_ratio(now, window_ms=feats_win),
+            'spread_tick': self.ob.spread_ticks(),
         }
+        # 呼び出し元から渡された特徴量を上書き
+        if isinstance(features, Mapping):
+            for k, v in features.items():
+                feats[k] = v
+        # 戦略側の特徴量をマージ
         extra = self._consume_strategy_features()
         if isinstance(extra, Mapping):
             for key, value in extra.items():
                 if key not in feats:
                     feats[key] = value
-        # 結論を要約
-        if not actions:
-            decision = "none"
-        else:
-            places = [a for a in actions if a.get("type") == "place"]
-            cancels = [a for a in actions if a.get("type") == "cancel_tag"]
-            if places:
-                sides = {p["order"].side for p in places if "order" in p}
-                decision = "place_both" if sides == {"buy", "sell"} else f"place_{list(sides)[0]}"
-            elif cancels:
-                decision = "cancel"
-            else:
-                decision = "none"
 
-        _features = dict(feats or {})  # 何をするか：特徴量JSONを壊さないようコピーしてタグ情報を追記する土台を作る
+        if not actions:
+            decision = 'none'
+        else:
+            places = [a for a in actions if a.get('type') == 'place']
+            cancels = [a for a in actions if a.get('type') == 'cancel_tag']
+            if places:
+                sides = {p['order'].side for p in places if 'order' in p}
+                decision = 'place_both' if sides == {'buy', 'sell'} else f"place_{list(sides)[0]}"
+            elif cancels:
+                decision = 'cancel'
+            else:
+                decision = 'none'
+
+        _features = dict(feats or {})
         orders = [
-            a.get("order")
+            a.get('order')
             for a in (actions or [])
-            if isinstance(a, dict) and a.get("type") == "place" and a.get("order") is not None
-        ]  # 何をするか：今回の意思決定で生成された注文を拾う
+            if isinstance(a, dict) and a.get('type') == 'place' and a.get('order') is not None
+        ]
         tags = sorted({
-            str(getattr(o, "tag", getattr(o, "_strategy", None)))
+            str(getattr(o, 'tag', getattr(o, '_strategy', None)))
             for o in orders
-            if getattr(o, "tag", None) or getattr(o, "_strategy", None)
-        })  # 何をするか：注文に刻まれたタグ/子戦略名を収集して一意化
+            if getattr(o, 'tag', None) or getattr(o, '_strategy', None)
+        })
         if tags:
-            _features["tags"] = tags  # 何をするか：タグ情報があれば features_json に配列で書き込む
+            _features['tags'] = tags
 
         corr_hint = current_corr_ctx.get()
         if not corr_hint:
-            corr_hint = next(
-                (getattr(o, "_corr_id", None) for o in orders if getattr(o, "_corr_id", None)),
-                None,
-            )
-        corr_id = corr_hint or uuid.uuid4().hex  # 何をするか：決定単位で一意な相関IDを決める
-        _features["corr_id"] = corr_id  # 何をするか：features_json内に相関IDを残す
+            corr_hint = next((getattr(o, '_corr_id', None) for o in orders if getattr(o, '_corr_id', None)), None)
+        corr_id = corr_hint or uuid.uuid4().hex
+        _features['corr_id'] = corr_id
 
-        # 設定スナップショット（分析用に毎回埋め込む）
         try:
-            cfg_obj = getattr(self, "cfg", None)
-            risk_node = getattr(cfg_obj, "risk", None) if cfg_obj is not None else None
-            inv_node = getattr(risk_node, "inv_capping", None) if risk_node is not None else None
-            size_node = getattr(cfg_obj, "size", None) if cfg_obj is not None else None
+            cfg_obj = getattr(self, 'cfg', None)
+            risk_node = getattr(cfg_obj, 'risk', None) if cfg_obj is not None else None
+            inv_node = getattr(risk_node, 'inv_capping', None) if risk_node is not None else None
+            size_node = getattr(cfg_obj, 'size', None) if cfg_obj is not None else None
 
-            max_inv = getattr(risk_node, "max_inventory", None) if risk_node is not None else None
-            # enabled/params は dict/Pydantic 両対応。未設定は既定値（enabled=True, ratio=0.90, margin=0.99）。
+            max_inv = getattr(risk_node, 'max_inventory', None) if risk_node is not None else None
             inv_enabled = True
             target_ratio = 0.90
             eff_margin = 0.99
@@ -582,52 +630,64 @@ class PaperEngine:
                 from collections.abc import Mapping as _Mapping
                 if inv_node is not None:
                     if isinstance(inv_node, _Mapping):
-                        inv_enabled = bool(inv_node.get("enabled", True))
-                        if inv_node.get("target_ratio") is not None:
-                            target_ratio = float(inv_node.get("target_ratio"))
-                        if inv_node.get("eff_limit_margin") is not None:
-                            eff_margin = float(inv_node.get("eff_limit_margin"))
+                        inv_enabled = bool(inv_node.get('enabled', True))
+                        if inv_node.get('target_ratio') is not None:
+                            target_ratio = float(inv_node.get('target_ratio'))
+                        if inv_node.get('eff_limit_margin') is not None:
+                            eff_margin = float(inv_node.get('eff_limit_margin'))
                     else:
-                        inv_enabled = bool(getattr(inv_node, "enabled", True))
-                        tr = getattr(inv_node, "target_ratio", None)
+                        inv_enabled = bool(getattr(inv_node, 'enabled', True))
+                        tr = getattr(inv_node, 'target_ratio', None)
                         if isinstance(tr, (int, float)):
                             target_ratio = float(tr)
-                        mg = getattr(inv_node, "eff_limit_margin", None)
+                        mg = getattr(inv_node, 'eff_limit_margin', None)
                         if isinstance(mg, (int, float)):
                             eff_margin = float(mg)
             except Exception:
                 pass
             try:
-                min_lot = float(getattr(size_node, "min", None)) if size_node is not None else None
+                min_lot = float(getattr(size_node, 'min', None)) if size_node is not None else None
             except Exception:
                 min_lot = None
             eff_limit = self.effective_inventory_limit()
 
-            _features["inv_capping"] = {
-                "enabled": bool(inv_enabled),
-                "target_ratio": float(target_ratio) if isinstance(target_ratio, (int, float)) else target_ratio,
-                "eff_limit_margin": float(eff_margin) if isinstance(eff_margin, (int, float)) else eff_margin,
-                "max_inventory": float(max_inv) if isinstance(max_inv, (int, float)) else max_inv,
-                "eff_limit": float(eff_limit) if eff_limit is not None else None,
-                "min_lot": min_lot,
-                "abs_q": abs(getattr(self, "Q", 0.0)),
+            _features['inv_capping'] = {
+                'enabled': bool(inv_enabled),
+                'target_ratio': float(target_ratio) if isinstance(target_ratio, (int, float)) else target_ratio,
+                'eff_limit_margin': float(eff_margin) if isinstance(eff_margin, (int, float)) else eff_margin,
+                'max_inventory': float(max_inv) if isinstance(max_inv, (int, float)) else max_inv,
+                'eff_limit': float(eff_limit) if eff_limit is not None else None,
+                'min_lot': min_lot,
+                'abs_q': abs(getattr(self, 'Q', 0.0)),
             }
         except Exception:
             pass
 
         decision_record = {
-            "ts": self._ts_jst(now),
-            "strategy": (current_strategy_ctx.get() or self.strat.name),
-            "decision": decision,
-            "features": _features,
-            "expected_edge_bp": None,  # 最小実装では未算出
-            "eta_ms": None,            # 最小実装では未算出
-            "ca_ratio": feats["ca_ratio"],
-            "best_age_ms": feats["best_age_ms"],
-            "spread_state": ("zero" if feats["spread_tick"] == 0 else "ge1"),
+            'ts': self._ts_jst(now),
+            'strategy': (current_strategy_ctx.get() or self.strat.name),
+            'decision': decision,
+            'features': _features,
+            'expected_edge_bp': None,
+            'eta_ms': None,
+            'ca_ratio': feats.get('ca_ratio'),
+            'best_age_ms': feats.get('best_age_ms'),
+            'spread_state': ('zero' if feats.get('spread_tick') == 0 else 'ge1'),
         }
-        decision_record.update({"expected_edge_bp": (feats.get("expected_edge_bp") or feats.get("mp_edge_bp") or ((feats["microprice"] - feats["mid"]) / feats["mid"] * 1e4) if "microprice" in feats and "mid" in feats else None), "eta_ms": (feats.get("eta_ms") or feats.get("queue_eta_ms"))})  # decisionログへETAと期待エッジ(bp)を必ず埋める。MPがあれば (MP−mid)/mid×1e4 で簡易推定、ETAはQueue ETAを採用
+        decision_record.update({
+            'expected_edge_bp': (
+                feats.get('expected_edge_bp')
+                or feats.get('mp_edge_bp')
+                or (
+                    (feats['microprice'] - feats['mid']) / feats['mid'] * 1e4
+                    if 'microprice' in feats and 'mid' in feats and feats.get('mid')
+                    else None
+                )
+            ),
+            'eta_ms': (feats.get('eta_ms') or feats.get('queue_eta_ms')),
+        })
         self.decision_log.add(**decision_record)
+
 
     def _consume_strategy_features(self) -> dict | None:
         getter = getattr(self.strat, "consume_decision_features", None)
@@ -637,89 +697,295 @@ class PaperEngine:
                 return dict(extra)
         return None
 
-    def _maybe_auto_reduce(self, now: datetime) -> None:
-        """戦略が無音でも在庫だけで“薄め”を1口（Reduce‑Only+IOC）。板に残さない。"""
+    @_ar_non_reentrant  # 再入防止：同時に2回以上走らせない
+    def _maybe_auto_reduce(self, now: float) -> None:
+        """これは「inventory_guard/Caution/Halted 中は在庫を減らす向きに reduce-only+IOC を最小ロットで出す」関数です。"""
+        # DEBUG: 何度呼ばれているか・どこで弾かれているかを軽量に可視化する
+        log = getattr(self, "logger", logger)
         try:
-            cfg = self.cfg
-            def _get(node, key, default=None):
-                if node is None:
-                    return default
-                try:
-                    from collections.abc import Mapping as _M
-                    if isinstance(node, _M):
-                        return node.get(key, default)
-                except Exception:
-                    pass
-                return getattr(node, key, default)
-
-            ar = _get(_get(cfg, "risk", {}), "auto_reduce", {}) or {}
-            if not bool(_get(ar, "enabled", False)):
-                return
-
-            q = Decimal(str(getattr(self, "Q", 0)))
-            a = Decimal(str(getattr(self, "A", 0)))
-            # best bid/ask → mid
-            bid_px = getattr(getattr(self, "ob", None), "best_bid", None)
-            ask_px = getattr(getattr(self, "ob", None), "best_ask", None)
-            bid_px = None if bid_px is None else getattr(bid_px, "price", None)
-            ask_px = None if ask_px is None else getattr(ask_px, "price", None)
-            mark = None
-            try:
-                if bid_px is not None and ask_px is not None and bid_px > 0 and ask_px > 0:
-                    mark = Decimal(str((bid_px + ask_px) / 2.0))
-            except Exception:
-                mark = None
-
-            mode = str(getattr(self.risk, "market_mode", "healthy")).lower()
-            eff = self.effective_inventory_limit() or 0.0
-            eff_limit = Decimal(str(eff))
-
-            decision = auto_reduce_should_fire(
-                enabled=bool(_get(ar, "enabled", False)),
-                profit_only=bool(_get(ar, "profit_only", True)),
-                force_on_risk=bool(_get(ar, "force_on_risk", True)),
-                q=q, a=a, mark=mark, mode=mode, recent_errors=[], eff_limit=eff_limit,
-            )
-            if not decision.fire:
-                return
-
-            size_node = _get(cfg, "size", {})
-            min_qty = Decimal(str(_get(ar, "min_step_qty", _get(size_node, "min", 0.001))))
-            qty_step = Decimal(str(_get(size_node, "min", 0.001)))
-            tick = Decimal(str(_get(cfg, "tick_size", 1)))
-
-            spec = auto_reduce_build(
-                side=decision.side or ("SELL" if q > 0 else "BUY"), q=q,
-                min_step_qty=min_qty, qty_step=qty_step, tick_size=tick,
-                best_bid=None if bid_px is None else Decimal(str(bid_px)),
-                best_ask=None if ask_px is None else Decimal(str(ask_px)),
-                tif=str(_get(ar, "tif", "IOC")), tag="auto_reduce",
-            )
-            if not spec:
-                return
-
-            # spec → Order（paperシミュ用）。price が無い場合は mid を使う
-            px = spec.get("price")
-            if px is None and mark is None:
-                return
-            o = Order(
-                side=str(spec["side"]).lower(),
-                price=float(px if px is not None else mark),
-                size=float(spec["size"]),
-                tif=str(spec.get("tif", "IOC")),
-                ttl_ms=None,
-                tag=str(spec.get("tag", "auto_reduce")),
-            )
-
-            self.sim.place(o, now)
-            self.order_log.add(
-                ts=self._ts_jst(now), action="place", tif=o.tif, ttl_ms=o.ttl_ms,
-                px=o.price, sz=o.size, reason=o.tag,
-            )
-            self._heartbeat(now, "place", reason=o.tag)
+            log.debug("auto_reduce: enter")
         except Exception:
+            pass
+
+        def _ar_dbg(reason: str) -> None:
+            """DEBUG: auto_reduceの早期return理由を1行で記録する（数だけ見れば十分な最小情報）。"""
+            try:
+                log.debug(f"auto_reduce: skip {reason}")
+            except Exception:
+                pass
+
+        cfg = getattr(self, "cfg", {}) or {}
+        # cfg.risk.auto_reduce を「辞書でもオブジェクトでも」安全に取り出して辞書化する
+        risk_obj = cfg.get("risk") if isinstance(cfg, dict) else getattr(cfg, "risk", None)
+        auto_reduce_obj = (
+            (risk_obj or {}).get("auto_reduce")
+            if isinstance(risk_obj, dict)
+            else getattr(risk_obj, "auto_reduce", None)
+        )
+        # Pydantic(BaseModel) や SimpleNamespace の場合も .model_dump() / vars() で辞書化する
+        if isinstance(auto_reduce_obj, dict):
+            ar = auto_reduce_obj
+        elif hasattr(auto_reduce_obj, "model_dump"):
+            try:
+                ar = auto_reduce_obj.model_dump()
+            except Exception:
+                ar = {}
+        elif auto_reduce_obj is not None:
+            try:
+                ar = vars(auto_reduce_obj)
+            except Exception:
+                ar = {}
+        else:
+            ar = {}
+        # 設定から enabled / profit_only / cooldown_ms をドットパスで安全に取得する
+        enabled = bool(_cfg_pick(cfg, "risk.auto_reduce.enabled", False))
+        profit_only = bool(_cfg_pick(cfg, "risk.auto_reduce.profit_only", True))
+        cooldown_ms = int(_cfg_pick(cfg, "risk.auto_reduce.cooldown_ms", 0))
+
+        if not enabled:
+            _ar_dbg(f"skip disabled (cfg resolved: enabled={enabled} profit_only={profit_only} cooldown_ms={cooldown_ms})")
             return
 
+        _ar_dbg(f"cfg resolved: enabled={enabled} profit_only={profit_only} cooldown_ms={cooldown_ms}")
+        try:
+            override_ms = float(ar.get("board_stale_override_ms", 0) or 0.0)
+        except Exception:
+            override_ms = 0.0
+
+        # クールダウン（連打防止）
+        # 設定に cooldown_ms があればそれを尊重（<=0 ならクールダウン無し）
+        cd_ms = int(cooldown_ms) if isinstance(cooldown_ms, (int, float)) else 0
+        last_ts = getattr(self, "_ar_last_ts", 0.0) or 0.0
+        if cd_ms > 0 and (now - last_ts) * 1000.0 < cd_ms:
+            _ar_dbg("cooldown")
+            return
+
+        # 在庫を読み、position が無ければ Q/A を使う
+        def _as_float(val) -> float:
+            try:
+                return float(val)
+            except Exception:
+                return 0.0
+
+        pos = getattr(self, "position", None)
+        if pos is not None:
+            q = _as_float(getattr(pos, "q", 0.0))
+            a = _as_float(getattr(pos, "a", 0.0))
+        else:
+            q = _as_float(getattr(self, "Q", 0.0))
+            a = _as_float(getattr(self, "A", 0.0))
+
+        if q == 0.0:
+            _ar_dbg("size_zero")
+            return
+
+        # target_eff 超過の判定（inv_capping と同等の考え方）
+        # target_eff = target_ratio * eff_limit（eff_limit は effective_inventory_limit を採用）
+        try:
+            cfg_obj = getattr(self, "cfg", None)
+            risk_node = getattr(cfg_obj, "risk", None) if cfg_obj is not None else None
+            inv_node = getattr(risk_node, "inv_capping", None) if risk_node is not None else None
+            tr = None
+            if inv_node is not None:
+                from collections.abc import Mapping as _Mapping
+                if isinstance(inv_node, _Mapping):
+                    tr = inv_node.get("target_ratio")
+                else:
+                    tr = getattr(inv_node, "target_ratio", None)
+            target_ratio = float(tr) if isinstance(tr, (int, float)) else 0.90
+        except Exception:
+            target_ratio = 0.90
+        eff_limit_val = self.effective_inventory_limit()
+        try:
+            eff_limit_f = float(eff_limit_val) if eff_limit_val is not None else 0.0
+        except Exception:
+            eff_limit_f = 0.0
+        target_eff = (target_ratio * eff_limit_f) if eff_limit_f > 0.0 else 0.0
+        over_eff = (abs(q) > target_eff) if target_eff > 0.0 else False
+        # target_eff を超えている間は、在庫縮小を優先させるために一時的に Close-Only と等価のフラグをON
+        if over_eff and not getattr(self.risk, "inventory_guard_active", False):
+            try:
+                self.risk.inventory_guard_active = True
+            except Exception:
+                pass
+        elif (not over_eff) and getattr(self.risk, "inventory_guard_active", False):
+            # target_eff を下回っており、かつハード上限(=eff_limit)も未到達なら一時フラグを解除
+            try:
+                eff_lim_eff = float(self.effective_inventory_limit() or 0.0)
+            except Exception:
+                eff_lim_eff = 0.0
+            hard_guard = (eff_lim_eff > 0.0 and abs(q) >= eff_lim_eff)
+            if not hard_guard:
+                try:
+                    self.risk.inventory_guard_active = False
+                except Exception:
+                    pass
+
+        # guard/モード判定
+        mode = str(getattr(self, "market_mode", getattr(self.risk, "market_mode", "healthy"))).lower()
+        guard_on = bool(getattr(self.risk, "inventory_guard", False) or getattr(self.risk, "inventory_guard_active", False))
+        force_on_risk = bool(ar.get("force_on_risk", True))
+        if not ((guard_on or over_eff) or (force_on_risk and mode in ("caution", "halted"))):  # over_eff時はHealthyでもreduce-onlyを許可して在庫を軽くする（market_mode_blockで止めない）
+            _ar_dbg("market_mode_block")
+            return  # 平常時は出さない
+
+        side = "SELL" if q > 0.0 else "BUY"
+        try:
+            min_step_cfg = float(ar.get("min_step_qty", 0.001))
+        except Exception:
+            min_step_cfg = 0.001
+
+        # --- auto_reduce の発注量を決める（ロット刻み・dust回避） ---
+        # ここでは「在庫の超過分（overshoot）」を最小ロットΔqに合わせて減らす量に変換する。
+        base_step = max(min_step_cfg, 0.0)
+        qty_step = float(getattr(self, "qty_step", base_step or 0.001))  # 最小ロット。設定未定義なら 0.001 BTC を既定にする
+        if qty_step <= 0.0:
+            qty_step = 0.001
+        dust_eps = float(getattr(self, "dust_eps", qty_step * 0.5))  # ゼロ寄せ境界（Δq/2を既定）
+
+        abs_q = abs(q)  # 現在在庫の絶対量
+        overshoot = (abs_q - target_eff) if (target_eff > 0.0 and over_eff) else 0.0  # 目標超過分（target_effを超えた部分）
+
+        # ロット未満／超過なしなら発注しない（無駄打ちと取引所拒否を防ぐ）
+        if abs_q < qty_step or overshoot <= 0.0:
+            _ar_dbg("size_zero")  # 減らす意味のある量がない
+            return
+
+        # 少なくとも1ロットは薄くする。overshoot が複数ロットならその分だけ薄くする。
+        try:
+            lots = max(int(overshoot / qty_step), 1)
+        except Exception:
+            lots = 1
+        step = min(abs_q, lots * qty_step)
+
+        # dust（極小端数）は出さない
+        if step <= 0.0 or step < dust_eps:
+            _ar_dbg("size_zero")
+            return
+
+        # Guard中は利益条件を自動無効化（必ず薄めを試す）。監査用にフラグ保持。
+        profit_overridden = False
+        if guard_on and profit_only:
+            profit_only = False
+            profit_overridden = True
+
+        # 板からmidを概算しておく
+        ob = getattr(self, "orderbook", None) or getattr(self, "ob", None)
+        stale_age_ms = None
+        if profit_only and guard_on and override_ms > 0 and ob is not None:
+            try:
+                age_fn = getattr(ob, "best_age_ms", None)
+                raw_age = age_fn() if callable(age_fn) else None
+                if raw_age is None:
+                    raw_age = getattr(ob, "_best_age_ms", None)
+                if raw_age is not None:
+                    stale_age_ms = float(raw_age)
+            except Exception:
+                stale_age_ms = None
+            if stale_age_ms is not None and stale_age_ms >= override_ms:
+                profit_only = False
+                self.logger.debug(
+                    "auto_reduce: profit_only overridden due to stale board (age_ms=%s >= %s)",
+                    stale_age_ms,
+                    override_ms,
+                )
+
+        def _best_px(book, attr: str):
+            node = getattr(book, attr, None) if book is not None else None
+            px = getattr(node, "price", None)
+            try:
+                val = float(px)
+            except Exception:
+                return None
+            return val if val > 0 else None
+
+        bid_px = _best_px(ob, "best_bid")
+        ask_px = _best_px(ob, "best_ask")
+        mid = 0.0
+        if bid_px is not None and ask_px is not None:
+            mid = (bid_px + ask_px) / 2.0
+        elif bid_px is not None:
+            mid = bid_px
+        elif ask_px is not None:
+            mid = ask_px
+
+        # profit_only の簡易判定
+        if profit_only:
+            if mid <= 0.0 or a <= 0.0:
+                _ar_dbg("board_not_suitable")
+                return
+            if (q > 0.0 and mid < a) or (q < 0.0 and mid > a):
+                _ar_dbg("profit_only_gate")
+                return
+
+        tif = str(ar.get("tif", "IOC")).upper()
+        px_for_sim = None
+        if side == "SELL":
+            px_for_sim = bid_px or ask_px or (mid if mid > 0 else None) or (a if a > 0 else None)
+        else:
+            px_for_sim = ask_px or bid_px or (mid if mid > 0 else None) or (a if a > 0 else None)
+
+        # 発火理由を明示（Guard中か／profit_onlyの自動解除有無）
+        try:
+            self.logger.debug(
+                "auto_reduce: fire reason=%s (profit_only_overridden=%s)",
+                ("inventory_guard" if guard_on else "normal"),
+                profit_overridden,
+            )
+        except Exception:
+            pass
+
+        try:
+            ex = getattr(self, "exchange", None)
+            if hasattr(ex, "sendchildorder"):
+                self.logger.info(f"auto_reduce: try place (REST) side={side} qty={step:.6f} tif={tif} tag=auto_reduce")
+                ex.sendchildorder(
+                    side=side,
+                    size=step,
+                    price=None,
+                    time_in_force=tif,
+                    reduce_only=True,
+                    tag="auto_reduce",
+                )
+            elif hasattr(self, "_place"):
+                self.logger.info(f"auto_reduce: try place (engine) side={side} qty={step:.6f} tif={tif} tag=auto_reduce")
+                self._place(
+                    side=side,
+                    qty=step,
+                    price=None,
+                    tif=tif,
+                    reduce_only=True,
+                    tag="auto_reduce",
+                )
+            elif hasattr(getattr(self, "sim", None), "place") and px_for_sim is not None:
+                order = Order(
+                    side=side.lower(),
+                    price=float(px_for_sim),
+                    size=step,
+                    tif=tif,
+                    ttl_ms=None,
+                    tag="auto_reduce",
+                )
+                setattr(order, "reduce_only", True)
+                ts_dt = datetime.now(timezone.utc)
+                self.logger.info(f"auto_reduce: try place (sim) side={side} qty={step:.6f} tif={tif} tag=auto_reduce")
+                self.sim.place(order, ts_dt)
+                self.order_log.add(
+                    ts=self._ts_jst(ts_dt),
+                    action="place",
+                    tif=order.tif,
+                    ttl_ms=order.ttl_ms,
+                    px=order.price,
+                    sz=order.size,
+                    reason=order.tag,
+                )
+                self._heartbeat(ts_dt, "place", reason=order.tag)
+            else:
+                self.logger.info(f"auto_reduce: skip (no place path) side={side} qty={step:.6f}")
+                return
+            self._ar_last_ts = now  # 発火時刻を更新
+        except Exception as e:
+            self.logger.warning(f"auto_reduce: place failed: {e}")
     def _heartbeat(self, now: datetime, event: str, reason: str | None = None) -> None:
         """【関数】ハートビート：Q/A/R・日次R・各ガード/窓の状態を1行JSONで追記する"""
         eff_limit = self.effective_inventory_limit()
@@ -764,6 +1030,8 @@ class PaperEngine:
         with hb_path.open("a", encoding="utf-8") as fh:
             for line in lines:
                 fh.write(line + "\n")
+        # HBごとにreduce-onlyを1回だけ試行（板が止まっても在庫解放のチャンスを作る）
+        self._maybe_auto_reduce(now=monotonic())
 
     # ─────────────────────────────────────────────────────────────
     def _apply_fill_and_log(
@@ -1020,6 +1288,21 @@ class PaperEngine:
                         return  # 安全停止（finallyでログflush）  # 文書の“Kill到達で停止”に準拠
 
                     self.ob.update_from_event(ev)
+                    # 板更新ごとに target_eff(= eff_limit * target_ratio) 超なら reduce-only の自動解放を試行
+                    try:
+                        inv_node = getattr(getattr(self.cfg, "risk", None), "inv_capping", None)
+                        tr = None
+                        if inv_node is not None:
+                            from collections.abc import Mapping as _Mapping
+                            tr = inv_node.get("target_ratio") if isinstance(inv_node, _Mapping) else getattr(inv_node, "target_ratio", None)
+                        target_ratio = float(tr) if isinstance(tr, (int, float)) else 0.90
+                    except Exception:
+                        target_ratio = 0.90
+                    _eff_lim = self.effective_inventory_limit()
+                    _over_eff = (_eff_lim is not None and _eff_lim > 0.0 and abs(self.Q) > target_ratio * float(_eff_lim))
+                    # 在庫が“目標有効上限”を超えたら、決済だけの自動縮小（reduce-only）を必ず試す
+                    if _over_eff:
+                        self._maybe_auto_reduce(now=monotonic())
                     # 窓の現在状態を判定（true/false）し、前回から変わったらCSVに記録
                     maint_now = self._in_maintenance(now)
                     fund_now = self._in_funding_calc(now) or self._in_funding_transfer(now)
@@ -1032,6 +1315,20 @@ class PaperEngine:
 
                     # メンテ窓：新規禁止＋同タグ一括Cancel（reason="window"）
                     if self._in_maintenance(now):
+                        # Guard中でも target_eff 超過なら在庫解放（reduce-only）を試行
+                        try:
+                            inv_node = getattr(getattr(self.cfg, "risk", None), "inv_capping", None)
+                            tr = None
+                            if inv_node is not None:
+                                from collections.abc import Mapping as _Mapping
+                                tr = inv_node.get("target_ratio") if isinstance(inv_node, _Mapping) else getattr(inv_node, "target_ratio", None)
+                            target_ratio = float(tr) if isinstance(tr, (int, float)) else 0.90
+                        except Exception:
+                            target_ratio = 0.90
+                        _eff_lim = self.effective_inventory_limit()
+                        _over_eff = (_eff_lim is not None and _eff_lim > 0.0 and abs(self.Q) > target_ratio * float(_eff_lim))
+                        if _over_eff:
+                            self._maybe_auto_reduce(now=monotonic())
                         for o in self.sim.cancel_by_tag("stall"):
                             self.order_log.add(
                                 ts=self._ts_jst(now),
@@ -1063,6 +1360,20 @@ class PaperEngine:
                     
                     # Funding窓（計算 or 授受）：新規禁止＋同タグ一括Cancel（reason="funding"）
                     if self._in_funding_calc(now) or self._in_funding_transfer(now):
+                        # Guard中でも target_eff 超過なら在庫解放（reduce-only）を試行
+                        try:
+                            inv_node = getattr(getattr(self.cfg, "risk", None), "inv_capping", None)
+                            tr = None
+                            if inv_node is not None:
+                                from collections.abc import Mapping as _Mapping
+                                tr = inv_node.get("target_ratio") if isinstance(inv_node, _Mapping) else getattr(inv_node, "target_ratio", None)
+                            target_ratio = float(tr) if isinstance(tr, (int, float)) else 0.90
+                        except Exception:
+                            target_ratio = 0.90
+                        _eff_lim = self.effective_inventory_limit()
+                        _over_eff = (_eff_lim is not None and _eff_lim > 0.0 and abs(self.Q) > target_ratio * float(_eff_lim))
+                        if _over_eff:
+                            self._maybe_auto_reduce(now=monotonic())
                         for o in self.sim.cancel_by_tag("stall"):
                             self.order_log.add(
                                 ts=self._ts_jst(now),
@@ -1112,6 +1423,20 @@ class PaperEngine:
                     self._midguard_paused = paused  # 直近のミッド移動ガード状態を保持（ハートビートに載せる）
 
                     if paused:
+                        # Guard中でも target_eff 超過なら在庫解放（reduce-only）を試行
+                        try:
+                            inv_node = getattr(getattr(self.cfg, "risk", None), "inv_capping", None)
+                            tr = None
+                            if inv_node is not None:
+                                from collections.abc import Mapping as _Mapping
+                                tr = inv_node.get("target_ratio") if isinstance(inv_node, _Mapping) else getattr(inv_node, "target_ratio", None)
+                            target_ratio = float(tr) if isinstance(tr, (int, float)) else 0.90
+                        except Exception:
+                            target_ratio = 0.90
+                        _eff_lim = self.effective_inventory_limit()
+                        _over_eff = (_eff_lim is not None and _eff_lim > 0.0 and abs(self.Q) > target_ratio * float(_eff_lim))
+                        if _over_eff:
+                            self._maybe_auto_reduce(now=monotonic())
                         for o in self.sim.cancel_by_tag("stall"):
                             self.order_log.add(
                                 ts=self._ts_jst(now),
@@ -1175,7 +1500,11 @@ class PaperEngine:
                             )  # 何を/なぜ記録したか（在庫上限）
                         logger.warning(f"risk guard: |Q|>={eff_limit} → new orders paused")  # 画面でも分かるように一言
                         self._heartbeat(now, "pause", reason="inventory_guard")  # ハートビート：在庫上限で停止
-
+                    if hasattr(self, "risk"):
+                        self.risk.inventory_guard_active = close_only_mode
+                    if close_only_mode:
+                        # Guard中（Close-Only）ならboard更新だけでも自動薄めを試行して在庫を減らす
+                        self._maybe_auto_reduce(now=monotonic())
 
                     actions = self.strat.evaluate(self.ob, now, self.cfg)
                     feats_win = getattr(getattr(self.cfg, "features", None), "ca_ratio_win_ms", 500)  # 何をする行か：CA比率集計窓(ms)を取得
@@ -1192,8 +1521,9 @@ class PaperEngine:
                             corr_token = current_corr_ctx.set(corr_from_action)
                         try:
                             if act.get("type") == "place":
-                                # 同タグの重複を最小抑止
-                                if self.sim.has_open_tag(act["order"].tag):
+                                allow_multi = bool(act.get("allow_multiple"))
+                                # 同タグの重複を最小抑止 (allow_multiple=True なら使う)
+                                if self.sim.has_open_tag(act["order"].tag) and not allow_multi:
                                     continue
                                 o = act["order"]
                                 corr_value = (
@@ -1294,6 +1624,12 @@ class PaperEngine:
                                                 inv_enabled = bool(getattr(inv_node, "enabled", True))
                                     except Exception:
                                         inv_enabled = True
+                                    # 在庫を減らす向き（reduce-only 相当）かを判定し、フラグを明示
+                                    is_reduce = bool(reduce_only or self.would_reduce_inventory(self.Q, side_val, req_qty))
+                                    try:
+                                        setattr(o, "reduce_only", getattr(o, "reduce_only", False) or is_reduce)
+                                    except Exception:
+                                        pass
                                     if not reduce_only and inv_enabled:
                                         try:
                                             max_inv = float(getattr(risk_node, "max_inventory", None)) if risk_node is not None else None
@@ -1324,13 +1660,15 @@ class PaperEngine:
                                                 min_lot=min_lot,
                                                 target_ratio=tgt,
                                                 cfg_path=cfg_path,
+                                                reduces_position=is_reduce,
                                             )
-                                            if should_skip:
+                                            if should_skip and not is_reduce:
                                                 self._heartbeat(now, "pause", reason="inventory_guard")
                                                 continue
                                             # 実際に縮小が発生した場合のみサイズを更新
                                             # 余地があれば安全側サイズで上書きし、どれだけ縮めたかを記録
-                                            if safe_size < (req_qty - 1e-12):
+                                            # 在庫を減らす注文はそのまま通し、増える方向だけheadroomに合わせて縮める
+                                            if (safe_size < (req_qty - 1e-12)) and (not is_reduce):
                                                 try:
                                                     o.size = safe_size
                                                 except Exception:
@@ -1406,12 +1744,13 @@ class PaperEngine:
                                                     min_lot=min_lot,
                                                     target_ratio=target_ratio,
                                                     cfg_path=cfg_path,
+                                                    reduces_position=is_reduce,
                                                 )
-                                                if should_skip:
+                                                if should_skip and not is_reduce:
                                                     self._heartbeat(now, "pause", reason="inventory_guard")
                                                     continue
                                                 # 最終ガード: eff_limit に対しても再チェック（ログは core に統一）
-                                                if (eff_limit is not None) and ((abs(self.Q) + req_qty) > float(eff_limit)):
+                                                if (eff_limit is not None) and (not is_reduce) and ((abs(self.Q) + req_qty) > float(eff_limit)):
                                                     _s, _skip = inv_capping_preflight(
                                                         req_raw=req_raw,
                                                         abs_q=abs_q,
@@ -1420,14 +1759,26 @@ class PaperEngine:
                                                         target_ratio=target_ratio,
                                                         cfg_path=cfg_path,
                                                     )
-                                                    if _skip:
+                                                    if _skip and not is_reduce:
                                                         self._heartbeat(now, "pause", reason="inventory_guard")
                                                         continue
-                                elif close_only_mode and not (reduce_only or self.would_reduce_inventory(self.Q, side_val, req_qty)):
-                                    logger.debug("skip place: close_only_mode (inventory_guard)")
-                                    self._heartbeat(now, "pause", reason="inventory_guard")
-                                    continue
+                                elif close_only_mode:
+                                    allows = reduce_only or self.would_reduce_inventory(self.Q, side_val, req_qty)
+                                    if hasattr(self.risk, "inventory_guard_allows"):
+                                        allows = self.risk.inventory_guard_allows(side=side_val, qty=req_qty)
+                                    if not allows:
+                                        logger.debug("skip place: close_only_mode (inventory_guard)")
+                                        self._heartbeat(now, "pause", reason="inventory_guard")
+                                        continue
                                 # 実際にシミュレータへ発注し、placeログを記録
+                                if hasattr(self, "risk") and hasattr(self.risk, "market_mode_allows"):
+                                    # この注文が在庫を減らすなら True（ロングなら売り、ショートなら買い）
+                                    reduces = self.would_reduce_inventory(self.Q, side_val, req_qty)
+                                    # 市場モードが新規停止でも、reduce-only かつ reduces ならブロックしない（決済だけは通す）
+                                    if (not self.risk.market_mode_allows(side=side_val, qty=req_qty)) and not (reduce_only and reduces):
+                                        logger.debug("skip place: market_mode close_only")
+                                        self._heartbeat(now, "pause", reason="market_mode")
+                                        continue
                                 self.sim.place(o, now)
                                 corr_for_log = _coid_to_corr.get(
                                     getattr(o, "client_order_id", ""),
@@ -1475,7 +1826,7 @@ class PaperEngine:
                                 current_corr_ctx.reset(corr_token)
 
                 elif ch.startswith("lightning_executions_"):
-                    self._maybe_auto_reduce(now)  # 在庫とモードだけで“薄め”を1口（Reduce‑Only+IOC）
+                    self._maybe_auto_reduce(now=monotonic())  # 在庫とモードだけで“薄め”を1口（Reduce‑Only+IOC）
                     # 約定でシミュを進め、Fill明細を受け取る→PnL/ログ反映
                     fills = self.sim.on_executions(ev.get("message") or [], now)
                     for f in fills:

@@ -1,38 +1,39 @@
-# configs/base.yml：共通の土台設定（paper/live/backtest から上書きする前提）
-# 役割：
-# - 戦略しきい値（features.*）と、ガード/リスク/窓/ログをひとまとめにする
-# - 自炊ワークフローの整合・安全装置・窓切替がこの数字を読む
+# configs/base.yml: 共通の土台設定（paper/live/backtest で上書き前提）
+# - 戦略しきい値（features.*）とガード/リスク/窓/ログをまとめる
+# - 窓切替や安全装置が読む基準値
 
-env: paper  # 既定は paper（各環境ファイルで上書き）  # 文書準拠
-product_code: FX_BTC_JPY  # 対象銘柄は固定（CFD/FX_BTC_JPY）
-tick_size: 1  # 価格刻み（1 tick = 1 JPY）
+env: paper  # 既定は paper（環境ファイルで上書き）
+product_code: FX_BTC_JPY
+tick_size: 1  # 1 tick = 1 JPY
 
-size:  # 取引サイズの下限と既定値
-  min: 0.001     # 最小ロット
-  default: 0.01  # 既定ロット（最初は小さく）
+tx:
+  min_interval_ms: 1000    # 送信間隔の最小値
+  place_dedup_ms: 1000     # 同一内容の短時間重複を抑止
 
-risk:  # リスク上限と非常停止（Kill-Switch）
-  max_inventory: 0.05  # 在庫の絶対上限（BTC）
-  inventory_eps: 0.002  # 上限の手前に置く安全マージン（単位=ベース通貨）。この分だけ手前で新規をブロックする
+size:  # 取引サイズ
+  min: 0.001
+  default: 0.01
+
+risk:  # 上限・非常停止
+  max_inventory: 0.05       # 在庫の絶対上限（BTC）
+  inventory_eps: 0.002      # 上限手前の安全マージン
   inv_capping:
-    enabled: true         # 在庫連動ロットの有効/無効（運用でON/OFF）
-    target_ratio: 0.90    # 目標：( |Q|+req ) / eff_limit ≤ この値（例：0.90）
-    eff_limit_margin: 0.99 # 実効上限 = max_inventory × この係数（例：0.99）
+    enabled: true
+    target_ratio: 0.90
+    eff_limit_margin: 0.99
   kill:
-    daily_pnl_jpy: -30000  # 日次損益がこの値を下回ったら停止
-  
-  # 在庫“自動薄め”の機能ブロック（既定はOFF。envで上書きして使う）
-  auto_reduce:
+    daily_pnl_jpy: -30000   # 日次PnL下限
+  auto_reduce:              # 在庫“自動薄め”ブロック（既定OFF。envで上書き可）
     enabled: false
     profit_only: false
     force_on_risk: true
     tif: IOC
     min_step_qty: 0.001
-    max_dd_jpy: -20000     # ドローダウンがこの値を下回ったら停止
+    max_dd_jpy: -20000
 
-guard:  # ガードレール（相場が速すぎる時は出さない）
+guard:  # 相場が速いときのブレーキ
   max_mid_move_bp_30s: 25
-  feed_health:  # WS/Heartbeat鮮度ガード
+  feed_health:
     age_ms:
       caution: 3000
       halted: 10000
@@ -44,102 +45,90 @@ guard:  # ガードレール（相場が速すぎる時は出さない）
   caution:
     max_order_size: 0.003
     max_order_rate_per_sec: 2
-  # 直近30sのミッド変化が25bp超なら停止/縮小
 
-mode_switch:  # “窓”の扱い。メンテ時間/ファンディング計算時刻の前後で挙動変更
-  maintenance: { start: "04:00:00", end: "04:10:00", action: "pause" }  # JSTの例
-  funding_calc_jst: ["06:00:00","14:00:00","22:00:00"]  # 計算タイミング（受渡は遅延）
-  funding_transfer_lag_hours: 8  # 授受のラグ時間（時間）
+mode_switch:  # 窓の扱い（メンテ/ファンディング）
+  maintenance: { start: "04:00:00", end: "04:10:00", action: "pause" }
+  funding_calc_jst: ["06:00:00","14:00:00","22:00:00"]
+  funding_transfer_lag_hours: 8
 
-latency:  # まずは固定遅延のモデル（実測に置換予定）
-  rx_ms: 20  # 受信遅延の仮定
-  tx_ms: 20  # 送信遅延の仮定
+latency:  # 固定遅延モデル（実測に置換予定）
+  rx_ms: 20
+  tx_ms: 20
 
 health:
-  stale_sec_warn: 3      # 何をする行か：Bestが3秒無更新なら Caution（新規を絞る/停止準備）
-  stale_sec_halt: 10     # 何をする行か：Bestが10秒無更新なら Halted（新規NG・決済のみ許可）
+  stale_sec_warn: 3   # Best 3s 無更新で Caution
+  stale_sec_halt: 10  # Best 10s 無更新で Halted
 
-features:  # 戦略のしきい値（#1/#2 の主材料）
-  stall_T_ms: 240          # #1 静止→一撃：BestがTms静止
-  ca_ratio_win_ms: 600     # #2 C/Aゲート：集計窓（ms）
-  ca_threshold: 1.25       # #2 C/Aゲート：Cancel/Add 閾値（以下ならOK）
-  min_spread_tick: 1       # 最低スプレッド（tick）
-  ttl_ms: 900              # オーダーの寿命（ms）
-  stall_ttl_ms: 650        # STだけ寿命を短く（初動の一拍を狙って長居しない）
-  age_ms: 200              # Age×MP（OFF時も計算は可能）
-  mp_offset_tick: 1.0      # Micropriceオフセット（tick）
-  tiny_prints_N: 20        # Tiny-Prints集計N（OFFの初期値）
-  tiny_prints_minCount: 14 # Tiny-Prints発火閾値（OFFの初期値）
-  eta_t_window_ms: 800     # Queue ETAの窓（OFFの初期値）
-  # 在庫帯ブロック（#2 Cancel/Add Gate の安全装置）
-  ca_gate_block_min_abs_inv: 0.04  # C/Aゲートを止め始める在庫の下限|Q|（この帯だけ止める）
-  ca_gate_block_max_abs_inv: 0.06  # C/Aゲートを再開する在庫の上限|Q|
-  # stall_then_strike:        # 何をする設定か：#1 静止→一撃 のしきい値を戦略専用でまとめる
-  #   stall_T_ms: 250         # 何をする設定か：Bestがこのms静止していたら両面エントリー可
-  #   min_spread_tick: 1      # 何をする設定か：最低スプレッド（tick）。これ未満なら何もしない
-  #   ttl_ms: 800             # 何をする設定か：置いた注文の寿命（ms）
+features:  # 戦略の共通しきい値（#1/#2 の主材料）
+  stall_T_ms: 240              # #1: Best静止トリガ時間(ms)
+  ca_ratio_win_ms: 600         # #2: C/A比を測る窓(ms)
+  ca_threshold: 1.25           # #2: C/A比がこの値以下なら“静か”
+  min_spread_tick: 1           # 共通: 最低スプレッドtick
+  ttl_ms: 900                  # 共通: 注文寿命(ms)
+  stall_ttl_ms: 650            # #1: STだけ寿命を短く
+  age_ms: 200                  # Age×MP 用滞留時間(ms)
+  mp_offset_tick: 1.0          # Micropriceのずらしtick
+  tiny_prints_N: 20            # Tiny-Prints集計件数
+  tiny_prints_minCount: 14     # Tiny-Prints発火閾値
+  eta_t_window_ms: 800         # Queue ETAの窓(ms)
+  ca_gate_block_min_abs_inv: 0.04  # #2: 在庫帯ブロック下限|Q|
+  ca_gate_block_max_abs_inv: 0.06  # #2: 在庫帯ブロック上限|Q|
+  zero_reopen_pop:
+    min_take_qty: 0.0
+    max_join_qty: 0.0
+    exact_one_tick_only: true
+    ttl_jitter_ms: 80
+    min_best_age_ms: 200
+    reopen_stable_ms: 50
+    loss_cooloff_ms: 1500
+    fee_maker_bp: 0.0
+    fee_taker_bp: 0.0
+    edge_bp_min: 0.0
+    max_speed_ticks_per_s: 12.0
+    min_spread_tick: 1
+    max_spread_tick: 2
+    ttl_ms: 800
+    stop_adverse_ticks: 2
+    entries_window_ms: 10000
+    max_entries_in_window: 6
+    size_min: 0.001
+    cooloff_ms: 250
+    seen_zero_window_ms: 1000
 
-  # cancel_add_gate:          # 何をする設定か：#2 キャンセル比ゲートのしきい値セット
-  #   ca_ratio_win_ms: 500    # 何をする設定か：Cancel/Add 比を測る時間窓（ms）
-  #   ca_threshold: 1.3       # 何をする設定か：C/A比がこの値以下のときだけエントリー可
-  #   min_spread_tick: 1      # 何をする設定か：最低スプレッド（tick）
-  #   ttl_ms: 800             # 何をする設定か：置いた注文の寿命（ms）
-
-  # age_microprice:           # 何をする設定か：#3（OFF想定）Age×MP 用の外だし（後日ONに備えて整理）
-  #   age_ms: 200             # 何をする設定か：Bestの滞留時間（ms）
-  #   mp_offset_tick: 1.0     # 何をする設定か：Micropriceの寄せ量（tick）
-
-  # tiny_prints_filter:       # 何をする設定か：#5（OFF想定）Tiny-Prints の発火しきい値
-  #   tiny_prints_N: 20       # 何をする設定か：集計に使う件数N
-  #   tiny_prints_minCount: 14　# 何をする設定か：P20以下がこの回数以上で有効
-
-  # queue_eta_gate:           # 何をする設定か：#6（OFF想定）Queue ETA の観測窓
-  #   eta_t_window_ms: 800    # 何をする設定か：ETAの時間窓（ms）
-  zero_reopen_pop:  # 何をする設定か：ゼロ→再拡大の“一拍だけ”出す戦略のパラメータ
-    min_take_qty: 0.0           # 何をする設定か：利確IOCが当たる相手側Bestの最小数量（0で無効・例 0.01 などに設定）
-    max_join_qty: 0.0           # 何をする設定か：自分が並ぶ側Bestの数量がこの値を超えたら見送り（0で無効・例 0.05 など）
-    exact_one_tick_only: true    # 何をする設定か：スプレッドが“1tickちょうど”の時だけ出す（+1tick利確が即時一致）
-    ttl_jitter_ms: 80          # 何をする設定か：TTLに与える±ゆらぎ幅(ms)。同時剥がれの衝突を避ける
-    min_best_age_ms: 200        # 何をする設定か：Bestがこの時間（ms）以上変わらず“落ち着いて”いたら発注を許可
-    reopen_stable_ms: 50        # 何をする設定か：再拡大がこの時間（ms）続いたら発注を許可（瞬間ノイズはスルー）
-    loss_cooloff_ms: 1500      # 何をする設定か：非常口フラット後に“お休み”する時間ms（連続被弾を防ぐ）
-    fee_maker_bp: 0.0        # 何をする設定か：メーカー手数料（bp）。例：-2.0 は -0.02% のリベート、+2.0 は +0.02% の費用
-    fee_taker_bp: 0.0        # 何をする設定か：テイカー手数料（bp）。例：10.0 は 0.10%
-    edge_bp_min: 0.0         # 何をする設定か：手数料控除後に最低これだけ余裕(bps)がないと発注しない（まずは0.0で様子見）
-    max_speed_ticks_per_s: 12.0     # 何をする設定か：midの速さ（tick/秒）がこの上限を超えたら発注しない
-    min_spread_tick: 1         # 何をする設定か：再拡大の下限tick（1以上で発注可）
-    max_spread_tick: 2         # 何をする設定か：再拡大が広すぎるときは出さない上限tick
-    ttl_ms: 800                # 何をする設定か：指値の寿命ms（置きっぱなし防止）
-    stop_adverse_ticks: 2       # 何をする設定か：エントリーVWAPから不利にこのtick以上動いたら即フラットIOCで逃げる
-    entries_window_ms: 10000    # 何をする設定か：この時間窓(ms)内のエントリー回数を数える
-    max_entries_in_window: 6     # 何をする設定か：時間窓内に許可する最大エントリー回数
-    size_min: 0.001            # 何をする設定か：最小ロット（取引所の最小単位に合わせる）
-    cooloff_ms: 250            # 何をする設定か：連打を防ぐ冷却時間ms
-    seen_zero_window_ms: 1000  # 何をする設定か：ゼロを“直後”とみなす時間窓ms
-
-# 何をする設定か：起動時にデフォルトでONにする戦略のリスト（※CLIの --strategy があればそちら優先）
+# デフォルトONにする戦略（CLI --strategy があればそちら優先）
 strategies:
-  - stall_then_strike      # #1 静止→一撃：最良気配が一定時間止まった直後だけ両面で薄く回す（常用・有効）
-  - cancel_add_gate        # #2 C/Aゲート：Best層のCancel/Add比が低いときだけ出す“毒性ゲート”（常用・有効）
-  # - age_microprice       # #3 Age×Microprice：Best滞留×MP寄りでリーン（試験用・普段はOFF）
-  # - gap_edge_refill      # #4 ギャップ縁補充：Top数層の2tick空きを縁で拾う（試験用・普段はOFF）
-  # - tiny_prints_filter   # #5 小口連発フィルタ：小口偏り時だけ両面薄く（試験用・普段はOFF）
-  # - queue_eta_gate       # #6 Queue ETAゲート：自分の順番ETAが短いときだけ置く（試験用・普段はOFF）
-  # - zero_reopen_pop      # #7 0→再拡大ポップ：スプレッド0の直後、再拡大の1拍を取る（試験用・普段はOFF）
+  - stall_then_strike
+  - cancel_add_gate
 
-logging:  # ログ出力の基本設定
-  level: DEBUG     # paperデフォルトは詳細ログ
-  rotate_mb: 128  # ログローテーションの閾値（MB）
-  run_log_template: logs/runtime/run.log  # 何をする設定か：共通run.logの出力先テンプレート
-  strategy_log_template: null  # 何をする設定か：戦略専用ログのテンプレート（nullで無効）
-  strategy_level: null  # 何をする設定か：戦略専用ログのレベル（nullならlevelを流用）
+logging:
+  level: DEBUG
+  rotate_mb: 128
+  run_log_template: logs/runtime/run.log
+  strategy_log_template: null
+  strategy_level: null
+
+# 戦略ごとの固有設定をまとめる
 strategy_cfg:
   stall_then_strike:
+    # 静止→一撃 (#1) の発注ロットと決済/撤退の目安
     size:
-      default: 0.003
+      default: 0.001
+    min_requote_interval_ms: 1500  # 条件外撤退後の再エントリー抑止間隔
+    take_profit_ticks: 1.0          # エントリー±このtickでIOC利確
+    stop_ticks: 2.0                 # 逆行このtickで撤退IOC
+    buy_momentum_filter:
+      window_ms: 2000       # 直近windowでのミッド変化率を見る窓
+      threshold_bps: 3.0    # これ以上の上昇なら買い側を抑制
+      mode: sell_only       # 抑制時の動作（sell_only/halt_both）
+    ttl_bands:
+      - { threshold_bp: 1.5, ttl_ms: 400, window_ms: 1000 }  # 変化が遅いときは長め
+      - { threshold_bp: 5.0,  ttl_ms: 300, window_ms: 1000 } # 変化が速いときは短め
   cancel_add_gate:
+    # C/Aゲート (#2) の発注ロット
     size:
       default: 0.007
+    taker_zscore_threshold: null   # 連続成行の毒性zscoreがこの値を超えたら撤退（nullで無効）
+
 env_overrides:
   live:
     env: live
@@ -151,4 +140,3 @@ env_overrides:
       max_mid_move_bp_30s: 10
     logging:
       level: INFO
-

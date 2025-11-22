@@ -1,0 +1,77 @@
+def inv_capping_preflight(
+    *,
+    req_raw: float,
+    abs_q: float,
+    eff_limit: float,
+    min_lot: float,
+    target_ratio: float = 0.90,
+    cfg_path: str | None = None,
+) -> tuple[float, bool]:
+    """
+    在庫ガード直前の“在庫連動ロット”前処理。
+    - 入力: req_raw（希望サイズ）, abs_q（現|Q|）, eff_limit（実効上限）, min_lot, target_ratio
+    - 出力: (safe_size, should_skip)
+      should_skip=True の場合は固定文言で DEBUG を記録済み。
+    """
+    # 関数内インポート（トップの import 変更を避ける）
+    from loguru import logger  # 在庫由来スキップの固定文言をDEBUGで残す（集計用）
+
+    try:
+        eff = float(eff_limit)
+        lotsz = float(min_lot)
+        tgt = float(target_ratio)
+        rq = float(req_raw)
+        aq = float(abs_q)
+    except Exception:
+        return 0.0, True
+
+    safe_size = cap_order_size_by_inventory(
+        req_raw=rq,
+        abs_q=aq,
+        eff_limit=eff,
+        min_lot=lotsz,
+        target_ratio=tgt,
+    )
+    r_pre = (aq + rq) / eff if eff > 0 else float("inf")
+    # headroomの観測ログ（target_ratio×eff_limit 基準）
+    target_eff = tgt * eff
+    headroom = max(target_eff - aq, 0.0)
+    try:
+        logger.debug(
+            "inv_capping.headroom | abs_q={:.6f} target_eff={:.6f} headroom={:.6f} cfg_path={}",
+            aq, target_eff, headroom, (cfg_path or "n/a"),
+        )
+    except Exception:
+        pass
+
+    # 観測イベントを1件カウント（60秒でINFO集計）
+    try:
+        _inv_cap_rollup_count("event", eff, (cfg_path or "n/a"))
+    except Exception:
+        pass
+
+    # 余地ゼロ、または丸め後も上限超過 → 固定文言で見送り
+    if (safe_size <= 0.0) or ((aq + safe_size) > eff):
+        logger.debug(
+            "skip place: capped_by_inventory (no_room) | r_pre={:.3f} abs_q={:.6f} req_raw={:.6f} eff_limit={:.6f} target={:.2f} headroom={:.6f} cfg_path={}",
+            r_pre, aq, rq, eff, tgt, headroom, (cfg_path or "n/a"),
+        )
+        # 余地ゼロ件数をカウント（60秒でINFO集計）
+        try:
+            _inv_cap_rollup_count("no_room", eff, (cfg_path or "n/a"))
+        except Exception:
+            pass
+        return 0.0, True
+
+    # 縮小の可視化（DEBUG）
+    if safe_size < (rq - 1e-12):
+        logger.debug(
+            "capped_by_inventory | r_pre={:.3f} -> r_post={:.3f} size:{:.6f}->{:.6f} headroom={:.6f} cfg_path={}",
+            r_pre, (aq + safe_size) / eff if eff > 0 else float("inf"), rq, safe_size, headroom, (cfg_path or "n/a"),
+        )
+        # 実縮小件数をカウント（60秒でINFO集計）
+        try:
+            _inv_cap_rollup_count("shrink", eff, (cfg_path or "n/a"))
+        except Exception:
+            pass
+    return safe_size, False

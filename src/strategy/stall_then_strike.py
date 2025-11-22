@@ -1,21 +1,22 @@
 # src/strategy/stall_then_strike.py
-# 役割：#1 静止→一撃（BestがTms静止 & Spread>=Sの直後にミッド±1tickへ最小ロット両面、条件外は即撤退）
+# 役割: #1 静止→一撃。Best が静止 & スプレッド開き時に mid±1tick を両面、条件外なら撤退。
 from __future__ import annotations
 
-from typing import List, Dict, Any, Callable  # 返り値の型
+from typing import List, Dict, Any, Callable
 from collections.abc import Mapping
-from datetime import datetime, timezone  # 戦略判断時刻
+from datetime import datetime, timezone
 
-from loguru import logger  # 何をするか：ゲート理由を戦略ログに1行で出す
+from loguru import logger
 
-from src.core.orderbook import OrderBook  # Best/Spreadを参照
-from src.core.orders import Order  # 置く指値の表現
-from src.strategy.base import StrategyBase  # 共通IF
-from src.core.utils import coerce_ms, normalize_ttl_bands  # 追加：時間値をmsに正規化するユーティリティ
+from src.core.orderbook import OrderBook
+from src.core.orders import Order
+from src.strategy.base import StrategyBase
+from src.core.utils import coerce_ms, normalize_ttl_bands
 
 
 class StallThenStrike(StrategyBase):
-    """【関数】#1 静止→一撃の最小実装（文書のトリガ/撤退に準拠）"""
+    """#1 静止→一撃。最小実装をドキュメントのトリガ/決済に合わせる。"""
+
     name: str = "stall_then_strike"
 
     def __init__(self, cfg=None, *, strategy_cfg=None):
@@ -24,6 +25,9 @@ class StallThenStrike(StrategyBase):
         self._last_cancel_ts_ms: int | None = None
         self.engine = None
         self._time_source: Callable[[], int] | None = None
+        self._pos_entry_px: float | None = None
+        self._pos_entry_ts_ms: int | None = None
+        self._pos_side: str | None = None
 
     @staticmethod
     def _value_from(node, *keys):
@@ -164,14 +168,88 @@ class StallThenStrike(StrategyBase):
                 return None
         return None
 
-    def evaluate(self, ob: OrderBook, now: datetime, cfg) -> List[Dict[str, Any]]:
-        engine = locals().get("engine", getattr(self, "engine", None))  # 何をするか：エンジン参照（引数or属性）
-        gate = engine.gate_status() if (engine and hasattr(engine, "gate_status")) else {"mode": "healthy", "reason": "na", "limits": {}, "ts_ms": None}  # 何をするか：ゲート状態を取得
-        if gate["mode"] == "halted":  # 何をするか：停止中は新規注文を作らず早期リターン（決済は別系で通す）
-            logger.info(f"strategy:skip_new_orders mode=halted reason={gate.get('reason')}")  # 何をするか：スキップ理由を1行で記録
-            return []  # 何をするか：このイベントでは何も出さない（新規ブロック）
+    def _current_inventory(self) -> float:
+        eng = getattr(self, "engine", None)
+        try:
+            return float(getattr(eng, "Q", 0.0))
+        except Exception:
+            return 0.0
 
-        # 設定の読み出し（無ければ文書の最小値）:contentReference[oaicite:4]{index=4} :contentReference[oaicite:5]{index=5}
+    def _stall_orders(self) -> list[Order]:
+        eng = getattr(self, "engine", None)
+        sim = getattr(eng, "sim", None)
+        if sim is None:
+            return []
+        result: list[Order] = []
+        for o in getattr(sim, "open", []):
+            tag = getattr(o, "tag", "")
+            if tag == "stall" or str(tag).startswith("stall|"):
+                result.append(o)
+        return result
+
+    def _clear_position_state(self) -> None:
+        self._pos_entry_px = None
+        self._pos_entry_ts_ms = None
+        self._pos_side = None
+
+    def _ensure_position_state(self, inventory: float, ob: OrderBook, now: datetime) -> None:
+        if abs(inventory) <= 1e-12:
+            self._clear_position_state()
+            return
+        side = "buy" if inventory > 0 else "sell"
+        if self._pos_side and self._pos_side != side:
+            self._clear_position_state()
+        self._pos_side = side
+        if self._pos_entry_px is None:
+            entry_px = None
+            try:
+                entry_px = float(getattr(getattr(self, "engine", None), "A", None))
+            except Exception:
+                entry_px = None
+            if entry_px is None or entry_px == 0.0:
+                try:
+                    entry_px = (ob.best_bid.price + ob.best_ask.price) / 2.0
+                except Exception:
+                    entry_px = None
+            self._pos_entry_px = entry_px
+            self._pos_entry_ts_ms = self._current_time_ms(now)
+
+    def _position_age_ms(self, now: datetime) -> int | None:
+        if self._pos_entry_ts_ms is None:
+            return None
+        ts = self._current_time_ms(now)
+        if ts is None:
+            return None
+        return ts - int(self._pos_entry_ts_ms)
+
+    def _resolve_take_profit_ticks(self) -> float:
+        val = self._value_from(self._strategy_cfg, "stall_then_strike", "take_profit_ticks")
+        if val is None:
+            val = self._value_from(self._strategy_cfg, "take_profit_ticks")
+        try:
+            tp = float(val)
+        except Exception:
+            tp = 1.0
+        return tp if tp > 0 else 1.0
+
+    def _resolve_stop_ticks(self) -> float:
+        val = self._value_from(self._strategy_cfg, "stall_then_strike", "stop_ticks")
+        if val is None:
+            val = self._value_from(self._strategy_cfg, "stop_ticks")
+        try:
+            st = float(val)
+        except Exception:
+            st = 2.0
+        return st if st > 0 else 2.0
+
+    def evaluate(self, ob: OrderBook, now: datetime, cfg) -> List[Dict[str, Any]]:
+        self.cfg = cfg
+        engine = locals().get("engine", getattr(self, "engine", None))
+        gate = engine.gate_status() if (engine and hasattr(engine, "gate_status")) else {"mode": "healthy", "reason": "na", "limits": {}, "ts_ms": None}
+        if gate["mode"] == "halted":
+            logger.info(f"strategy:skip_new_orders mode=halted reason={gate.get('reason')}")
+            return []
+
         feats = cfg.features
         stall_T = getattr(feats, "stall_T_ms", 250)
         min_sp = getattr(feats, "min_spread_tick", 1)
@@ -222,6 +300,9 @@ class StallThenStrike(StrategyBase):
             "stall_mid_change_bp": mid_change_bp,
             "stall_ttl_selected_ms": ttl_ms,
             "stall_ttl_window_ms": ttl_window_ms,
+            "stall_T_ms": stall_T,
+            "stall_min_spread_tick": min_sp,
+            "tick_size": tick,
         }
         if selected_band is not None and selected_band.get("threshold_bp") is not None:
             decision_features["stall_ttl_band_threshold_bp"] = selected_band["threshold_bp"]
@@ -235,19 +316,89 @@ class StallThenStrike(StrategyBase):
             decision_features["stall_buy_filter_mode"] = buy_filter_mode
         decision_features["stall_buy_filter_suppressed"] = False
 
-        # Bestが未確定のときは何もしない
         if ob.best_bid.price is None or ob.best_ask.price is None:
             self._set_decision_features(decision_features)
             return []
 
-        # 現在の指標を取得（BestAge/Spread）:contentReference[oaicite:6]{index=6}
         age_ms = coerce_ms(ob.best_age_ms(now)) or 0.0
-
         sp_tick = ob.spread_ticks()
+        decision_features["best_age_ms"] = age_ms
+        decision_features["spread_tick"] = sp_tick
+        mid = (ob.best_bid.price + ob.best_ask.price) / 2.0
 
-        # トリガ成立：ミッド±1tick に最小ロット両面
-        if age_ms is not None and age_ms >= stall_T and sp_tick >= min_sp:
-            mid = (ob.best_bid.price + ob.best_ask.price) / 2.0
+        inventory = self._current_inventory()
+        has_position = abs(inventory) > 1e-12
+        if has_position:
+            self._ensure_position_state(inventory, ob, now)
+        else:
+            self._clear_position_state()
+
+        stall_orders = self._stall_orders()
+        has_reduce_order = any(getattr(o, "reduce_only", False) for o in stall_orders)
+        needs_cancel_entries = any(not getattr(o, "reduce_only", False) for o in stall_orders)
+        tp_ticks = self._resolve_take_profit_ticks()
+        stop_ticks = self._resolve_stop_ticks()
+        pos_age_ms = self._position_age_ms(now)
+        if pos_age_ms is not None:
+            decision_features["stall_position_age_ms"] = pos_age_ms
+
+        if has_position:
+            entry_px = self._pos_entry_px if self._pos_entry_px is not None else mid
+            best_moved = age_ms < stall_T or sp_tick < min_sp
+            adverse = False
+            if entry_px is not None and mid is not None:
+                drift = mid - entry_px
+                if inventory > 0:
+                    adverse = drift <= -stop_ticks * tick
+                else:
+                    adverse = drift >= stop_ticks * tick
+            timeout = pos_age_ms is not None and ttl_ms is not None and pos_age_ms >= ttl_ms
+
+            actions: List[Dict[str, Any]] = []
+            if needs_cancel_entries:
+                actions.append({"type": "cancel_tag", "tag": "stall"})
+            if best_moved or adverse or timeout:
+                qty = abs(inventory)
+                close_side = "sell" if inventory > 0 else "buy"
+                close_px = ob.best_bid.price if inventory > 0 else ob.best_ask.price
+                if close_px is not None and qty > 0:
+                    order = Order(
+                        side=close_side,
+                        price=close_px,
+                        size=qty,
+                        tif="IOC",
+                        ttl_ms=ttl_ms,
+                        tag="stall",
+                    )
+                    order.reduce_only = True
+                    actions.append({"type": "place", "order": order, "allow_multiple": True})
+                self._set_decision_features(decision_features)
+                return actions
+
+            if not has_reduce_order:
+                qty = abs(inventory)
+                target_px = None
+                if entry_px is not None:
+                    target_px = entry_px + tp_ticks * tick if inventory > 0 else entry_px - tp_ticks * tick
+                if target_px is not None and qty > 0:
+                    order = Order(
+                        side="sell" if inventory > 0 else "buy",
+                        price=target_px,
+                        size=qty,
+                        tif="IOC",
+                        ttl_ms=ttl_ms,
+                        tag="stall",
+                    )
+                    order.reduce_only = True
+                    actions.append({"type": "place", "order": order, "allow_multiple": True})
+            if actions:
+                self._set_decision_features(decision_features)
+                return actions
+            self._set_decision_features(decision_features)
+            return []
+
+        # ここからは建玉なしのエントリー判定
+        if age_ms is not None and age_ms >= stall_T and sp_tick >= min_sp and not stall_orders:
             buy_suppressed = False
             if buy_filter_cfg and buy_filter_threshold is not None and buy_filter_mid_change is not None:
                 try:
@@ -272,6 +423,7 @@ class StallThenStrike(StrategyBase):
                                 ttl_ms=ttl_st,
                                 tag="stall",
                             ),
+                            "allow_multiple": True,
                         }
                     )
                 return actions
@@ -286,6 +438,7 @@ class StallThenStrike(StrategyBase):
                         ttl_ms=ttl_st,
                         tag="stall",
                     ),
+                    "allow_multiple": True,
                 },
                 {
                     "type": "place",
@@ -297,9 +450,10 @@ class StallThenStrike(StrategyBase):
                         ttl_ms=ttl_st,
                         tag="stall",
                     ),
+                    "allow_multiple": True,
                 },
             ]
-        # 条件外：この戦略タグの注文は撤退
+
         min_requote_interval_ms = self._resolve_min_requote_interval_ms()
         if min_requote_interval_ms is not None:
             current_ts_ms = self._current_time_ms(now)
@@ -313,4 +467,6 @@ class StallThenStrike(StrategyBase):
             if current_ts_ms is not None:
                 self._last_cancel_ts_ms = current_ts_ms
         self._set_decision_features(decision_features)
-        return [{"type": "cancel_tag", "tag": "stall"}]
+        if stall_orders:
+            return [{"type": "cancel_tag", "tag": "stall"}]
+        return []

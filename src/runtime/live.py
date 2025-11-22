@@ -5,13 +5,15 @@ from __future__ import annotations
 
 import os  # 何をするか：APIキー/シークレットを環境変数から読む
 from typing import Any, Sequence  # 何をするか：cfg の型ヒント用
-from collections.abc import Mapping
+from collections.abc import Mapping  # 何をするか：dict/Mapping を扱う
 from loguru import logger  # 何をするか：進行ログを出す
 from src.strategy.base import build_strategy_from_cfg  # 何をするか：cfg['strategies'] 配列から戦略群を構築する
 import json  # 何をするか：heartbeatをndjsonで書くためにJSONへ直す
 from zoneinfo import ZoneInfo  # 何をするか：JST（Asia/Tokyo）へのタイムゾーン変換に使う
+from decimal import Decimal  # 何をするか：auto_reduce の計算で桁落ちを防ぐ
 
 from src.core.exchange import RateLimitError  # 何をするか：取引所のレート制限例外を型で捕捉する
+from src.core.risk import auto_reduce_should_fire  # 何をするか：Reduce-Only IOC を出すべきか判定する
 
 from datetime import datetime  # 何をするか：heartbeatのts(ISO)を日時に直してレート制限に使う
 
@@ -101,6 +103,27 @@ def _in_funding_transfer(now: datetime, cfg) -> bool:
             return True
     return False
 
+def _cfg_pick(root, dotted: str, default=None):
+    """
+    何をする関数か：
+    - ドット区切りパス（例: "risk.auto_reduce.enabled"）で、dict / Pydantic モデル / SimpleNamespace を安全にたどる。
+    - Pydantic v2 の model_extra も見ることで、schema 外の設定（auto_reduce など）も拾う。
+    """
+    cur = root
+    for key in dotted.split("."):
+        if cur is None:
+            return default
+        if isinstance(cur, Mapping):
+            cur = cur.get(key)
+        else:
+            extra = getattr(cur, "model_extra", None)
+            if isinstance(extra, dict) and key in extra:
+                cur = extra[key]
+            else:
+                cur = getattr(cur, key, None)
+    return default if cur is None else cur
+
+
 def _mid_from_ob(ob: OrderBook) -> float | None:
     """何をするか：ローカル板からミッド価格を取り出す（実装差異を吸収）"""
     mid = getattr(ob, "mid", None)
@@ -121,6 +144,163 @@ def _round_size(sz: float, step: float) -> float:
     rounded = float(steps * step)
     return rounded
 
+
+def _maybe_auto_reduce_live(
+    cfg,
+    ex: BitflyerExchange,
+    ob: OrderBook,
+    now: datetime,
+    pnl_state: dict,
+    eff_inv_limit: float | None,
+    last_ts: datetime | None,
+    order_log: OrderLog,
+    hb_path: Path,
+) -> datetime | None:
+    """
+    何をする関数か：
+    - live 環境で在庫が重いときに、Reduce-Only+IOC の自動決済を 1 回だけ試す。
+    - paper 側の auto_reduce と同等の設定（risk.auto_reduce.*）を使うが、発注は REST(send_child_order) 経由。
+    """
+    try:
+        q = float(pnl_state.get("pos", 0.0) or 0.0)
+        a = float(pnl_state.get("avg_px", pnl_state.get("avg", 0.0)) or 0.0)
+    except Exception:
+        logger.debug("auto_reduce: skip invalid_pos")
+        return last_ts
+
+    enabled = bool(_cfg_pick(cfg, "risk.auto_reduce.enabled", False))
+    profit_only = bool(_cfg_pick(cfg, "risk.auto_reduce.profit_only", True))
+    force_on_risk = bool(_cfg_pick(cfg, "risk.auto_reduce.force_on_risk", True))
+    try:
+        cooldown_ms = int(_cfg_pick(cfg, "risk.auto_reduce.cooldown_ms", 1500))
+    except Exception:
+        cooldown_ms = 1500
+    try:
+        min_step_cfg = float(_cfg_pick(cfg, "risk.auto_reduce.min_step_qty", 0.001))
+    except Exception:
+        min_step_cfg = 0.001
+    tif = str(_cfg_pick(cfg, "risk.auto_reduce.tif", "IOC") or "IOC").upper()
+
+    if not enabled or eff_inv_limit is None:
+        return last_ts
+
+    if q == 0.0:
+        logger.debug("auto_reduce: skip size_zero (flat)")
+        return last_ts
+
+    # クールダウン（連打防止）
+    if cooldown_ms > 0 and last_ts is not None:
+        elapsed_ms = (now - last_ts).total_seconds() * 1000.0
+        if elapsed_ms < float(cooldown_ms):
+            logger.debug("auto_reduce: skip cooldown")
+            return last_ts
+
+    # inv_capping.target_ratio を考慮して「どれだけ重いか」を見る
+    try:
+        target_ratio = float(_cfg_pick(cfg, "risk.inv_capping.target_ratio", 0.90))
+    except Exception:
+        target_ratio = 0.90
+    eff_limit = float(eff_inv_limit or 0.0)
+    target_eff = (target_ratio * eff_limit) if eff_limit > 0.0 else 0.0
+    abs_q = abs(q)
+    over_eff = (abs_q > target_eff) if target_eff > 0.0 else False
+    if not over_eff:
+        logger.debug("auto_reduce: skip not_over_eff")
+        return last_ts
+
+    # mark（現在価格）を best_bid/best_ask の mid として取得
+    try:
+        mid = _mid_from_ob(ob)
+        mark_dec = Decimal(str(mid)) if mid is not None else None
+    except Exception:
+        mark_dec = None
+
+    # auto_reduce_should_fire で「やるべきか」を判定（理由もログに残す）
+    try:
+        decision = auto_reduce_should_fire(
+            enabled=True,
+            profit_only=profit_only,
+            force_on_risk=force_on_risk,
+            q=Decimal(str(q)),
+            a=Decimal(str(a)),
+            mark=mark_dec,
+            mode="halted",  # 在庫ガード発動中なので事実上 Close-Only/Halted 扱い
+            recent_errors=[],
+            eff_limit=Decimal(str(eff_limit)),
+        )
+    except Exception as e:
+        logger.debug(f"auto_reduce: skip decision_error={e}")
+        return last_ts
+
+    if not decision.fire:
+        logger.debug(f"auto_reduce: skip {decision.reason}")
+        return last_ts
+
+    side = (decision.side or ("SELL" if q > 0.0 else "BUY")).upper()
+
+    # overshoot（target_eff 超過分）をロット刻みに揃えて減らす量に変換
+    base_step = max(min_step_cfg, 0.0)
+    qty_step = float(getattr(cfg, "qty_step", base_step or 0.001) or 0.001)
+    if qty_step <= 0.0:
+        qty_step = 0.001
+    dust_eps = qty_step * 0.5
+
+    overshoot = abs_q - target_eff
+    if abs_q < qty_step or overshoot <= 0.0:
+        logger.debug("auto_reduce: skip size_zero (no meaningful overshoot)")
+        return last_ts
+
+    try:
+        lots = max(int(overshoot / qty_step), 1)
+    except Exception:
+        lots = 1
+    step = min(abs_q, lots * qty_step)
+
+    if step <= 0.0 or step < dust_eps:
+        logger.debug("auto_reduce: skip size_zero (dust)")
+        return last_ts
+
+    try:
+        logger.info(
+            f"auto_reduce: try place (REST) side={side} qty={step:.6f} tif={tif} tag=auto_reduce"
+        )
+        acc = ex.send_child_order(
+            side=side,
+            size=step,
+            price=None,
+            time_in_force=tif,
+            reduce_only=True,
+            tag="auto_reduce",
+        )
+        # IOC なので TTL/price などは固定でよいが、orders/trades/heartbeat には記録しておく
+        now_iso = now.isoformat()
+        order_log.add(
+            ts=now_iso,
+            action="place",
+            tif=tif,
+            ttl_ms=None,
+            px=None,
+            sz=step,
+            reason="auto_reduce",
+        )
+        _hb_write(
+            hb_path,
+            event="place",
+            ts=now_iso,
+            acc=str(acc),
+            reason="auto_reduce",
+            tif=tif,
+            ttl_ms=None,
+            px=None,
+            sz=step,
+        )
+        return now
+    except RateLimitError as e:
+        logger.error(f"auto_reduce: RateLimit �� skip: {e}")
+        return last_ts
+    except Exception as e:
+        logger.warning(f"auto_reduce: place failed: {e}")
+        return last_ts
 def _net_inventory_btc(ex: BitflyerExchange) -> float:
     """何をするか：現在の建玉（BTC）を +BUY/-SELL で合算して返す（在庫ガード用）"""
     try:
@@ -593,7 +773,6 @@ def run_live(
             inv_eps_default = 0.0 if inv_limit is None else max(0.0, float(inv_limit) * 0.01)
             inventory_eps = float(getattr(getattr(cfg, "risk", None), "inventory_eps", inv_eps_default))
             eff_inv_limit = None if inv_limit is None else max(0.0, float(inv_limit) - float(inventory_eps))
-            _last_tx_at = None  # 何をするか：直近の実発注時刻を覚えておく（TX間隔ガード用）
 
             canary_m = getattr(cfg, "canary_minutes", None)  # 何をするか：実運転の時間制限（分）。None/0なら無効
             fee_bps = float(getattr(getattr(cfg, "fees", None), "bps", 0.0) or 0.0)  # 何をするか：手数料(bps)を設定から取得（無ければ0.0）
@@ -621,7 +800,7 @@ def run_live(
             events_dir.mkdir(parents=True, exist_ok=True)  # 何をするか：フォルダを作成
             (events_dir / "maintenance.csv").touch(exist_ok=True)  # 何をするか：ファイルを事前作成
             (events_dir / "funding_schedule.csv").touch(exist_ok=True)  # 何をするか：ファイルを事前作成
-            maint_prev, fund_prev = False, False  # 何をするか：直前の窓状態（入っていたか）を保持
+            # 初期は None のまま（変化だけ検出）
 
             hb_path.parent.mkdir(parents=True, exist_ok=True)  # 何をするか：保存先フォルダを作る
 
@@ -636,8 +815,16 @@ def run_live(
             last_place: dict[str, datetime] = {}  # 何をするか：直近に出した(side|price|tag)→時刻 を覚える
             _last_tx_at = _now_utc() - timedelta(milliseconds=min_tx_ms)  # 何をするか：直近の送信時刻（初期は「今−間隔」で即送れる状態）
             fee_bps = float(getattr(getattr(cfg, "fees", None), "bps", 0.0))  # 何をするか：手数料のbps設定（未指定は0.0）
-            canary_min = int(getattr(cfg, "canary_minutes", 60))  # 何をするか：最長運転時間（分）。未指定は60分
+            canary_min = (10**9 if dry_run else int(getattr(cfg, "canary_minutes", 0) or 0))  # DRYは無効（分）
             throttle_until: datetime | None = None  # 何をするか：レート制限に当たった時のクールダウン期限
+            auto_reduce_last_ts: datetime | None = None  # 何をするか：auto_reduceのクールダウン共有用
+            inv_resync_ms = int(getattr(getattr(getattr(cfg, "risk", None), "auto_reduce", None), "resync_ms", 5000))  # 何をするか：定期的に取引所の建玉とPnL状態を同期する間隔(ms)
+            last_inv_sync_at: datetime | None = _now_utc()  # 何をするか：直近の建玉再同期時刻
+            margin_err_window_s = 10  # 何をするか：-205（証拠金不足）をカウントする時間窓（秒）
+            margin_err_limit = 3      # 何をするか：時間窓内にこの回数 -205 が出たら新規を一時停止する
+            margin_cooldown_s = 60    # 何をするか：-205 連発時に新規を止める時間（秒）
+            margin_block_until: datetime | None = None  # 何をするか：-205 連発により新規を止める期限
+            margin_err_log: deque[datetime] = deque()  # 何をするか：直近の -205 発生時刻を覚える
 
             try:
                 _ = ex.list_active_child_orders(count=1)  # 何をするか：認証/権限・疎通の最小チェック（実発注なし）
@@ -798,12 +985,7 @@ def run_live(
                     _hb_write(hb_path, event="kill", ts=now.isoformat(), daily_pnl_jpy=daily_R, dd_jpy=R_HWM - daily_R, reason="signal")  # 何をするか：停止を1行JSONで記録
                     break  # 何をするか：イベントループを終了
                 
-                if (now - started_at).total_seconds() >= canary_min * 60:  # 何をするか：Canaryの経過時間をチェック
-                    if live_orders:
-                        ex.cancel_all_child_orders()  # 何をするか：安全のため全て取消
-                        live_orders.clear()
-                    _hb_write(hb_path, event="kill", ts=now.isoformat(), daily_pnl_jpy=daily_R, dd_jpy=R_HWM - daily_R, reason="canary")  # 何をするか：停止理由を心拍に記録
-                    break  # 何をするか：live を終了
+                # Canary 停止は (not dry_run) and canary_m の判定に統一
 
                 ob.update_from_event(ev)  # 何をするか：ローカル板にイベントを反映
                 bid = _best_px(getattr(ob, "best_bid", None))  # 何をするか：オブジェクト/辞書/数値を価格(float)に正規化
@@ -877,6 +1059,11 @@ def run_live(
                             R=daily_R,                           # 何をするか：当日実現PnL(JPY)
                             maint=_in_maintenance(now, cfg),      # 何をするか：メンテ窓フラグ
                             funding=(_in_funding_calc(now, cfg) or _in_funding_transfer(now, cfg)))  # 何をするか：Funding窓フラグ
+                    # これは「status を run.log にも INFO で1行残す」ための補助ログ（監視容易化のため）。
+                    try:
+                        logger.info(f"hb status Q={float(pnl_state.get('pos', 0.0)):.3f} A={len(live_orders)} R={daily_R:.0f} maint={_in_maintenance(now, cfg)} funding={_in_funding_calc(now, cfg) or _in_funding_transfer(now, cfg)}")
+                    except Exception:
+                        pass  # ログ出力失敗時は無視（安全側）
                     hb_next = now + timedelta(seconds=hb_interval_s)  # 何をするか：次回の予定を更新
 
                 maint_now = _in_maintenance(now, cfg)  # 何をするか：いまメンテ窓の中かを判定
@@ -920,18 +1107,43 @@ def run_live(
                         live_orders.clear()
                     continue  # 何をするか：次のイベントまで待つ
 
+                # 何をするか：一定間隔で取引所の建玉（get_positions）とローカル状態を再同期し、ズレを減らす
+                resync_failed = False
+                if inv_resync_ms > 0 and (last_inv_sync_at is None or (now - last_inv_sync_at).total_seconds() * 1000.0 >= inv_resync_ms):
+                    try:
+                        avg_sync, net_sync = _seed_inventory_and_avg_px(ex)
+                        if net_sync is not None:
+                            pnl_state["pos"] = float(net_sync or 0.0)
+                        if avg_sync is not None:
+                            pnl_state["avg_px"] = avg_sync
+                    except Exception as e:
+                        resync_failed = True
+                        logger.warning(f"inventory resync failed: {e}")
+                        _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="inventory_resync_failed")
+                    finally:
+                        last_inv_sync_at = now
+
                 # 何をするか：在庫上限ガード（建玉 |Q| が上限以上なら新規を止める）
 
                 close_only_mode = False
 
 
                 if eff_inv_limit is not None:
-                    try:
-                        Q = _net_inventory_btc(ex)  # 何をするか：現在の建玉（BTC）を取得して合算
-                    except NameError:
-                        Q = 0.0  # 何をするか：ヘルパ未追加でも落ちないように0扱い
-                    if abs(Q) >= eff_inv_limit or abs(pnl_state["pos"]) >= eff_inv_limit:
+                    Q = float(pnl_state.get("pos", 0.0) or 0.0)
+                    if abs(Q) >= eff_inv_limit:
                         close_only_mode = True
+                        if (not dry_run) and (not throttled):
+                            auto_reduce_last_ts = _maybe_auto_reduce_live(
+                                cfg,
+                                ex,
+                                ob,
+                                now,
+                                pnl_state,
+                                eff_inv_limit,
+                                auto_reduce_last_ts,
+                                order_log,
+                                hb_path,
+                            )  # 何をするか：在庫が厚いときに Reduce-Only IOC を投げて軽くする
                         if live_orders:
                             ex.cancel_all_child_orders()
                             live_orders.clear()
@@ -1028,10 +1240,35 @@ def run_live(
                 evaluate_actions: list[dict[str, Any]] = []
 
                 try:
+                    if resync_failed:
+                        logger.debug("pause: inventory_resync_failed")
+                        skip_new_orders = True
+                        _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="inventory_resync_failed")
+
+                    # 何をするか：-205（証拠金不足）が短時間に連発した場合は一定時間 close-only にする
+                    margin_guard = (margin_block_until is not None) and (now < margin_block_until)
+
                     inv_paused = (eff_inv_limit is not None) and (abs(float(pnl_state.get("pos", 0.0))) >= eff_inv_limit)  # 何をするか：在庫上限に達しているかを判定
                     if inv_paused:
                         logger.debug(f"pause: inventory guard |Q|={abs(pnl_state.get('pos', 0.0)):.3f} >= {eff_inv_limit}")  # 何をするか：理由をrun.logに記録
                         _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="inventory_guard")  # 何をするか：ハートビートに停止を記録
+                        skip_new_orders = True
+                    elif margin_guard:
+                        logger.debug("pause: margin_guard (recent -205 exceeded limit)")  # 何をするか：run.logに停止理由を記録
+                        _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="margin_guard", cooldown_s=margin_cooldown_s)  # 何をするか：心拍にも margin_guard を記録
+                        # 可能なら Reduce-Only IOC で少しでも在庫を削る
+                        if (not dry_run) and (not throttled) and (eff_inv_limit is not None):
+                            auto_reduce_last_ts = _maybe_auto_reduce_live(
+                                cfg,
+                                ex,
+                                ob,
+                                now,
+                                pnl_state,
+                                eff_inv_limit,
+                                auto_reduce_last_ts,
+                                order_log,
+                                hb_path,
+                            )
                         skip_new_orders = True
                     elif _in_maintenance(now, cfg):
                         logger.debug("pause: maintenance window")  # 何をするか：理由をrun.logに記録
@@ -1046,16 +1283,49 @@ def run_live(
                         _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="active_guard", A=len(live_orders))  # 何をするか：心拍にも停止を記録
                         skip_new_orders = True
                     else:
+                        feats_win = getattr(getattr(cfg, "features", None), "ca_ratio_win_ms", 500)
                         try:
                             t0 = time.perf_counter()  # 何をするか：戦略評価の開始時刻（ms測定）
                             evaluate_actions = strat.evaluate(ob, now, cfg) or []  # 何をするか：None安全化
                         except Exception as e:
                             logger.exception(f"strategy error: {e}")  # 何をするか：原因をrun.logに記録（スタック付き）
                             _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="strategy_error")  # 何をするか：心拍に“戦略エラー”を記録
-                            decision_log.add(ts=now.isoformat(), strategy=summary_name, decision="error", features={}, expected_edge_bp=None, eta_ms=int((time.perf_counter() - t0) * 1000), ca_ratio=None, best_age_ms=None, spread_state=None)  # 何をするか：必須のKW引数をすべて埋めて“error”を記録
+                            feats = {
+                                'best_age_ms': ob.best_age_ms(now),
+                                'ca_ratio': ob.ca_ratio(now, window_ms=feats_win),
+                                'spread_tick': ob.spread_ticks(),
+                            }
+                            try:
+                                extra = getattr(strat, 'consume_decision_features', None)
+                                extra = extra() if callable(extra) else None
+                                if isinstance(extra, Mapping):
+                                    for k, v in extra.items():
+                                        if k not in feats:
+                                            feats[k] = v
+                            except Exception:
+                                pass
+                            spread_state = ('zero' if feats.get('spread_tick') == 0 else 'ge1') if feats.get('spread_tick') is not None else None
+                            logger.info(f"decision record (error) path={__file__} features_in={feats}")
+                            decision_log.add(ts=now.isoformat(), strategy=summary_name, decision='error', features=feats, expected_edge_bp=None, eta_ms=int((time.perf_counter() - t0) * 1000), ca_ratio=feats.get('ca_ratio'), best_age_ms=feats.get('best_age_ms'), spread_state=spread_state)  # 何をするか：必須のKW引数をすべて埋めて“error”を記録
                             skip_new_orders = True
                         else:
-                            decision_log.add(ts=now.isoformat(), strategy=summary_name, decision=("place" if evaluate_actions else "hold"), features={}, expected_edge_bp=None, eta_ms=int((time.perf_counter() - t0) * 1000), ca_ratio=None, best_age_ms=None, spread_state=None)  # 何をするか：必須のKW引数をすべて埋めて“place/hold”を記録
+                            feats = {
+                                'best_age_ms': ob.best_age_ms(now),
+                                'ca_ratio': ob.ca_ratio(now, window_ms=feats_win),
+                                'spread_tick': ob.spread_ticks(),
+                            }
+                            try:
+                                extra = getattr(strat, 'consume_decision_features', None)
+                                extra = extra() if callable(extra) else None
+                                if isinstance(extra, Mapping):
+                                    for k, v in extra.items():
+                                        if k not in feats:
+                                            feats[k] = v
+                            except Exception:
+                                pass
+                            spread_state = 'zero' if feats.get('spread_tick') == 0 else 'ge1'
+                            logger.info(f"decision record path={__file__} features_in={feats}")
+                            decision_log.add(ts=now.isoformat(), strategy=summary_name, decision=('place' if evaluate_actions else 'hold'), features=feats, expected_edge_bp=None, eta_ms=int((time.perf_counter() - t0) * 1000), ca_ratio=feats.get('ca_ratio'), best_age_ms=feats.get('best_age_ms'), spread_state=spread_state)  # 何をするか：必須のKW引数をすべて埋めて“place/hold”を記録
 
                 except Exception as e:
                     logger.error(f"strategy evaluate failed: {e}")
@@ -1188,7 +1458,30 @@ def run_live(
                         _hb_write(hb_path, event="pause", ts=_now_utc().isoformat(), reason="throttle")  # 何をするか：心拍に“throttle”を記録
                         break
                     except (ServerError, NetworkError, ExchangeError) as e:
-                        logger.warning(f"send order rejected: {e}")
+                        msg = str(e)
+                        logger.warning(f"send order rejected: {msg}")
+                        if ("-205" in msg) or ("Margin amount is insufficient" in msg):
+                            margin_err_log.append(now)
+                            cutoff = now - timedelta(seconds=margin_err_window_s)
+                            while margin_err_log and margin_err_log[0] < cutoff:
+                                margin_err_log.popleft()
+                            if len(margin_err_log) >= margin_err_limit:
+                                margin_block_until = now + timedelta(seconds=margin_cooldown_s)
+                                _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="margin_guard", cooldown_s=margin_cooldown_s)
+                                logger.warning(f"margin_guard: -205 exceeded {margin_err_limit} in {margin_err_window_s}s → close-only for {margin_cooldown_s}s")
+                                # 可能ならReduce-Only IOCで在庫を減らす
+                                if (not dry_run) and (eff_inv_limit is not None):
+                                    auto_reduce_last_ts = _maybe_auto_reduce_live(
+                                        cfg,
+                                        ex,
+                                        ob,
+                                        now,
+                                        pnl_state,
+                                        eff_inv_limit,
+                                        auto_reduce_last_ts,
+                                        order_log,
+                                        hb_path,
+                                    )
                         continue
 
                 if throttled:
