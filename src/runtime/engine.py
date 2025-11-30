@@ -169,6 +169,7 @@ class PaperEngine:
         self.cfg = cfg
         self.logger = logger
         self._ar_last_ts = 0.0  # これは「auto_reduceの前回発火時刻（秒）」です
+        self._ar_recent = deque(maxlen=32)  # auto_reduceの直近発火時刻リスト
         self.product = getattr(cfg, "product_code", "FX_BTC_JPY") or "FX_BTC_JPY"
         self.tick = float(getattr(cfg, "tick_size", 1.0))
         self.max_inv = getattr(getattr(cfg, "risk", None), "max_inventory", None)
@@ -235,6 +236,19 @@ class PaperEngine:
         self._midguard_paused = False  # 直近の“ミッド変化ガード”状態を持つ
         # Sliding 30s mid-price window for guard (epoch_sec, mid)
         self._midwin: Deque[Tuple[float, float]] = deque()
+        # 板フリーズ検知用（spread=0が続いたらKill-Switch）
+        self._freeze_since_ms: float | None = None
+        self._freeze_halted: bool = False
+        self._freeze_recover_since_ms: float | None = None
+        # フィード健全性・Fill監視
+        self._feed_unhealthy_since_ms: float | None = None
+        self._last_fill_ms: float | None = None
+        self._early_exit_triggered: bool = False
+        # auto_reduceのレート/量リミット用
+        self._ar_min_bucket_ms: float | None = None
+        self._ar_min_count: int = 0
+        self._ar_hour_bucket_ms: float | None = None
+        self._ar_hour_qty: float = 0.0
 
 
         # PnL最小モデルの内部状態（自炊Q/A/Rのミニ版）
@@ -262,12 +276,15 @@ class PaperEngine:
         limit = float(self.max_inv) - float(self.inventory_eps)
         return max(0.0, limit)
 
+
     def _place_with_feed_guard(self, *args, **kwargs):
-        """何をするか：発注直前にフィード健全性を判定し、Haltedでは新規をブロック（決済のみ許可）する"""
+        """フィードの健全性と在庫ガードを踏まえて発注をフィルタする（Haltedでは新規を止める）。"""
         now_ms = int(time.time() * 1000)
-        prev_mode = getattr(self, "_feed_mode", "healthy")  # 何をするか：モード変更の検知（ログを増やしすぎない）
+        now_dt = datetime.now(timezone.utc)
+        prev_mode = getattr(self, "_feed_mode", "healthy")
         best_age_ms: float | None = None
         hb_gap_sec: float | None = None
+        spread_tick: int | None = None
 
         ob = getattr(self, "ob", None)
         last_rx_dt = None
@@ -281,30 +298,110 @@ class PaperEngine:
             elif isinstance(ba_attr, (int, float)):
                 best_age_ms = float(ba_attr)
             last_rx_dt = getattr(ob, "_last_ts", None)
+            try:
+                spread_tick = int(ob.spread_ticks())
+            except Exception:
+                spread_tick = None
 
         if last_rx_dt is not None:
             try:
                 hb_gap_sec = max(0.0, (datetime.now(timezone.utc) - last_rx_dt).total_seconds())
             except Exception:
                 hb_gap_sec = None
-        elif isinstance(self._last_heartbeat_ms, (int, float)):
+        elif isinstance(getattr(self, "_last_heartbeat_ms", None), (int, float)):
             hb_gap_sec = max(0.0, (now_ms - float(self._last_heartbeat_ms)) / 1000.0)
 
-        cfg_obj = getattr(self, "cfg", {})
+        cfg_obj = getattr(self, "cfg", {}) or {}
+        freeze_cfg = _cfg_pick(cfg_obj, "guard.freeze", {}) or {}
+        freeze_age_ms = float(freeze_cfg.get("age_ms", 3000.0) or 3000.0)
+        freeze_streak_ms = float(freeze_cfg.get("streak_ms", 3000.0) or 3000.0)
+        resume_spread_tick = int(freeze_cfg.get("resume_spread_tick", 1) or 1)
+        resume_age_ms = float(freeze_cfg.get("resume_age_ms", 800.0) or 800.0)
+        resume_window_ms = float(freeze_cfg.get("resume_window_ms", 4000.0) or 4000.0)
+        # 早期終了用のゆるい閾値（長めに設定しておき、ログを見ながら詰める想定）
+        try:
+            freeze_timeout_min = float(freeze_cfg.get("max_unhealthy_min", 10.0) or 0.0)
+        except Exception:
+            freeze_timeout_min = 0.0
+        try:
+            nofill_timeout_min = float(freeze_cfg.get("max_no_fill_min", 10.0) or 0.0)
+        except Exception:
+            nofill_timeout_min = 0.0
+
+        spread_freeze = (spread_tick == 0) and (best_age_ms is not None and best_age_ms >= freeze_age_ms)
+        if spread_freeze:
+            if self._freeze_since_ms is None:
+                self._freeze_since_ms = now_ms
+        else:
+            self._freeze_since_ms = None
+            self._freeze_recover_since_ms = None
+
+        freeze_halt = False
+        if self._freeze_since_ms is not None and (now_ms - self._freeze_since_ms) >= freeze_streak_ms:
+            freeze_halt = True
+
         mode, reason = _eval_feed_health(cfg_obj, best_age_ms, hb_gap_sec)
+        if freeze_halt:
+            mode = "halted"
+            reason = f"freeze:spread0_age>={int(freeze_age_ms)}ms"
+        elif getattr(self, "_freeze_halted", False):
+            healthy_spread = (spread_tick is not None and spread_tick >= resume_spread_tick)
+            healthy_age = (best_age_ms is None) or (best_age_ms <= resume_age_ms)
+            if healthy_spread and healthy_age:
+                if self._freeze_recover_since_ms is None:
+                    self._freeze_recover_since_ms = now_ms
+                if (now_ms - self._freeze_recover_since_ms) >= resume_window_ms:
+                    mode = "caution"
+                    reason = "freeze_recovered"
+                    self._freeze_halted = False
+                    self._freeze_since_ms = None
+            else:
+                self._freeze_recover_since_ms = None
+
         self._feed_mode = mode
         self._last_feed_reason = reason
-        if mode in ("healthy", "halted"):  # 何をするか：制限の無い2モードはここで一括更新（limitsは空）
+        if mode in ("healthy", "halted"):
             self._last_gate_status = {"mode": mode, "reason": reason, "limits": {}, "ts_ms": now_ms}
             if prev_mode != mode:
-                logger.info(f"guard:mode_change {prev_mode}->{mode} reason={reason} limits={{}}")  # 何をするか：モード変化を1行で記録
+                logger.info(f"guard:mode_change {prev_mode}->{mode} reason={reason} limits={{}}")
 
-        # 何をするか：ゲート判定のモード（healthy/caution/halted）を risk へ同期して在庫・Killの方針と連携する
+        # 早期終了判定（板不健康が長時間続き、かつ Fill が一定時間無い場合）
+        # 早期終了判定：フリーズ継続かつノーフィルが長時間続いた場合にRunを終わらせる
+        freeze_dur_ms = (now_ms - self._freeze_since_ms) if self._freeze_since_ms is not None else 0.0
+        last_fill_age = (now_ms - self._last_fill_ms) if self._last_fill_ms is not None else None
+        freeze_timeout = freeze_timeout_min > 0 and self._freeze_since_ms is not None and freeze_dur_ms >= freeze_timeout_min * 60_000.0
+        nofill_timeout = nofill_timeout_min > 0 and (last_fill_age is None or last_fill_age >= nofill_timeout_min * 60_000.0)
+        if freeze_timeout and nofill_timeout and not self._early_exit_triggered:
+            self._early_exit_triggered = True
+            unhealthy_min = freeze_dur_ms / 60000.0
+            nofill_min = float("inf") if last_fill_age is None else last_fill_age / 60000.0
+            logger.warning(
+                f"guard:early_exit reason=freeze_timeout unhealthy_min={unhealthy_min:.2f} no_fill_min={nofill_min:.2f}"
+            )
+            try:
+                sim = getattr(self, "sim", None)
+                canceller = getattr(sim, "cancel_all", None)
+                if callable(canceller):
+                    canceller()
+                # 簡易的にopenが空くまで少し待つ
+                if sim is not None and hasattr(sim, "open"):
+                    for _ in range(10):
+                        if not getattr(sim, "open", None):
+                            break
+                        time.sleep(0.05)
+            except Exception as e:
+                logger.warning(f"guard:early_exit_cancel_failed {e}")
+            try:
+                self._last_gate_status = {"mode": "halted", "reason": "freeze_timeout", "limits": {}, "ts_ms": now_ms}
+            except Exception:
+                pass
+            raise SystemExit("early_exit_freeze_timeout")
+
         if hasattr(self, "risk") and hasattr(self.risk, "set_market_mode"):
             try:
-                self.risk.set_market_mode(mode)  # 何をするか：risk側のマーケットモードを更新（安全装置の契約に沿う）
+                self.risk.set_market_mode(mode)
             except Exception as e:
-                logger.warning(f"risk.set_market_mode failed: {e}")  # 何をするか：失敗しても主処理は続行し、理由を監査に残す
+                logger.warning(f"risk.set_market_mode failed: {e}")
 
         is_reduce = bool(kwargs.get("reduce_only"))
         if not is_reduce and args:
@@ -312,14 +409,20 @@ class PaperEngine:
             is_reduce = getattr(first, "reduce_only", False) or getattr(first, "close_only", False)
 
         if mode == "halted" and not is_reduce:
+            if freeze_halt and not getattr(self, "_freeze_halted", False):
+                try:
+                    sim = getattr(self, "sim", None)
+                    canceller = getattr(sim, "cancel_all", None)
+                    if callable(canceller):
+                        canceller()
+                except Exception as e:
+                    logger.warning(f"guard:freeze_cancel_failed {e}")
+                self._freeze_halted = True
+            self._last_gate_status = {"mode": "halted", "reason": reason, "limits": {}, "ts_ms": now_ms}
             logger.warning(f"guard:block_new_order mode=halted reason={reason}")
             return None
 
-
         if mode == "caution" and not is_reduce:
-
-
-
             def _cfg_get(node, key):
                 if node is None:
                     return None
@@ -362,10 +465,10 @@ class PaperEngine:
                 rate = 2.0
             min_interval_ms = 1000.0 / max(0.001, rate)
 
-            limits = {"max_order_size": max_sz, "max_order_rate_per_sec": rate}  # 何をするか：Caution時の制限（戦略へ伝える数字）
-            self._last_gate_status = {"mode": "caution", "reason": reason, "limits": limits, "ts_ms": now_ms}  # 何をするか：最新ゲート情報を更新
+            limits = {"max_order_size": max_sz, "max_order_rate_per_sec": rate}
+            self._last_gate_status = {"mode": "caution", "reason": reason, "limits": limits, "ts_ms": now_ms}
             if prev_mode != "caution":
-                logger.info(f"guard:mode_change {prev_mode}->caution reason={reason} limits={limits}")  # 何をするか：モード変化を1行で記録
+                logger.info(f"guard:mode_change {prev_mode}->caution reason={reason} limits={limits}")
 
             if not is_reduce:
                 if now_ms - self._last_place_ts_ms < min_interval_ms:
@@ -390,11 +493,10 @@ class PaperEngine:
                     logger.warning(f"guard:shrink_size mode=caution from={kwargs['sz']} to={max_sz}")
                     kwargs["sz"] = max_sz
 
-
         if self._orig_place is None:
             return None
         if not is_reduce:
-            self._last_place_ts_ms = now_ms  # 何をするか：新規発注が通る直前に“最後に出した時刻”を更新（Cautionのレート制御に使う）
+            self._last_place_ts_ms = now_ms  # 新規注文が通る直前に“最後に出した時刻”を更新（Cautionのレート制御に使う）
         return self._orig_place(*args, **kwargs)
 
     def gate_status(self):
@@ -759,6 +861,52 @@ class PaperEngine:
         if cd_ms > 0 and (now - last_ts) * 1000.0 < cd_ms:
             _ar_dbg("cooldown")
             return
+        # 1秒あたりの発火回数を制限する
+        try:
+            recent = getattr(self, "_ar_recent", None)
+            if recent is None:
+                recent = deque(maxlen=32)
+                self._ar_recent = recent
+        except Exception:
+            recent = deque(maxlen=32)
+            self._ar_recent = recent
+        now_ms = now * 1000.0
+        try:
+            while recent and (now_ms - recent[0]) > 1000.0:
+                recent.popleft()
+        except Exception:
+            recent.clear()
+        try:
+            max_per_sec = float(_cfg_pick(cfg, "risk.auto_reduce.max_per_sec", 1.0))
+        except Exception:
+            max_per_sec = 1.0
+        if max_per_sec > 0 and len(recent) >= max_per_sec:
+            _ar_dbg("rate_limit")
+            return
+        # 分/時間あたりの発火回数・累積サイズリミット
+        try:
+            max_per_min = float(_cfg_pick(cfg, "risk.auto_reduce.max_triggers_per_min", 0) or 0)
+        except Exception:
+            max_per_min = 0.0
+        try:
+            max_qty_hour = float(_cfg_pick(cfg, "risk.auto_reduce.max_qty_per_hour", 0) or 0)
+        except Exception:
+            max_qty_hour = 0.0
+        wall_ms = time.time() * 1000.0
+        # minute bucket
+        if self._ar_min_bucket_ms is None or (wall_ms - self._ar_min_bucket_ms) >= 60_000.0:
+            self._ar_min_bucket_ms = wall_ms
+            self._ar_min_count = 0
+        # hour bucket
+        if self._ar_hour_bucket_ms is None or (wall_ms - self._ar_hour_bucket_ms) >= 3_600_000.0:
+            self._ar_hour_bucket_ms = wall_ms
+            self._ar_hour_qty = 0.0
+        if max_per_min > 0 and self._ar_min_count >= max_per_min:
+            _ar_dbg("per_min_limit")
+            return
+        if max_qty_hour > 0 and self._ar_hour_qty >= max_qty_hour:
+            _ar_dbg("hour_qty_limit")
+            return
 
         # 在庫を読み、position が無ければ Q/A を使う
         def _as_float(val) -> float:
@@ -777,6 +925,35 @@ class PaperEngine:
 
         if q == 0.0:
             _ar_dbg("size_zero")
+            return
+        best_age_ms = None
+        hb_gap_sec = None
+        ob = getattr(self, "ob", None)
+        last_rx_dt = getattr(ob, "_last_ts", None) if ob is not None else None
+        if ob is not None:
+            ba_attr = getattr(ob, "best_age_ms", None)
+            if callable(ba_attr):
+                try:
+                    best_age_ms = float(ba_attr())
+                except Exception:
+                    best_age_ms = None
+            elif isinstance(ba_attr, (int, float)):
+                best_age_ms = float(ba_attr)
+        if last_rx_dt is not None:
+            try:
+                hb_gap_sec = max(0.0, (datetime.now(timezone.utc) - last_rx_dt).total_seconds())
+            except Exception:
+                hb_gap_sec = None
+        elif isinstance(getattr(self, "_last_heartbeat_ms", None), (int, float)):
+            hb_gap_sec = max(0.0, (time.time() * 1000.0 - float(self._last_heartbeat_ms)) / 1000.0)
+        feed_mode, feed_reason = _eval_feed_health(cfg, best_age_ms, hb_gap_sec)
+        try:
+            self._feed_mode = feed_mode
+            self._last_feed_reason = feed_reason
+        except Exception:
+            pass
+        if feed_mode in ("caution", "halted"):
+            _ar_dbg(f"feed_unhealthy:{feed_mode}:{feed_reason}")
             return
 
         # target_eff 超過の判定（inv_capping と同等の考え方）
@@ -800,8 +977,9 @@ class PaperEngine:
             eff_limit_f = float(eff_limit_val) if eff_limit_val is not None else 0.0
         except Exception:
             eff_limit_f = 0.0
+        abs_q = abs(q)
         target_eff = (target_ratio * eff_limit_f) if eff_limit_f > 0.0 else 0.0
-        over_eff = (abs(q) > target_eff) if target_eff > 0.0 else False
+        over_eff = (abs_q > target_eff) if target_eff > 0.0 else False
         # target_eff を超えている間は、在庫縮小を優先させるために一時的に Close-Only と等価のフラグをON
         if over_eff and not getattr(self.risk, "inventory_guard_active", False):
             try:
@@ -814,7 +992,7 @@ class PaperEngine:
                 eff_lim_eff = float(self.effective_inventory_limit() or 0.0)
             except Exception:
                 eff_lim_eff = 0.0
-            hard_guard = (eff_lim_eff > 0.0 and abs(q) >= eff_lim_eff)
+            hard_guard = (eff_lim_eff > 0.0 and abs_q >= eff_lim_eff)
             if not hard_guard:
                 try:
                     self.risk.inventory_guard_active = False
@@ -824,6 +1002,8 @@ class PaperEngine:
         # guard/モード判定
         mode = str(getattr(self, "market_mode", getattr(self.risk, "market_mode", "healthy"))).lower()
         guard_on = bool(getattr(self.risk, "inventory_guard", False) or getattr(self.risk, "inventory_guard_active", False))
+        if eff_limit_f > 0.0 and abs_q >= eff_limit_f:
+            guard_on = True  # eff_limitを超えたら強制でガードON
         force_on_risk = bool(ar.get("force_on_risk", True))
         if not ((guard_on or over_eff) or (force_on_risk and mode in ("caution", "halted"))):  # over_eff時はHealthyでもreduce-onlyを許可して在庫を軽くする（market_mode_blockで止めない）
             _ar_dbg("market_mode_block")
@@ -835,34 +1015,36 @@ class PaperEngine:
         except Exception:
             min_step_cfg = 0.001
 
-        # --- auto_reduce の発注量を決める（ロット刻み・dust回避） ---
-        # ここでは「在庫の超過分（overshoot）」を最小ロットΔqに合わせて減らす量に変換する。
+        # --- auto_reduce の発注量を決める（在庫の絶対値を確実に減らすだけ） ---
         base_step = max(min_step_cfg, 0.0)
-        qty_step = float(getattr(self, "qty_step", base_step or 0.001))  # 最小ロット。設定未定義なら 0.001 BTC を既定にする
+        qty_step = float(getattr(self, "qty_step", base_step or 0.001)) if base_step > 0.0 else float(getattr(self, "qty_step", 0.001))
         if qty_step <= 0.0:
             qty_step = 0.001
-        dust_eps = float(getattr(self, "dust_eps", qty_step * 0.5))  # ゼロ寄せ境界（Δq/2を既定）
-
-        abs_q = abs(q)  # 現在在庫の絶対量
-        overshoot = (abs_q - target_eff) if (target_eff > 0.0 and over_eff) else 0.0  # 目標超過分（target_effを超えた部分）
-
-        # ロット未満／超過なしなら発注しない（無駄打ちと取引所拒否を防ぐ）
-        if abs_q < qty_step or overshoot <= 0.0:
-            _ar_dbg("size_zero")  # 減らす意味のある量がない
-            return
-
-        # 少なくとも1ロットは薄くする。overshoot が複数ロットならその分だけ薄くする。
         try:
-            lots = max(int(overshoot / qty_step), 1)
+            max_step_cfg = ar.get("max_step_qty")
+            max_step_cfg = float(max_step_cfg) if max_step_cfg is not None else None
         except Exception:
-            lots = 1
-        step = min(abs_q, lots * qty_step)
-
-        # dust（極小端数）は出さない
-        if step <= 0.0 or step < dust_eps:
-            _ar_dbg("size_zero")
-            return
-
+            max_step_cfg = None
+        try:
+            limit_ratio = float(ar.get("max_step_ratio_of_limit", 1.0))
+            if limit_ratio <= 0.0:
+                limit_ratio = 1.0
+        except Exception:
+            limit_ratio = 1.0
+        caps = [abs_q, qty_step]
+        if eff_limit_f > 0.0:
+            caps.append(eff_limit_f * limit_ratio)
+        if max_step_cfg is not None and max_step_cfg > 0.0:
+            caps.append(max_step_cfg)
+        step_cap = min(c for c in caps if isinstance(c, (int, float)) and c > 0.0)
+        dust_eps = float(getattr(self, "dust_eps", qty_step * 0.1))
+        if abs_q <= dust_eps:
+            step = abs_q
+        else:
+            step = max(0.0, min(step_cap, abs_q))
+            if step < dust_eps:
+                _ar_dbg("size_zero")
+                return
         # Guard中は利益条件を自動無効化（必ず薄めを試す）。監査用にフラグ保持。
         profit_overridden = False
         if guard_on and profit_only:
@@ -984,6 +1166,18 @@ class PaperEngine:
                 self.logger.info(f"auto_reduce: skip (no place path) side={side} qty={step:.6f}")
                 return
             self._ar_last_ts = now  # 発火時刻を更新
+            try:
+                self._ar_min_count += 1
+            except Exception:
+                pass
+            try:
+                self._ar_hour_qty += float(step)
+            except Exception:
+                pass
+            try:
+                self._ar_recent.append(now_ms)
+            except Exception:
+                pass
         except Exception as e:
             self.logger.warning(f"auto_reduce: place failed: {e}")
     def _heartbeat(self, now: datetime, event: str, reason: str | None = None) -> None:
@@ -1071,6 +1265,10 @@ class PaperEngine:
             sz=sz,
             reason=f"{reason_tag}; tag={order_tag}; corr={corr_for_log}",
         )
+        try:
+            self._last_fill_ms = time.time() * 1000.0
+        except Exception:
+            pass
         dt = _parse_iso(ts_iso)  # 【関数】この約定時刻で窓フラグを判定するためにdatetime化
         is_maint = self._in_maintenance(dt)  # 【関数】メンテ窓か？
         is_fund = self._in_funding_calc(dt) or self._in_funding_transfer(dt)  # 【関数】Funding窓か？
