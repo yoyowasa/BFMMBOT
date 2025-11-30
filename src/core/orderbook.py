@@ -42,7 +42,6 @@ class OrderBook:
         self.asks: Dict[float, float] = {}
         self.best_bid = _BestSide()
         self.best_ask = _BestSide()
-        # C/A計測用： (時刻, side, kind, qty_abs) を貯める（kind: "add" | "cancel"）
         self.ca_events: Deque[Tuple[datetime, str, str, float]] = deque()
         self._last_ts: datetime | None = None  # 最後に適用したイベントの時刻
         self._last_best_bid_px = None  # Best Bidの直近価格（Ageリセット判定用）
@@ -173,11 +172,10 @@ class OrderBook:
             return (bb.price + ba.price) / 2.0
         return (ba.price * bb.size + bb.price * ba.size) / denom
 
-    # ── 【関数】C/A比（Best層合計, 直近window_ms）
-    def ca_ratio(self, now: datetime | None = None, window_ms: int = 500) -> float:
+    def ca_ratio_details(self, now: datetime | None = None, window_ms: int = 500) -> tuple[float, float, float]:
+        """C/A比をadd/cancel量とともに返す"""
         now = now or self._last_ts or datetime.now(timezone.utc)
         cutoff = now.timestamp() - (window_ms / 1000.0)
-        # 古いイベントを窓から落とす
         while self.ca_events and self.ca_events[0][0].timestamp() < cutoff:
             self.ca_events.popleft()
         adds = 0.0
@@ -187,9 +185,28 @@ class OrderBook:
                 adds += qty
             else:
                 cancels += qty
-        return (cancels / adds) if adds > 0 else float("inf")
+        if adds <= 0.0:
+            if cancels <= 0.0:
+                # Add/Cancelともゼロなら比率は0扱いでinfを避ける
+                return 0.0, 0.0, 0.0
+            return float("inf"), 0.0, cancels
+        ratio = (cancels / adds)
+        return ratio, adds, cancels
 
-    # ── 【関数】主要指標のスナップ（デバッグ/ログ用）
+    def ca_ratio(self, now: datetime | None = None, window_ms: int = 500, cap: float | None = None) -> float:
+        """C/A比を返す。cap指定時はcapでクランプ"""
+        ratio, _, _ = self.ca_ratio_details(now, window_ms)
+        if cap is None:
+            return ratio
+        try:
+            cap_val = float(cap)
+            if ratio == float("inf"):
+                return cap_val
+            return min(ratio, cap_val)
+        except Exception:
+            pass
+        return ratio
+
     def state_snapshot(self, now: datetime | None = None) -> Dict[str, Any]:
         now = now or self._last_ts or datetime.now(timezone.utc)
         return {

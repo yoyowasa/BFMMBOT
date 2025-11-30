@@ -140,6 +140,29 @@ class CancelAddGate(StrategyBase):
 
         ratio = ob.ca_ratio(now, window_ms=win_ms)
         decision_features["ca_ratio"] = ratio
+        mid = (ob.best_bid.price + ob.best_ask.price) / 2.0 if ob.best_bid.price is not None and ob.best_ask.price is not None else None
+        mp = ob.microprice()
+        mp_edge_bp = None
+        if mid not in (None, 0) and mp is not None:
+            mp_edge_bp = (mp - mid) / mid * 1e4
+            decision_features["mp_edge_bp"] = mp_edge_bp
+        zero_min_edge_bp = getattr(feats_node, "zero_min_mp_edge_bp", None) if feats_node is not None else None
+        if zero_min_edge_bp is None and isinstance(feats_node, Mapping):
+            zero_min_edge_bp = feats_node.get("zero_min_mp_edge_bp")
+        try:
+            zero_min_edge_bp_val = float(zero_min_edge_bp) if zero_min_edge_bp is not None else 1.0
+        except Exception:
+            zero_min_edge_bp_val = 1.0
+        decision_features["zero_min_mp_edge_bp"] = zero_min_edge_bp_val
+        if spread_ticks == 0:
+            if mp_edge_bp is None:
+                decision_features["zero_mp_edge_blocked"] = True
+                self._set_decision_features(decision_features)
+                return [{"type": "cancel_tag", "tag": "ca_gate"}]
+            if mp_edge_bp > -zero_min_edge_bp_val:
+                decision_features["zero_mp_edge_sell_blocked"] = True
+                self._set_decision_features(decision_features)
+                return [{"type": "cancel_tag", "tag": "ca_gate"}]
 
         # 在庫帯ごとのしきい値補正
         try:

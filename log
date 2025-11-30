@@ -152,9 +152,14 @@ cd E:\BF-MMBOT
 .\.venv\Scripts\Activate.ps1
 
 
+# ステージ：作業ツリーの全変更（追加・更新・削除）を一括
 git add -A
-git commit -m "chore: initial upload"   # ←必ずメッセージを入れる
-git push  
+
+# コミット
+git commit -m "chore: bulk update after lint & format"
+
+# プッシュ
+git push
 
 python -m src.analytics.session_kpi --dir /mnt/data --config configs/paper.yml
 

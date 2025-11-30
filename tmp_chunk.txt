@@ -1,0 +1,30 @@
+        while self.ca_events and self.ca_events[0][0].timestamp() < cutoff:
+            self.ca_events.popleft()
+        adds = 0.0
+        cancels = 0.0
+        for _, _, kind, qty in self.ca_events:
+            if kind == "add":
+                adds += qty
+            else:
+                cancels += qty
+        ratio = (cancels / adds) if adds > 0 else float("inf")
+        return ratio, adds, cancels
+
+    def ca_ratio(self, now: datetime | None = None, window_ms: int = 500, cap: float | None = None) -> float:
+        """C/A比を返す。cap指定時はcapでクリップ"""
+        ratio, _, _ = self.ca_ratio_details(now, window_ms)
+        if cap is None:
+            return ratio
+        try:
+            cap_val = float(cap)
+            if ratio != float("inf"):
+                return min(ratio, cap_val)
+        except Exception:
+            pass
+        return ratio
+
+
+    # ── 【関数】主要指標のスナップ（デバッグ/ログ用）
+    def state_snapshot(self, now: datetime | None = None) -> Dict[str, Any]:
+        now = now or self._last_ts or datetime.now(timezone.utc)
+        return {

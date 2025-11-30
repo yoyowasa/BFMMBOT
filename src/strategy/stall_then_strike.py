@@ -137,6 +137,28 @@ class StallThenStrike(StrategyBase):
                 result["mode"] = mode_val
         return result or None
 
+    def _resolve_min_mp_edge_bp(self, default: float = 0.0) -> float:
+        node = self._value_from(self._strategy_cfg, "stall_then_strike", "min_mp_edge_bp")
+        if node is None:
+            node = self._value_from(self._strategy_cfg, "min_mp_edge_bp")
+        if node is None:
+            node = self._value_from(getattr(self.cfg, "features", None), "stall_min_mp_edge_bp")
+        try:
+            return float(node) if node is not None else default
+        except Exception:
+            return default
+
+    def _resolve_min_mp_edge_bp(self, default: float = 0.0) -> float:
+        node = self._value_from(self._strategy_cfg, "stall_then_strike", "min_mp_edge_bp")
+        if node is None:
+            node = self._value_from(self._strategy_cfg, "min_mp_edge_bp")
+        if node is None:
+            node = self._value_from(getattr(self.cfg, "features", None), "stall_min_mp_edge_bp")
+        try:
+            return float(node) if node is not None else default
+        except Exception:
+            return default
+
     def _current_time_ms(self, now: datetime) -> int | None:
         if callable(self._time_source):
             try:
@@ -325,6 +347,28 @@ class StallThenStrike(StrategyBase):
         decision_features["best_age_ms"] = age_ms
         decision_features["spread_tick"] = sp_tick
         mid = (ob.best_bid.price + ob.best_ask.price) / 2.0
+        mp = ob.microprice()
+        mp_edge_bp = None
+        if mid not in (None, 0) and mp is not None:
+            mp_edge_bp = (mp - mid) / mid * 1e4
+            decision_features["mp_edge_bp"] = mp_edge_bp
+        min_edge_bp_base = self._resolve_min_mp_edge_bp(0.1)
+        # スプレッドとBest Ageで下限をスライド（0.1〜0.3bp）
+        edge_bump = 0.0
+        if sp_tick >= 2:
+            edge_bump += 0.05
+        if age_ms >= 500:
+            edge_bump += 0.05
+        if age_ms >= 1000:
+            edge_bump += 0.05
+        min_edge_bp = min(0.3, min_edge_bp_base + edge_bump)
+        decision_features["stall_min_mp_edge_bp"] = min_edge_bp
+        zero_min_edge_bp = self._value_from(getattr(self.cfg, "features", None), "zero_min_mp_edge_bp") or 1.0
+        try:
+            zero_min_edge_bp = float(zero_min_edge_bp)
+        except Exception:
+            zero_min_edge_bp = 1.0
+        decision_features["zero_min_mp_edge_bp"] = zero_min_edge_bp
 
         inventory = self._current_inventory()
         has_position = abs(inventory) > 1e-12
@@ -399,6 +443,33 @@ class StallThenStrike(StrategyBase):
 
         # ここからは建玉なしのエントリー判定
         if age_ms is not None and age_ms >= stall_T and sp_tick >= min_sp and not stall_orders:
+            apply_edge_block = (min_edge_bp > 0) and (min_sp > 0) and (stall_T > 0)
+            allow_buy = True
+            allow_sell = True
+            if apply_edge_block:
+                if mp_edge_bp is None:
+                    decision_features["stall_mp_edge_blocked"] = True
+                    self._set_decision_features(decision_features)
+                    return [{"type": "cancel_tag", "tag": "stall"}]
+                if mp_edge_bp < 0:
+                    allow_buy = False
+                    decision_features["stall_mp_edge_buy_blocked"] = True
+                elif mp_edge_bp < min_edge_bp:
+                    decision_features["stall_mp_edge_blocked"] = True
+                    self._set_decision_features(decision_features)
+                    return [{"type": "cancel_tag", "tag": "stall"}]
+            if sp_tick == 0:
+                if mp_edge_bp is None:
+                    decision_features["stall_zero_mp_edge_blocked"] = True
+                    self._set_decision_features(decision_features)
+                    return [{"type": "cancel_tag", "tag": "stall"}]
+                zero_min_edge_bp = decision_features.get("zero_min_mp_edge_bp") or 1.0
+                if mp_edge_bp > -zero_min_edge_bp:
+                    allow_sell = False
+                    decision_features["stall_zero_mp_edge_sell_blocked"] = True
+                if mp_edge_bp < zero_min_edge_bp:
+                    allow_buy = False
+                    decision_features["stall_zero_mp_edge_buy_blocked"] = True
             buy_suppressed = False
             if buy_filter_cfg and buy_filter_threshold is not None and buy_filter_mid_change is not None:
                 try:
@@ -427,19 +498,23 @@ class StallThenStrike(StrategyBase):
                         }
                     )
                 return actions
-            return [
-                {
-                    "type": "place",
-                    "order": Order(
-                        side="buy",
-                        price=mid - 1 * tick,
-                        size=lot,
-                        tif="GTC",
-                        ttl_ms=ttl_st,
-                        tag="stall",
-                    ),
-                    "allow_multiple": True,
-                },
+            actions: list[Dict[str, Any]] = []
+            if allow_buy:
+                actions.append(
+                    {
+                        "type": "place",
+                        "order": Order(
+                            side="buy",
+                            price=mid - 1 * tick,
+                            size=lot,
+                            tif="GTC",
+                            ttl_ms=ttl_st,
+                            tag="stall",
+                        ),
+                        "allow_multiple": True,
+                    }
+                )
+            actions.append(
                 {
                     "type": "place",
                     "order": Order(
@@ -451,8 +526,9 @@ class StallThenStrike(StrategyBase):
                         tag="stall",
                     ),
                     "allow_multiple": True,
-                },
-            ]
+                }
+            )
+            return actions
 
         min_requote_interval_ms = self._resolve_min_requote_interval_ms()
         if min_requote_interval_ms is not None:

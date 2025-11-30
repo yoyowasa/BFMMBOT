@@ -33,6 +33,11 @@ risk:  # 上限・非常停止
 
 guard:  # 相場が速いときのブレーキ
   max_mid_move_bp_30s: 25
+  zero_spread:
+    suppress_ms: 300       # アルパカスプレッド持続の閾値(ms)超過で新規注文を抑制
+    cooldown_ms: 600       # 抑制解除までのクールダウン(ms)
+    max_block_ms: 3000     # 連続ゼロスプレッドでのブロック上限(ms)
+    min_place_spread_tick: 1  # 0tick相当では新規注文を出さない
   feed_health:
     age_ms:
       caution: 3000
@@ -62,10 +67,14 @@ health:
 features:  # 戦略の共通しきい値（#1/#2 の主材料）
   stall_T_ms: 240              # #1: Best静止トリガ時間(ms)
   ca_ratio_win_ms: 600         # #2: C/A比を測る窓(ms)
+  ca_ratio_cap: 10.0           # #2: 計測時のC/A比をこの上限でクリップ（異常値抑止）
   ca_threshold: 1.25           # #2: C/A比がこの値以下なら“静か”
   min_spread_tick: 1           # 共通: 最低スプレッドtick
   ttl_ms: 900                  # 共通: 注文寿命(ms)
   stall_ttl_ms: 650            # #1: STだけ寿命を短く
+  stall_min_mp_edge_bp: 0.1    # GE1エントリ用の最小MPエッジ(bps)。未満ならスキップ
+  zero_min_mp_edge_bp: 1.0     # スプレッド0時はこのエッジ(bps)未満の逆サイドを出さない
+  zero_min_mp_edge_bp_sell: 1.5  # スプレッド0時の売り側MPエッジ下限(bps)。この値未満のsellを止める
   age_ms: 200                  # Age×MP 用滞留時間(ms)
   mp_offset_tick: 1.0          # Micropriceのずらしtick
   tiny_prints_N: 20            # Tiny-Prints集計件数
@@ -138,5 +147,10 @@ env_overrides:
       max_inventory: 0.1
     guard:
       max_mid_move_bp_30s: 10
+      zero_spread:
+        suppress_ms: 300       # アルパカスプレッド長期の閾値(ms)超過で新規抑制
+        cooldown_ms: 600       # 抑制解除までのクールダウン(ms)
+        max_block_ms: 3000     # アルパカスプレッドでのブロック上限(ms)
+        min_place_spread_tick: 1  # 0tick相当では新規注文を出さない
     logging:
       level: INFO
