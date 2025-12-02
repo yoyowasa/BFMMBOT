@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import os  # 何をするか：APIキー/シークレットを環境変数から読む
-from typing import Any, Sequence  # 何をするか：cfg の型ヒント用
+from typing import Any, Sequence, Callable  # 何をするか：cfg の型ヒント用
 from collections.abc import Mapping  # 何をするか：dict/Mapping を扱う
 from loguru import logger  # 何をするか：進行ログを出す
 from src.strategy.base import build_strategy_from_cfg  # 何をするか：cfg['strategies'] 配列から戦略群を構築する
@@ -540,27 +540,109 @@ def _csv_event_write(path: Path, row: dict) -> None:
             w.writeheader()
         w.writerow(row)
 
-def _mk_atexit(hb_path: Path):
-    """何をするか：プロセス終了時に heartbeat に stop を1行書く関数を返す"""
-    def _on_exit():
+def cancel_all_with_retry(
+    ex: BitflyerExchange,
+    product: str,
+    *,
+    max_retry: int = 3,
+    sleep_sec: float = 1.0,
+    timeout: float | None = None,
+) -> None:
+    """何をするか：cancel_all_child_orders を複数回リトライして確実に流すヘルパ"""
+    try:
+        attempts = int(max_retry)
+    except Exception:
+        attempts = 3
+    attempts = max(1, attempts)
+    orig_prod = getattr(ex, "product_code", None)
+    orig_timeout = getattr(getattr(ex, "_client", None), "timeout", None)
+    last_exc: Exception | None = None
+    try:
+        if product:
+            try:
+                ex.product_code = product
+            except Exception:
+                pass
+        if timeout is not None:
+            try:
+                ex._client.timeout = timeout  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        for i in range(1, attempts + 1):
+            try:
+                ex.cancel_all_child_orders()
+                return
+            except Exception as e:
+                last_exc = e
+                logger.warning(f"cancel_all retry {i}/{attempts} failed: {e}")
+                if i >= attempts:
+                    break
+                time.sleep(max(0.0, sleep_sec))
+        if last_exc:
+            raise last_exc
+    finally:
+        if orig_prod is not None:
+            try:
+                ex.product_code = orig_prod
+            except Exception:
+                pass
+        if timeout is not None and orig_timeout is not None:
+            try:
+                ex._client.timeout = orig_timeout  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+def _mk_atexit(
+    ex: BitflyerExchange,
+    hb_path: Path,
+    product_code: str,
+    live_orders: dict[str, dict],
+    *,
+    dry_run: bool,
+    max_retry: int = 3,
+    sleep_sec: float = 1.0,
+    timeout: float | None = None,
+) -> Callable[[str], None]:
+    """何をするか：終了時の“最終キャンセル＋stop心拍”を1回だけ通すハンドラを作る"""
+    done = False
+    def _on_exit(reason: str = "exit") -> None:
+        nonlocal done
+        if done:
+            return
+        done = True
+        if not dry_run:
+            try:
+                cancel_all_with_retry(
+                    ex,
+                    product_code,
+                    max_retry=max_retry,
+                    sleep_sec=sleep_sec,
+                    timeout=timeout,
+                )
+            except Exception as e:
+                logger.warning(f"final cancel_all failed: {e}")
+        else:
+            logger.info("live(dry-run): final cancel_all skipped")
         try:
-            _hb_write(hb_path, event="stop", ts=_now_utc().isoformat(), reason="exit")  # 何をするか：終了の合図を記録
+            live_orders.clear()
+        except Exception:
+            pass
+        try:
+            _hb_write(hb_path, event="stop", ts=_now_utc().isoformat(), reason=reason)  # 何をするか：終了の合図を記録
         except Exception:
             pass  # 何をするか：終了間際のエラーは握って静かに終わる
     return _on_exit
 
-def _mk_excepthook(ex: BitflyerExchange, hb_path: Path, live_orders: dict[str, dict], orig_hook):
-    """何をするか：未捕捉例外が起きたら“全取消→killを書いて停止”する excepthook を作って返す"""
+def _mk_excepthook(exit_handler: Callable[[str], None], stop_event: Event, orig_hook):
+    """何をするか：未捕捉例外で停止フラグを立てつつ終了シーケンスへ誘導する excepthook を作って返す"""
     def _hook(exc_type, exc, tb):
-        logger.exception(f"live: unexpected error → cancel_all & halt: {exc}")  # 何をするか：原因をrun.logに記録（スタック付き）
+        logger.exception(f"live: unexpected error → halt requested: {exc}")  # 何をするか：原因をrun.logに記録（スタック付き）
         try:
-            if live_orders:  # 何をするか：生きている注文を片付ける
-                ex.cancel_all_child_orders()
-                live_orders.clear()
+            stop_event.set()  # 何をするか：シグナルと同様に停止要求だけ伝える
         except Exception:
-            pass  # 何をするか：片付け中の二次エラーは握る
+            pass
         try:
-            _hb_write(hb_path, event="kill", ts=_now_utc().isoformat(), reason="exception")  # 何をするか：ハートビートに“例外停止”を記録
+            exit_handler("exception")  # 何をするか：最終キャンセルを単一路で実施
         except Exception:
             pass
         try:
@@ -753,6 +835,15 @@ def run_live(
         summary_name = primary_strategy
 
     with BitflyerExchange(api_key, api_secret, product_code=product_code) as ex:
+        live_orders: dict[str, dict] = {}
+        exit_reason = "exit"
+        cancel_retry = 3
+        cancel_sleep_sec = 1.0
+        try:
+            cancel_timeout = float(getattr(getattr(cfg, "tx", None), "cancel_all_timeout_sec", 10.0))
+        except Exception:
+            cancel_timeout = 10.0
+        exit_handler: Callable[[str], None] | None = None
         try:
             _ = ex.list_active_child_orders(count=1)
             if dry_run:
@@ -763,7 +854,6 @@ def run_live(
             else:
                 # 次ステップで：ここにイベントループ＋戦略呼び出し＋TTL取消などを実装
                 pass
-            live_orders: dict[str, dict] = {}  # 何をするか：受理ID→TTLなどのメタ情報を保持
             if not bool(getattr(cfg, "cancel_all_on_start", True)):  # 何をするか：起動時に全取消しない運用なら、残っている注文を監視にシード
                 _seed_live_orders_from_active(ex, live_orders)
 
@@ -804,6 +894,19 @@ def run_live(
 
             hb_path.parent.mkdir(parents=True, exist_ok=True)  # 何をするか：保存先フォルダを作る
 
+            exit_handler = _mk_atexit(
+                ex,
+                hb_path,
+                product_code,
+                live_orders,
+                dry_run=dry_run,
+                max_retry=cancel_retry,
+                sleep_sec=cancel_sleep_sec,
+                timeout=cancel_timeout,
+            )  # 何をするか：最終キャンセルとstop心拍を単一路に集約
+            atexit.register(exit_handler)  # 何をするか：プロセス終了時も同じ入口を通す
+            stop_event = Event()  # 何をするか：シグナルや例外で立てる停止フラグ
+
             halted = False  # 何をするか：Kill 到達後は新規を出さない
             pnl_state = (lambda a,n: {"pos": n, "avg_px": a})(*_seed_inventory_and_avg_px(ex))  # 何をするか：起動時の建玉(数量/平均建値)を反映してPnL状態を初期化
             daily_R, R_HWM = 0.0, 0.0  # 何をするか：日次実現PnLとその高値（HWM）
@@ -831,14 +934,21 @@ def run_live(
             except AuthError as e:
                 logger.error(f"live: auth failed → halt: {e}")  # 何をするか：理由をrun.logへ
                 _hb_write(hb_path, event="kill", ts=_now_utc().isoformat(), reason="auth")  # 何をするか：心拍に“auth停止”を記録
+                exit_reason = "auth"
                 return  # 何をするか：安全に終了（実運転に入らない）
 
-            sys.excepthook = _mk_excepthook(ex, hb_path, live_orders, sys.excepthook)  # 何をするか：未捕捉例外→全取消&kill停止のフックを登録
+            sys.excepthook = _mk_excepthook(exit_handler, stop_event, sys.excepthook)  # 何をするか：未捕捉例外で停止フラグを立てて終了シーケンスへ流す
             if getattr(cfg, "cancel_all_on_start", True):  # 何をするか：起動時の安全装置（全取消）設定を確認
                 if dry_run:  # 何をするか：dry-run中は実際に取消しを実行しない（安全にスキップ）
                     logger.info("live(dry-run): startup safety — skip cancel_all")  # 何をするか：スキップした事実をrun.logへ記録
                 else:
-                    ex.cancel_all_child_orders()  # 何をするか：本運転のみ、残っている全ての子注文を取消
+                    cancel_all_with_retry(
+                        ex,
+                        product_code,
+                        max_retry=cancel_retry,
+                        sleep_sec=cancel_sleep_sec,
+                        timeout=cancel_timeout,
+                    )  # 何をするか：本運転のみ、残っている全ての子注文をリトライ付きで取消
                     logger.info("live: startup safety — cancel_all issued")  # 何をするか：実行した事実をrun.logへ記録
 
 
@@ -846,10 +956,8 @@ def run_live(
             _JST = timezone(timedelta(hours=9))  # 何をするか：JSTのタイムゾーン
             day_start_utc = _now_utc().astimezone(_JST).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)  # 何をするか：当日のJST=00:00（UTCに直した時刻）
 
-            stop_event = Event()  # 何をするか：停止フラグ（signal 受信で立てる）
-
             def _on_signal(signum, frame) -> None:
-                logger.warning(f"signal received: {signum} → cancel all & halt")  # 何をするか：受信をログ
+                logger.warning(f"signal received: {signum} → halt requested")  # 何をするか：受信をログ
                 stop_event.set()  # 何をするか：イベントループに停止を伝える
 
             signal.signal(signal.SIGINT, _on_signal)   # 何をするか：Ctrl+C（SIGINT）で停止
@@ -922,7 +1030,6 @@ def run_live(
                 strategy=summary_name,
                 strategies=strategy_list,
             )  # 何をするか：起動の合図をrun.logと揃えて心拍に記録
-            atexit.register(_mk_atexit(hb_path))  # 何をするか：終了時にstopを1行出す
 
 
             for ev in _stream_with_reconnect(product_code, hb_path):  # 何をするか：WSが切れても自動再接続しながらイベントを処理
@@ -934,15 +1041,14 @@ def run_live(
                 if (not dry_run) and canary_m and (now - started_at).total_seconds() >= float(canary_m) * 60.0:  # 何をするか：実運転のみ時間超過で停止
                     logger.info("live: canary time limit reached → halt")  # 何をするか：停止理由をrun.logへ
                     _hb_write(hb_path, event="kill", ts=now.isoformat(), reason="canary", runtime_sec=int((now - started_at).total_seconds()))  # 何をするか：心拍に“canary停止”を記録
-                    if live_orders:
-                        ex.cancel_all_child_orders()  # 何をするか：生きている注文をお片付け
-                        live_orders.clear()
-                    return  # 何をするか：run_live を安全に終了
+                    exit_reason = "canary"
+                    break  # 何をするか：ループを抜けて終了シーケンスへ
 
                 if dry_run and dry_limit_s and (now - started_at).total_seconds() >= float(dry_limit_s):  # 何をするか：dry-runの時間制限を超えたら終了
                     logger.info("live(dry-run): time limit reached → halt")  # 何をするか：終了理由をrun.logに記録
                     _hb_write(hb_path, event="kill", ts=now.isoformat(), reason="dryrun_done", runtime_sec=int((now - started_at).total_seconds()))  # 何をするか：心拍に終了理由と経過秒を記録
-                    return  # 何をするか：run_live を安全に終了
+                    exit_reason = "dryrun_done"
+                    break  # 何をするか：ループを抜けて終了シーケンスへ
 
                 # 何をするか：現在の窓状態を判定（メンテ／Funding計算・授受のどれかでもTrue）
                 maint_now = _in_maintenance(now, cfg)
@@ -979,9 +1085,7 @@ def run_live(
                     _hb_write(hb_path, event="start", ts=now.isoformat(), reason="day_reset")  # 何をするか：心拍にも“日次リセット”を記録
 
                 if stop_event.is_set():  # 何をするか：停止フラグが立っていたら安全停止
-                    if live_orders:
-                        ex.cancel_all_child_orders()  # 何をするか：生きている注文をすべて取消
-                        live_orders.clear()
+                    exit_reason = "signal"
                     _hb_write(hb_path, event="kill", ts=now.isoformat(), daily_pnl_jpy=daily_R, dd_jpy=R_HWM - daily_R, reason="signal")  # 何をするか：停止を1行JSONで記録
                     break  # 何をするか：イベントループを終了
                 
@@ -1198,10 +1302,8 @@ def run_live(
                     R_HWM = max(R_HWM, daily_R)  # 何をするか：当日の最高益(HWM)を更新
                     if (not dry_run) and _check_kill(daily_R, R_HWM, kill_cfg):  # 何をするか：dry-run時はKillを発火させない（疎通運転で止まらない）
                         logger.warning(f"kill-switch: daily_pnl={daily_R:.0f} JPY, dd={R_HWM - daily_R:.0f} JPY → halt")  # 何をするか：停止理由をrun.logへ
-                        if live_orders:
-                            ex.cancel_all_child_orders()  # 何をするか：生きている注文を全て取消
-                            live_orders.clear()
                         _hb_write(hb_path, event="kill", ts=now.isoformat(), daily_pnl_jpy=daily_R, dd_jpy=R_HWM - daily_R)  # 何をするか：心拍にKillを記録
+                        exit_reason = "kill"
                         return  # 何をするか：run_live を終了（安全停止）
 
                     for _acc_id, _meta in list(live_orders.items()):  # 何をするか：全部さばけた注文を監視から外す（TTLや二重取消を防ぐ）
@@ -1488,5 +1590,12 @@ def run_live(
                     continue
 
         except (AuthError, RateLimitError, ServerError, NetworkError, ExchangeError) as e:
+            exit_reason = "exception"
             logger.error(f"live: exchange 疎通に失敗しました: {e}")
             raise
+        finally:
+            if exit_handler is not None:
+                try:
+                    exit_handler(exit_reason)
+                except Exception:
+                    logger.warning("live: 終了処理で例外が発生しましたが握りつぶします", exc_info=True)
