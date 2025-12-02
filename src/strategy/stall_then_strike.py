@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import List, Dict, Any, Callable
+from collections import deque
 from collections.abc import Mapping
 from datetime import datetime, timezone
 
@@ -28,6 +29,21 @@ class StallThenStrike(StrategyBase):
         self._pos_entry_px: float | None = None
         self._pos_entry_ts_ms: int | None = None
         self._pos_side: str | None = None
+        # ローカルな連敗/ドローダウン監視用バッファ
+        self._pnl_window = deque()  # (ts_ms, pnl)
+        self._pnl_window_sum: float = 0.0
+        self._loss_window = deque()  # (ts_ms, is_loss)
+        self._guard_cooldown_until_ms: int = 0
+        self._guard_reason: str | None = None
+        self._guard_notified: bool = False
+        # パラメータ（薄め設定）
+        self._pnl_guard_window_ms = 45_000
+        self._pnl_guard_fill_cap = 50
+        self._pnl_guard_threshold = 500.0  # JPY
+        self._pnl_guard_cooldown_ms = 30_000
+        self._loss_guard_window = 15
+        self._loss_guard_losses = 12
+        self._loss_guard_cooldown_ms = 20_000
 
     @staticmethod
     def _value_from(node, *keys):
@@ -190,6 +206,59 @@ class StallThenStrike(StrategyBase):
                 return None
         return None
 
+    def _prune_local_windows(self, now_ms: int) -> None:
+        """ローカルPnL/連敗バッファを時間・件数で整理する。"""
+        cutoff = now_ms - self._pnl_guard_window_ms
+        while self._pnl_window and (self._pnl_window[0][0] < cutoff or len(self._pnl_window) > self._pnl_guard_fill_cap):
+            ts, pnl = self._pnl_window.popleft()
+            self._pnl_window_sum -= pnl
+        while self._loss_window and len(self._loss_window) > self._loss_guard_window:
+            self._loss_window.popleft()
+
+    def _evaluate_local_guard(self, now_ms: int) -> tuple[bool, str | None]:
+        """ローカルDD/連敗ガードを判定し、必要ならクールダウンをセットする。"""
+        self._prune_local_windows(now_ms)
+        if self._guard_cooldown_until_ms and now_ms >= self._guard_cooldown_until_ms:
+            self._guard_cooldown_until_ms = 0
+            self._guard_reason = None
+            self._guard_notified = False
+        if self._guard_cooldown_until_ms and now_ms < self._guard_cooldown_until_ms:
+            return True, self._guard_reason
+
+        # 45s/-500円で休む
+        if self._pnl_window and self._pnl_window_sum <= -self._pnl_guard_threshold:
+            self._guard_cooldown_until_ms = now_ms + self._pnl_guard_cooldown_ms
+            self._guard_reason = "local_pnl_dd"
+            self._guard_notified = False
+            return True, self._guard_reason
+
+        # 15トレード中12敗で休む
+        if self._loss_window:
+            loss_count = sum(1 for _, is_loss in self._loss_window if is_loss)
+            if len(self._loss_window) >= self._loss_guard_window and loss_count >= self._loss_guard_losses:
+                self._guard_cooldown_until_ms = now_ms + self._loss_guard_cooldown_ms
+                self._guard_reason = "loss_streak"
+                self._guard_notified = False
+                return True, self._guard_reason
+
+        return False, None
+
+    def on_fill(self, ob: OrderBook, fill) -> list[dict]:
+        """約定PnLをローカルバッファに入れてガード判定する。"""
+        now_ms = self._current_time_ms(datetime.now(timezone.utc)) or 0
+        pnl = getattr(fill, "pnl", None)
+        try:
+            pnl_val = float(pnl) if pnl is not None else None
+        except Exception:
+            pnl_val = None
+        if pnl_val is not None:
+            self._pnl_window.append((now_ms, pnl_val))
+            self._pnl_window_sum += pnl_val
+            is_loss = pnl_val < 0.0
+            self._loss_window.append((now_ms, is_loss))
+        self._evaluate_local_guard(now_ms)
+        return []
+
     def _current_inventory(self) -> float:
         eng = getattr(self, "engine", None)
         try:
@@ -273,6 +342,10 @@ class StallThenStrike(StrategyBase):
             return []
 
         feats = cfg.features
+        now_ms = self._current_time_ms(now) or 0
+        guard_active, guard_reason = self._evaluate_local_guard(now_ms)
+        if not guard_active and self._guard_notified:
+            self._guard_notified = False
         stall_T = getattr(feats, "stall_T_ms", 250)
         min_sp = getattr(feats, "min_spread_tick", 1)
         ttl_ms = getattr(feats, "ttl_ms", 800)
@@ -443,6 +516,16 @@ class StallThenStrike(StrategyBase):
 
         # ここからは建玉なしのエントリー判定
         if age_ms is not None and age_ms >= stall_T and sp_tick >= min_sp and not stall_orders:
+            if guard_active:
+                decision_features["stall_local_guard"] = guard_reason or "local_guard"
+                if not self._guard_notified:
+                    cooldown_left = max(0, self._guard_cooldown_until_ms - now_ms)
+                    logger.info(f"strategy:skip_new_orders mode=halted reason={guard_reason} cooldown_ms={cooldown_left}")
+                    self._guard_notified = True
+                self._set_decision_features(decision_features)
+                return [{"type": "cancel_tag", "tag": "stall"}]
+            else:
+                self._guard_notified = False
             apply_edge_block = (min_edge_bp > 0) and (min_sp > 0) and (stall_T > 0)
             allow_buy = True
             allow_sell = True

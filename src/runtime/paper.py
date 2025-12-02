@@ -376,8 +376,9 @@ def run_paper(
                         fee_jpy = ex_price * fill_sz * (fee_bps / 10000.0)  # 何をするか：約定金額×bpsで手数料
                         realized -= fee_jpy  # 何をするか：PnLは手数料控除後（ネット）
                         paper_pos = pnl_state["pos"]  # 何をするか：CSV/Parquet出力用の在庫を同期
-                        _trades_add(ts=now.isoformat(), side=side, px=ex_price, sz=fill_sz, fee=fee_jpy, pnl=realized, strategy=strategy_name, tag=tag, inventory_after=paper_pos)  # 何をするか：CSVへ約定を記録
-                        trade_log.add(ts=now.isoformat(), side=side, px=ex_price, sz=fill_sz, fee=fee_jpy, pnl=realized, strategy=strategy_name, tag=tag, inventory_after=paper_pos, window_funding=False, window_maint=False)  # 何をするか：Parquetへ約定を記録
+                        ts_jst = now.astimezone(timezone(timedelta(hours=9))).isoformat()
+                        _trades_add(ts=ts_jst, side=side, px=ex_price, sz=fill_sz, fee=fee_jpy, pnl=realized, strategy=strategy_name, tag=tag, inventory_after=paper_pos)  # 何をするか：CSVへ約定を記録（JST）
+                        trade_log.add(ts=ts_jst, side=side, px=ex_price, sz=fill_sz, fee=fee_jpy, pnl=realized, strategy=strategy_name, tag=tag, inventory_after=paper_pos, window_funding=False, window_maint=False)  # 何をするか：Parquetへ約定を記録（JST）
 
                         done_local = meta.get("rem_sz", 0.0) <= 1e-12  # 何をするか：この注文が完了したか（残量ゼロか）を安全に再判定
                         order_log.add(ts=now.isoformat(), action=("fill" if done_local else "partial"), tif=None, ttl_ms=None, px=ex_price, sz=fill_sz, reason=tag)  # 何をするか：Parquetにもfill/partialを記録
@@ -392,6 +393,7 @@ def run_paper(
                                 side=side,
                                 price=ex_price,
                                 size=fill_sz,
+                                pnl=realized,
                                 tag=tag,
                                 done=done,
                                 order=meta.get("order"),

@@ -255,8 +255,6 @@ class PaperEngine:
         self.Q = 0.0  # 在庫（+ロング/−ショート）
         self.A = 0.0  # 平均建値
         self.R = 0.0  # 実現PnL累計
-        self._inv_guard_state: str = "healthy"  # 在庫ガードの現在モード（warning/caution/hard）
-
         self._JST = timezone(timedelta(hours=9))  # 【関数】日次境界（JST）
         jst_now = _now_utc().astimezone(self._JST)
         jst_midnight = jst_now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1666,47 +1664,11 @@ class PaperEngine:
                             self._heartbeat(now, "pause", reason="midmove_guard")  # 直近イベントを要約（ミッド変化ガードで停止）
                         continue  # 新規は出さない
                     
-
-                    # 在庫ガード: 警告/縮小/停止の段階制を適用
+                    # 戦略評価→意思決定ログ→アクション適用
+                    # 在庫上限ガード：|Q| が上限以上なら新規はClose-Onlyに切り替え、既存の指値は整理
                     eff_limit = self.effective_inventory_limit()
                     close_only_mode = False
-                    inv_state = "healthy"
-                    inv_limits = {}
-                    shrink_factor = 1.0
-                    inv_cfg = getattr(getattr(self.cfg, "risk", None), "inventory_guard", None)
-
-                    def _inv_val(key, default=None):
-                        val = None
-                        if isinstance(inv_cfg, Mapping):
-                            val = inv_cfg.get(key)
-                        elif inv_cfg is not None:
-                            val = getattr(inv_cfg, key, None)
-                        try:
-                            return float(val) if val is not None else default
-                        except Exception:
-                            return default
-
-                    warning_lim = _inv_val("warning", eff_limit * 0.7 if eff_limit is not None else None)
-                    caution_lim = _inv_val("caution", eff_limit)
-                    hard_lim = _inv_val("hard", (eff_limit * 1.5) if eff_limit is not None else None)
-                    shrink_factor = _inv_val("shrink_factor", 0.5) or 0.5
-                    if shrink_factor <= 0 or shrink_factor >= 1:
-                        shrink_factor = 0.5
-
-                    abs_q = abs(self.Q)
-                    if hard_lim is not None and abs_q >= hard_lim:
-                        inv_state = "hard"
-                    elif caution_lim is not None and abs_q >= caution_lim:
-                        inv_state = "caution"
-                    elif warning_lim is not None and abs_q >= warning_lim:
-                        inv_state = "warning"
-
-                    inv_limits = {"warning": warning_lim, "caution": caution_lim, "hard": hard_lim}
-                    if inv_state != getattr(self, "_inv_guard_state", "healthy"):
-                        logger.info(f"inventory_guard: state_change {getattr(self, '_inv_guard_state', 'na')}->{inv_state} |Q|={abs_q:.6f} limits={inv_limits}")
-                    self._inv_guard_state = inv_state
-
-                    if inv_state == "hard":
+                    if eff_limit is not None and abs(self.Q) >= eff_limit:
                         close_only_mode = True
                         for o in self.sim.cancel_by_tag("stall"):
                             self.order_log.add(
@@ -1720,7 +1682,7 @@ class PaperEngine:
                                     f"risk; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
                                     f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
                                 ),
-                            )
+                            )  # 何を/なぜ記録したか（在庫上限）
                         for o in self.sim.cancel_by_tag("ca_gate"):
                             self.order_log.add(
                                 ts=self._ts_jst(now),
@@ -1733,21 +1695,13 @@ class PaperEngine:
                                     f"risk; tag={getattr(o, 'tag', getattr(o, '_strategy', '-'))}; "
                                     f"corr={_coid_to_corr.get(getattr(o, 'client_order_id', ''), (getattr(o, '_corr_id', None) or current_corr_ctx.get() or '-'))}"
                                 ),
-                            )
-                        logger.warning(f"risk guard: |Q|>={hard_lim} -> close-only (inventory hard guard)")
-                        self._heartbeat(now, "pause", reason="inventory_guard")
-
-                    now_ms_gate = int(now.timestamp() * 1000)
-                    if inv_state in ("caution", "hard"):
-                        mode = "halted" if inv_state == "hard" else "caution"
-                        try:
-                            self._last_gate_status = {"mode": mode, "reason": f"inventory_{inv_state}", "limits": inv_limits, "ts_ms": now_ms_gate}
-                        except Exception:
-                            pass
-
+                            )  # 何を/なぜ記録したか（在庫上限）
+                        logger.warning(f"risk guard: |Q|>={eff_limit} → new orders paused")  # 画面でも分かるように一言
+                        self._heartbeat(now, "pause", reason="inventory_guard")  # ハートビート：在庫上限で停止
                     if hasattr(self, "risk"):
-                        self.risk.inventory_guard_active = inv_state in ("caution", "hard")
+                        self.risk.inventory_guard_active = close_only_mode
                     if close_only_mode:
+                        # Guard中（Close-Only）ならboard更新だけでも自動薄めを試行して在庫を減らす
                         self._maybe_auto_reduce(now=monotonic())
 
                     actions = self.strat.evaluate(self.ob, now, self.cfg)
@@ -1758,12 +1712,6 @@ class PaperEngine:
                         "spread_tick": self.ob.spread_ticks(),  # 何をする行か：現在スプレッド(tick)を記録
                     }
                     self._record_decision(now, actions, features=features)
-                    try:
-                        cfg_size = getattr(self.cfg, 'size', None)
-                        sz_min_val = cfg_size.get('min') if isinstance(cfg_size, Mapping) else getattr(cfg_size, 'min', None)
-                        size_min_guard = float(sz_min_val) if sz_min_val is not None else 0.001
-                    except Exception:
-                        size_min_guard = 0.001
                     for act in actions:
                         corr_from_action = act.get("_corr_id") if isinstance(act, dict) else None
                         corr_token = None
@@ -1776,22 +1724,6 @@ class PaperEngine:
                                 if self.sim.has_open_tag(act["order"].tag) and not allow_multi:
                                     continue
                                 o = act["order"]
-                                reduce_only = bool(getattr(o, 'reduce_only', False) or getattr(o, 'close_only', False))
-                                if close_only_mode and not reduce_only:
-                                    continue
-                                if inv_state == 'caution' and not reduce_only:
-                                    try:
-                                        orig_sz = getattr(o, 'size', getattr(o, 'sz', None))
-                                        if orig_sz is not None:
-                                            new_sz = max(size_min_guard, float(orig_sz) * shrink_factor)
-                                            if new_sz < float(orig_sz) - 1e-12:
-                                                logger.warning(f"inventory_guard:shrink size={orig_sz}->{new_sz} state=caution")
-                                                if hasattr(o, 'size'):
-                                                    o.size = new_sz
-                                                if hasattr(o, 'sz'):
-                                                    o.sz = new_sz
-                                    except Exception:
-                                        pass
                                 corr_value = (
                                     corr_from_action
                                     or getattr(o, "_corr_id", None)
@@ -2122,30 +2054,6 @@ class PaperEngine:
         except KeyboardInterrupt:
             logger.info("Ctrl+C - stopping paper")
         finally:
-            try:
-                sim = getattr(self, "sim", None)
-                if sim is not None:
-                    for _ in range(10):
-                        open_len = len(getattr(sim, "open", []))
-                        if open_len == 0:
-                            break
-                        canceller = getattr(sim, "cancel_all", None)
-                        if callable(canceller):
-                            try:
-                                canceller()
-                            except Exception as e:
-                                logger.warning(f"paper: final cancel_all failed: {e}")
-                        else:
-                            try:
-                                getattr(sim, "open", []).clear()
-                            except Exception:
-                                pass
-                        time.sleep(0.05)
-                    residual = len(getattr(sim, "open", []))
-                    if residual > 0:
-                        logger.warning(f"paper: open orders remain after final cancel (count={residual})")
-            except Exception as e:
-                logger.warning(f"paper: final cancel failed: {e}")
             # ログの確定保存
             self.order_log.flush()
             self.trade_log.flush()
