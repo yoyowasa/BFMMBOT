@@ -127,8 +127,8 @@ def _parse_iso(ts: str) -> datetime:
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 def _now_utc() -> datetime:
-    """【関数】現在UTC（実行時刻の印）"""
-    return datetime.now(timezone.utc)
+    """【関数】現在時刻（JST）"""
+    return datetime.now(ZoneInfo("Asia/Tokyo"))
 
 class PaperEngine:
     """リアルタイム“paper”の最小エンジン"""

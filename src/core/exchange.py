@@ -204,10 +204,12 @@ class BitflyerExchange:
         *,
         product_code: Optional[str] = None,
         tag: str = "auto_reduce",
+        reduce_only: bool = True,
     ) -> str:
         """
         在庫を減らすための IOC 成行を 1 回送信する関数。
         - child_order_type=MARKET + time_in_force=IOC により「即時に当たる分だけ約定→残りはキャンセル」。
+        - reduce_only=True を付けて在庫を増やさない。
         - tag は運用ログ用の目印（取引所には送らない）。
         - 刻み/数量の丸めは上位で済ませてから呼ぶこと。
         返り値: child_order_acceptance_id
@@ -229,6 +231,8 @@ class BitflyerExchange:
             "size": float(size),
             "time_in_force": "IOC",
         }
+        if reduce_only is not None:
+            body["reduce_only"] = bool(reduce_only)
 
         try:
             logger.info(

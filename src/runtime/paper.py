@@ -23,8 +23,8 @@ from src.core.utils import monotonic_ms
 # ---- 小さなユーティリティ（live.pyに依存せず単体で動く最小セット） ----
 
 def _now_utc() -> datetime:
-    """何をする関数か：UTCの現在時刻を返す"""
-    return datetime.now(timezone.utc)
+    """何をする関数か：JSTの現在時刻を返す"""
+    return datetime.now(ZoneInfo("Asia/Tokyo"))
 
 def _hb_write(hb_path: Path, **fields):
     """何をする関数か：心拍を ndjson で1行追記する（paper用の簡易版）"""

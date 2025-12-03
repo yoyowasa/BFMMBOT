@@ -14,7 +14,7 @@ from src.strategy.base import build_strategy_from_cfg
 
 
 def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(ZoneInfo("Asia/Tokyo"))
 
 
 def _hb_write(path: Path, **fields) -> None:
@@ -149,4 +149,3 @@ def run_live(
         reason=("signal" if stop["flag"] else "done"),
         runtime_sec=int((_now_utc() - started_at).total_seconds()),
     )
-

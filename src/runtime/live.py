@@ -55,8 +55,8 @@ def _normalize_strategy_names(
 
 
 def _now_utc() -> datetime:
-    """何をするか：UTC現在時刻を返す（ログ/TTL計算の基準）"""
-    return datetime.now(timezone.utc)
+    """何をするか：JST現在時刻を返す（ログ/TTL計算の基準）"""
+    return datetime.now(ZoneInfo("Asia/Tokyo"))
 
 def _ttl_deadline(now: datetime, ttl_ms: int | None) -> datetime | None:
     """何をするか：TTLミリ秒から締切（UTC）を作る（Noneは無期限）"""
@@ -258,6 +258,17 @@ def _maybe_auto_reduce_live(
 
     if step <= 0.0 or step < dust_eps:
         logger.debug("auto_reduce: skip size_zero (dust)")
+        return last_ts
+
+    step, reason = _calc_reduce_order_size(
+        q,
+        step,
+        size_cfg=getattr(cfg, "size", None),
+        step=qty_step,
+        min_size=min_step_cfg,
+    )
+    if step is None:
+        logger.debug(f"auto_reduce: skip reduce_size_{reason}")
         return last_ts
 
     try:
@@ -530,6 +541,58 @@ def _normalize_px_sz(cfg, px: float, sz: float) -> tuple[float | None, float | N
 
     return px, sz
 
+def _calc_reduce_order_size(
+    current_pos: float,
+    request_size: float,
+    *,
+    size_cfg=None,
+    step: float | None = None,
+    min_size: float | None = None,
+) -> tuple[float | None, str | None]:
+    """何をするか：reduce-only用に「在庫以内へクリップ」「刻みで切り下げ」「最小0.001BTC未満や残尾が最小未満なら発注しない」を返す"""
+    try:
+        pos_abs = abs(float(current_pos or 0.0))
+    except Exception:
+        return None, "invalid_pos"
+    if pos_abs <= 0.0:
+        return None, "flat"
+    try:
+        req = float(request_size or 0.0)
+    except Exception:
+        return None, "invalid_size"
+    if req <= 0.0:
+        return None, "non_positive"
+
+    try:
+        cfg_step = float(getattr(size_cfg, "step", 0.0) or 0.0)
+    except Exception:
+        cfg_step = 0.0
+    eff_step = float(step) if step is not None else cfg_step
+
+    eff_min = 0.001
+    try:
+        cfg_min = float(getattr(size_cfg, "min", 0.0) or 0.0)
+    except Exception:
+        cfg_min = 0.0
+    try:
+        extra_min = float(min_size or 0.0)
+    except Exception:
+        extra_min = 0.0
+    eff_min = max(eff_min, cfg_min, extra_min)
+
+    capped = min(req, pos_abs)
+    if eff_step > 0.0:
+        capped = math.floor(capped / eff_step) * eff_step
+
+    if capped < eff_min - 1e-12:
+        return None, "below_min"
+
+    residual = pos_abs - capped
+    if 0.0 < residual < eff_min:
+        return None, "dust_residual"
+
+    return capped, None
+
 def _csv_event_write(path: Path, row: dict) -> None:
     """何をするか：イベントCSV（enter/exit）を1行追記（初回はヘッダも書く）"""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -602,8 +665,9 @@ def _mk_atexit(
     max_retry: int = 3,
     sleep_sec: float = 1.0,
     timeout: float | None = None,
+    size_cfg=None,
 ) -> Callable[[str], None]:
-    """何をするか：終了時の“最終キャンセル＋stop心拍”を1回だけ通すハンドラを作る"""
+    """何をするか：終了時に cancel_all＋reduce-onlyでのフラット＋stop心拍 を1回だけ通すハンドラを作る"""
     done = False
     def _on_exit(reason: str = "exit") -> None:
         nonlocal done
@@ -621,6 +685,35 @@ def _mk_atexit(
                 )
             except Exception as e:
                 logger.warning(f"final cancel_all failed: {e}")
+            try:
+                q = _net_inventory_btc(ex)
+            except Exception as e:
+                logger.warning(f"final flatten: inventory fetch failed: {e}")
+            else:
+                attempts = 0
+                while attempts < 3 and abs(q) >= 0.001:
+                    size_try, clip_reason = _calc_reduce_order_size(
+                        q,
+                        abs(q),
+                        size_cfg=size_cfg,
+                    )
+                    if size_try is None:
+                        logger.warning(f"final flatten skipped: reason={clip_reason} pos={q:.6f}")
+                        break
+                    side = "SELL" if q > 0 else "BUY"
+                    try:
+                        ex.place_ioc_reduce_only(side=side, size=size_try, product_code=product_code, tag="final_flat")
+                        _hb_write(hb_path, event="reduce_only", ts=_now_utc().isoformat(), side=side, sz=size_try, reason="final_flat")
+                    except Exception as e:
+                        logger.warning(f"final flatten attempt failed: {e}")
+                    attempts += 1
+                    try:
+                        q = _net_inventory_btc(ex)
+                    except Exception as e:
+                        logger.warning(f"final flatten: inventory refresh failed: {e}")
+                        break
+                if abs(q) >= 0.001:
+                    logger.warning(f"final flatten: residual position remains pos={q:.6f} BTC")
         else:
             logger.info("live(dry-run): final cancel_all skipped")
         try:
@@ -879,6 +972,11 @@ def run_live(
             fund_csv = Path("logs/events/funding.csv")       # 何をするか：Funding窓のイベントCSVのパス
             maint_now = False  # 何をするか：参照前の未定義を避けるための初期値（後で毎周回の判定で上書き）
             fund_now = False   # 何をするか：同上（Funding窓も先にFalseで用意しておく）
+            margin_leverage = float(getattr(getattr(cfg, "risk", None), "margin_leverage", 2.0) or 2.0)  # 何をするか：証拠金必要額の概算レバレッジ
+            margin_buffer = float(getattr(getattr(cfg, "risk", None), "margin_buffer", 0.9) or 0.9)  # 何をするか：余力に掛ける安全係数
+            collateral_refresh_s = float(getattr(getattr(cfg, "risk", None), "collateral_refresh_sec", 5.0) or 5.0)  # 何をするか：証拠金情報を再取得する間隔
+            collateral_cache: dict[str, Any] | None = None
+            collateral_last_fetch: datetime | None = None
 
             hb_interval_s = int(getattr(getattr(cfg, "logging", None), "heartbeat_status_sec", 5))  # 何をするか：ステータス心拍の間隔（秒）
             hb_next = _now_utc() + timedelta(seconds=hb_interval_s)  # 何をするか：次に出す時刻
@@ -903,6 +1001,7 @@ def run_live(
                 max_retry=cancel_retry,
                 sleep_sec=cancel_sleep_sec,
                 timeout=cancel_timeout,
+                size_cfg=getattr(cfg, "size", None),
             )  # 何をするか：最終キャンセルとstop心拍を単一路に集約
             atexit.register(exit_handler)  # 何をするか：プロセス終了時も同じ入口を通す
             stop_event = Event()  # 何をするか：シグナルや例外で立てる停止フラグ
@@ -928,6 +1027,9 @@ def run_live(
             margin_cooldown_s = 60    # 何をするか：-205 連発時に新規を止める時間（秒）
             margin_block_until: datetime | None = None  # 何をするか：-205 連発により新規を止める期限
             margin_err_log: deque[datetime] = deque()  # 何をするか：直近の -205 発生時刻を覚える
+            reduce_retry_until: datetime | None = None  # 何をするか：自動決済IOCの連続送信を抑制する
+            reduce_fail_count = 0  # 何をするか：reduce-onlyが連続で失敗した回数（決済不能の検知用）
+            reduce_fail_limit = 3   # 何をするか：この回数連続で失敗したらHaltして手動介入を促す
 
             try:
                 _ = ex.list_active_child_orders(count=1)  # 何をするか：認証/権限・疎通の最小チェック（実発注なし）
@@ -956,9 +1058,73 @@ def run_live(
             _JST = timezone(timedelta(hours=9))  # 何をするか：JSTのタイムゾーン
             day_start_utc = _now_utc().astimezone(_JST).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)  # 何をするか：当日のJST=00:00（UTCに直した時刻）
 
+            def _ensure_collateral(now: datetime, force: bool = False) -> tuple[dict[str, Any] | None, datetime | None]:
+                """何をするか：必要に応じて get_collateral を呼び、キャッシュと取得時刻を返す"""
+                nonlocal collateral_cache, collateral_last_fetch
+                try:
+                    if force or collateral_cache is None or collateral_last_fetch is None or (now - collateral_last_fetch).total_seconds() >= collateral_refresh_s:
+                        collateral_cache = ex.get_collateral()
+                        collateral_last_fetch = now
+                except Exception as e:
+                    logger.warning(f"collateral fetch failed: {e}")
+                return collateral_cache, collateral_last_fetch
+
             def _on_signal(signum, frame) -> None:
                 logger.warning(f"signal received: {signum} → halt requested")  # 何をするか：受信をログ
                 stop_event.set()  # 何をするか：イベントループに停止を伝える
+
+            def _aggressive_reduce_inventory(now: datetime) -> None:
+                """何をするか：close-only / margin_guard 時に在庫を削るための reduce-only IOC を複数回トライ"""
+                nonlocal reduce_retry_until, reduce_fail_count
+                if dry_run or throttled:
+                    return
+                if reduce_retry_until is not None and now < reduce_retry_until:
+                    return
+                q_abs = abs(float(pnl_state.get("pos", 0.0) or 0.0))
+                if q_abs <= 0.0:
+                    return
+                side = "SELL" if float(pnl_state.get("pos", 0.0)) > 0 else "BUY"
+                size_cfg = getattr(cfg, "size", None)
+                try:
+                    base_sz = float(getattr(size_cfg, "default", q_abs) or q_abs)
+                except Exception:
+                    base_sz = q_abs
+                base_sz = min(q_abs, base_sz) if base_sz > 0 else q_abs
+                attempts: list[float] = []
+                cur = base_sz
+                for _ in range(3):
+                    s = cur if cur > 0 else q_abs
+                    attempts.append(max(s, 0.0))
+                    cur *= 0.5
+                attempted = False
+                for sz_try in attempts:
+                    if sz_try <= 0.0:
+                        continue
+                    attempted = True
+                    norm_sz, reason = _calc_reduce_order_size(
+                        pnl_state.get("pos", 0.0),
+                        sz_try,
+                        size_cfg=size_cfg,
+                    )
+                    if norm_sz is None:
+                        logger.debug(f"auto reduce-only skip size={sz_try:.6f} reason={reason}")
+                        continue
+                    try:
+                        ex.place_ioc_reduce_only(side=side, size=norm_sz, product_code=product_code, tag="auto_close_only")
+                        logger.info(f"auto reduce-only IOC sent side={side} sz={norm_sz}")
+                        _hb_write(hb_path, event="reduce_only", ts=now.isoformat(), side=side, sz=norm_sz, reason="auto_close_only")
+                        # 失敗しても次の試行へ進む（約定確認は次ループで反映）
+                        reduce_fail_count = 0
+                    except Exception as e:
+                        logger.warning(f"auto reduce-only IOC failed: {e}")
+                        reduce_fail_count += 1
+                if attempted:
+                    reduce_retry_until = now + timedelta(seconds=5)
+                if reduce_fail_count >= reduce_fail_limit:
+                    logger.error(f"reduce-only flatten failed {reduce_fail_count} times → halt for manual action")
+                    _hb_write(hb_path, event="kill", ts=_now_utc().isoformat(), reason="reduce_only_failed", attempts=reduce_fail_count)
+                    stop_event.set()
+                    return
 
             signal.signal(signal.SIGINT, _on_signal)   # 何をするか：Ctrl+C（SIGINT）で停止
             signal.signal(signal.SIGTERM, _on_signal)  # 何をするか：SIGTERM（停止要求）で停止
@@ -1248,6 +1414,8 @@ def run_live(
                                 order_log,
                                 hb_path,
                             )  # 何をするか：在庫が厚いときに Reduce-Only IOC を投げて軽くする
+                        if not dry_run and not throttled:
+                            _aggressive_reduce_inventory(now)
                         if live_orders:
                             ex.cancel_all_child_orders()
                             live_orders.clear()
@@ -1359,18 +1527,20 @@ def run_live(
                         logger.debug("pause: margin_guard (recent -205 exceeded limit)")  # 何をするか：run.logに停止理由を記録
                         _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="margin_guard", cooldown_s=margin_cooldown_s)  # 何をするか：心拍にも margin_guard を記録
                         # 可能なら Reduce-Only IOC で少しでも在庫を削る
-                        if (not dry_run) and (not throttled) and (eff_inv_limit is not None):
-                            auto_reduce_last_ts = _maybe_auto_reduce_live(
-                                cfg,
-                                ex,
-                                ob,
-                                now,
-                                pnl_state,
-                                eff_inv_limit,
-                                auto_reduce_last_ts,
-                                order_log,
-                                hb_path,
-                            )
+                        if (not dry_run) and (not throttled):
+                            if eff_inv_limit is not None:
+                                auto_reduce_last_ts = _maybe_auto_reduce_live(
+                                    cfg,
+                                    ex,
+                                    ob,
+                                    now,
+                                    pnl_state,
+                                    eff_inv_limit,
+                                    auto_reduce_last_ts,
+                                    order_log,
+                                    hb_path,
+                                )
+                            _aggressive_reduce_inventory(now)
                         skip_new_orders = True
                     elif _in_maintenance(now, cfg):
                         logger.debug("pause: maintenance window")  # 何をするか：理由をrun.logに記録
@@ -1438,6 +1608,10 @@ def run_live(
 
                 if throttled:
                     continue
+
+                guard_close_only = close_only_mode or margin_guard  # 何をするか：在庫超過や証拠金ガード中はクローズ専用に寄せる
+
+                margin_guard_triggered = False  # 何をするか：-205検知でこの周回の新規発注を止めるフラグ
 
                 for o in actions_to_process or []:
                     sz = float(_act(o, "size", getattr(getattr(cfg, "size", None), "default", 0.0)) or 0.0)  # 何をするか：dict/object両対応でサイズ取得（未指定ならconfigのdefault）
@@ -1517,25 +1691,67 @@ def run_live(
                             continue  # 何をするか：この周回は発注を行わない
 
                         side_norm = _side_norm(_act(o, "side"))  # 何をするか：sideを'BUY'/'SELL'に正規化
-                        current_pos = pnl_state["pos"]
+                        try:
+                            current_pos = float(pnl_state["pos"])
+                        except Exception:
+                            current_pos = 0.0
                         reduce_only = bool(_act(o, "reduce_only", False))
+                        reduces_inventory = _would_reduce_inventory(current_pos, side_norm, sz)
+                        if guard_close_only and not reduces_inventory:
+                            logger.debug("pause: close_only_mode (margin/inventory)")  # 何をするか：クローズ専用モード中は在庫を増やさない
+                            _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="close_only", side=side_norm, sz=sz)  # 何をするか：心拍に理由を記録
+                            continue
+                        if reduce_only or guard_close_only:
+                            clipped_sz, clip_reason = _calc_reduce_order_size(
+                                current_pos,
+                                sz,
+                                size_cfg=getattr(cfg, "size", None),
+                                step=size_step,
+                            )
+                            if clipped_sz is None:
+                                logger.debug(f"pause: reduce_clip_{clip_reason}")
+                                _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="reduce_clip", side=side_norm, sz=sz, detail=clip_reason)
+                                continue
+                            sz = clipped_sz
+                            reduce_only = True
+                            reduces_inventory = _would_reduce_inventory(current_pos, side_norm, sz)
+                            if not reduces_inventory:
+                                logger.debug("pause: reduce_clip_not_reducing")
+                                _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="close_only", side=side_norm, sz=sz)
+                                continue
                         if eff_inv_limit is not None:  # 何をするか：在庫上限ガード
                             pos_after = current_pos + (sz if side_norm == "BUY" else -sz)  # 何をするか：この発注が通った後の建玉を試算
                             if abs(pos_after) > eff_inv_limit:
-                                if reduce_only or _would_reduce_inventory(current_pos, side_norm, sz):
+                                if reduce_only or reduces_inventory:
                                     pass  # 何をするか：在庫を減らす注文なので通す
                                 else:
                                     logger.debug("pause: inventory_guard")  # 何をするか：上限超過のため止める
                                     _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="inventory_guard", pos_before=current_pos, pos_after=pos_after, limit=eff_inv_limit, side=side_norm, sz=sz)  # 何をするか：心拍に理由を記録
                                     continue  # 何をするか：このアクションは見送り
-                            elif close_only_mode and not (reduce_only or _would_reduce_inventory(current_pos, side_norm, sz)):
+                            elif close_only_mode and not (reduce_only or reduces_inventory):
                                 logger.debug("pause: inventory_guard_close_only")
                                 _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="inventory_guard", pos_before=current_pos, pos_after=pos_after, limit=eff_inv_limit, side=side_norm, sz=sz)
                                 continue
 
+                        # 何をするか：証拠金のざっくりチェック（reduce-only/在庫減少は除外）
+                        if not reduce_only and not reduces_inventory:
+                            coll, coll_ts = _ensure_collateral(now)
+                            if coll is not None:
+                                try:
+                                    avail = float(coll.get("collateral", 0.0)) - float(coll.get("require_collateral", 0.0))
+                                    required = (float(px) * float(sz)) / max(margin_leverage, 1e-9)
+                                    if required > avail * margin_buffer:
+                                        logger.debug(f"pause: margin_precheck required={required:.0f} avail={avail:.0f}")
+                                        _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="margin_precheck", required_jpy=int(required), avail_jpy=int(avail), leverage=margin_leverage, collateral_ts=(coll_ts.isoformat() if coll_ts else None))
+                                        continue
+                                except Exception as e:
+                                    logger.debug(f"margin_precheck skipped: {e}")
+
                         acc = ex.send_child_order(
-                            side=side_norm, size=sz, price=px, time_in_force=_act(o, "tif", "GTC")
+                            side=side_norm, size=sz, price=px, time_in_force=_act(o, "tif", "GTC"), reduce_only=reduce_only
                         )  # 何をするか：正規化後・ガード通過後にだけ実発注する
+                        if reduce_only:
+                            reduce_fail_count = 0
 
                         if not acc or (isinstance(acc, str) and acc.strip() == ""):
                             logger.warning("send order did not return acceptance id → skip")  # 何をするか：受理IDが無いのでこの発注は見送る
@@ -1562,17 +1778,55 @@ def run_live(
                     except (ServerError, NetworkError, ExchangeError) as e:
                         msg = str(e)
                         logger.warning(f"send order rejected: {msg}")
-                        if ("-205" in msg) or ("Margin amount is insufficient" in msg):
+                        is_reduce = reduce_only or reduces_inventory
+                        is_margin205 = ("-205" in msg) or ("Margin amount is insufficient" in msg)
+                        if is_margin205:
                             margin_err_log.append(now)
                             cutoff = now - timedelta(seconds=margin_err_window_s)
                             while margin_err_log and margin_err_log[0] < cutoff:
                                 margin_err_log.popleft()
-                            if len(margin_err_log) >= margin_err_limit:
-                                margin_block_until = now + timedelta(seconds=margin_cooldown_s)
-                                _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="margin_guard", cooldown_s=margin_cooldown_s)
-                                logger.warning(f"margin_guard: -205 exceeded {margin_err_limit} in {margin_err_window_s}s → close-only for {margin_cooldown_s}s")
-                                # 可能ならReduce-Only IOCで在庫を減らす
-                                if (not dry_run) and (eff_inv_limit is not None):
+                            margin_block_until = now + timedelta(seconds=margin_cooldown_s)
+                            _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="margin_guard", cooldown_s=margin_cooldown_s)
+                            logger.warning(f"margin_guard: -205 detected → close-only for {margin_cooldown_s}s (count={len(margin_err_log)}/{margin_err_limit} window={margin_err_window_s}s)")
+                            margin_guard_triggered = True
+                            if is_reduce:
+                                reduce_fail_count += 1
+                                fallback_sz, clip_reason = _calc_reduce_order_size(
+                                    current_pos,
+                                    sz * 0.5,
+                                    size_cfg=getattr(cfg, "size", None),
+                                    step=size_step,
+                                )
+                                if fallback_sz is not None and fallback_sz < sz - 1e-12:
+                                    try:
+                                        acc_fb = ex.send_child_order(
+                                            side=side_norm,
+                                            size=fallback_sz,
+                                            price=px,
+                                            time_in_force=_act(o, "tif", "GTC"),
+                                            reduce_only=True,
+                                        )
+                                        reduce_fail_count = 0
+                                        last_place[dedup_key] = now
+                                        _last_tx_at = now
+                                        deadline = _ttl_deadline(now, _act(o, "ttl_ms", getattr(getattr(cfg, "features", None), "ttl_ms", None)))
+                                        live_orders[acc_fb] = {"deadline": deadline, "order": o, "executed": 0.0, "avg_price": 0.0}
+                                        order_log.add(ts=now.isoformat(), action="place", tif=_act(o, "tif", "GTC"), ttl_ms=_act(o, "ttl_ms", None), px=px, sz=fallback_sz, reason=_act(o, "tag", ""))
+                                        _hb_write(hb_path, event="place", ts=now.isoformat(), acc=acc_fb, reason=_act(o, "tag", ""), tif=_act(o, "tif", "GTC"), ttl_ms=_act(o, "ttl_ms", None), px=px, sz=fallback_sz)
+                                        continue
+                                    except Exception as fb_exc:
+                                        logger.warning(f"reduce-only retry failed: {fb_exc}")
+                                else:
+                                    logger.debug(f"reduce-only retry skipped size_reason={clip_reason}")
+                                if reduce_fail_count >= reduce_fail_limit:
+                                    logger.error(f"reduce-only rejected repeatedly ({reduce_fail_count}) → halt for manual action")
+                                    _hb_write(hb_path, event="kill", ts=_now_utc().isoformat(), reason="reduce_only_failed", attempts=reduce_fail_count)
+                                    stop_event.set()
+                                    exit_reason = "reduce_only_failed"
+                                    break
+                            # 可能ならReduce-Only IOCで在庫を減らす
+                            if (not dry_run):
+                                if eff_inv_limit is not None:
                                     auto_reduce_last_ts = _maybe_auto_reduce_live(
                                         cfg,
                                         ex,
@@ -1584,9 +1838,10 @@ def run_live(
                                         order_log,
                                         hb_path,
                                     )
+                                _aggressive_reduce_inventory(now)
                         continue
 
-                if throttled:
+                if throttled or margin_guard_triggered:
                     continue
 
         except (AuthError, RateLimitError, ServerError, NetworkError, ExchangeError) as e:

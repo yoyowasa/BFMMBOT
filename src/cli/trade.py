@@ -16,6 +16,7 @@ except Exception:
 
 
 from pathlib import Path  # run.log の保存先を扱う
+from zoneinfo import ZoneInfo  # ログ時刻をJSTに固定する
 
 
 def _cfg_get(obj, key: str, default):
@@ -79,6 +80,16 @@ def _setup_text_logs(cfg, strategy: str) -> list[int]:
 
     return sink_ids
 
+def _force_jst_logger() -> None:
+    """何をするか：loguruのタイムスタンプをJSTで出力するようにパッチする"""
+    jst = ZoneInfo("Asia/Tokyo")
+    def _patch(record):
+        try:
+            record["time"] = record["time"].astimezone(jst)
+        except Exception:
+            pass
+    logger.configure(patcher=_patch)
+
 from src.core.utils import load_config  # 【関数】設定ローダー（base＋上書き）:contentReference[oaicite:12]{index=12}
 from src.runtime.engine import PaperEngine  # 【関数】paperエンジン（本ステップ）
 try:
@@ -117,6 +128,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     """【関数】エントリ：設定を読み、paperエンジンを走らせる"""
     load_dotenv(find_dotenv())  # 何をするか：プロジェクト直下の .env を読み込んでから run_live を呼ぶ
+    _force_jst_logger()  # 何をするか：loguru出力をJST表記に統一する
     args = _parse_args()
     cfg = load_config(args.config, env=args.env)
     strategy_cfg = _cfg_get(cfg, "strategy_cfg", None)
