@@ -32,6 +32,34 @@ except Exception:
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# 起動直後ガード：想定外の python.exe（system Python）から呼ばれたら即終了し、
+# ついでに子プロセス用に PYTHONEXECUTABLE を .venv に固定する。
+if sys.platform.startswith("win"):
+    _EARLY_EXPECTED_VENV = (REPO_ROOT / ".venv" / "Scripts" / "python.exe").resolve()
+    _EARLY_CURRENT = Path(sys.executable).resolve()
+    if _EARLY_EXPECTED_VENV.exists():
+        # 子プロセス（multiprocessingなど）も .venv の python を使わせる
+        try:
+            import multiprocessing as _MP
+            _MP.set_executable(str(_EARLY_EXPECTED_VENV))
+        except Exception:
+            pass
+        # venv でない（prefix==base_prefix）か、想定と違う exe なら即終了
+        if (sys.prefix == sys.base_prefix) or (_EARLY_CURRENT != _EARLY_EXPECTED_VENV):
+            print(
+                f"[BF-MMBOT guard] unexpected python executable: {_EARLY_CURRENT} "
+                f"(expected .venv python at {_EARLY_EXPECTED_VENV}). exit this extra process.",
+                file=sys.stderr,
+            )
+            os._exit(0)
+        os.environ.setdefault("PYTHONEXECUTABLE", str(_EARLY_EXPECTED_VENV))
+
+# 再帰起動ガード：この環境変数が付いた子プロセス（multiprocessingや誤起動）が来たら即終了。
+if os.environ.get("BFMMBOT_TRADE_MAIN"):
+    print("[BF-MMBOT guard] detected child/secondary src.cli.trade process → exit", file=sys.stderr)
+    os._exit(0)
+os.environ["BFMMBOT_TRADE_MAIN"] = "1"
+
 # この関数は「どの python.exe から起動されているか」を確認して、
 # 想定外（.venv ではなく system Python）からの二重起動であれば、
 # すぐに静かに終了するためのガードです。
@@ -70,15 +98,29 @@ def _debug_log_process_boot():
         proc_name = multiprocessing.current_process().name
     except Exception:
         proc_name = "unknown"
+    base_exe = getattr(sys, "_base_executable", None)
     print(
         "[BF-MMBOT boot] "
         f"pid={os.getpid()} "
         f"ppid={os.getppid()} "
         f"exe={sys.executable} "
+        f"base_exe={base_exe} "
         f"proc_name={proc_name} "
         f"argv={sys.argv}",
         flush=True,
     )
+    try:
+        debug_path = REPO_ROOT / "logs/runtime/boot_debug.log"
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        with debug_path.open("a", encoding="utf-8") as fh:
+            fh.write(
+                f"{datetime.now().isoformat()} "
+                f"pid={os.getpid()} ppid={os.getppid()} exe={sys.executable} base_exe={base_exe} "
+                f"proc_name={proc_name} argv={' '.join(sys.argv)} "
+                f"BFMMBOT_TRADE_MAIN={os.environ.get('BFMMBOT_TRADE_MAIN')}\n"
+            )
+    except Exception:
+        pass
 
 def _mutex_name(env_name: str | None, config_path: str) -> str:
     """何をするか：Windows名前付きMutex用の一意な名前を作る"""

@@ -1535,12 +1535,17 @@ def run_live(
                 logger.exception("live: HTTP replay for position failed; aborting startup")
                 raise
 
+            dbg_event_count = 0  # 何をするか：接続後の受信イベントを最初の数件だけログに出すためのカウンタ
             while True:
                 if stop_event.is_set():
                     exit_reason = "signal"
                     break
                 force_reconnect = False
                 for ev in _stream_with_reconnect(product_code, hb_path, stop_event=stop_event):  # 何をするか：WSが切れても自動再接続しながらイベントを処理（停止フラグも監視）
+                    try:
+                        logger.info(f"live_loop recv ev channel={ev.get('channel')}")
+                    except Exception:
+                        logger.info(f"live_loop recv ev={ev}")
                     now = _now_utc()  # 何をするか：UTCの現在時刻
                     if throttle_until and now >= throttle_until:
                         throttle_until = None  # 何をするか：クールダウンが明けたら解除
@@ -1592,6 +1597,45 @@ def run_live(
                         )
                         continue
 
+                    # まずイベント内容をローカル板に反映（板が空のまま no_snapshot 判定になるのを防ぐ）
+                    if dbg_event_count < 5:
+                        logger.info(f"recv_event channel={ev.get('channel')} keys={list(ev.keys())}")
+                        dbg_event_count += 1
+
+                    ob.update_from_event(ev)  # 何をするか：ローカル板にイベントを反映（例外はそのまま吐く）
+                    try:
+                        logger.info(f"after_update channel={ev.get('channel')} best_bid={getattr(ob,'best_bid',None)} best_ask={getattr(ob,'best_ask',None)}")
+                    except Exception:
+                        pass
+                    last_ev_at = now  # 何をするか：イベント受信時刻を必ず更新（stale判定の基準）
+
+                    ch = str(ev.get("channel", "")).lower()
+                    if "board_snapshot" in ch:
+                        snapshot_seen = True
+
+                    bid = _best_px(getattr(ob, "best_bid", None))  # 何をするか：オブジェクト/辞書/数値を価格(float)に正規化
+                    ask = _best_px(getattr(ob, "best_ask", None))  # 何をするか：同上
+                    has_book = (bid is not None) and (ask is not None) and (ask > bid)
+
+                    # 受信した値を毎回ログ（診断優先）
+                    if ch.startswith("lightning_board"):
+                        logger.info(f"board_event channel={ch} bid={bid} ask={ask} has_book={has_book} snapshot_seen={snapshot_seen}")
+
+                    # board系イベントが来た時点でスナップショット取得済みとみなす（暫定で強制）
+                    if ch.startswith("lightning_board"):
+                        snapshot_seen = True
+
+                    try:
+                        dbg_seen = getattr(ob, "_dbg_seen", 0)
+                    except Exception:
+                        dbg_seen = 0
+                    if dbg_seen < 3:
+                        logger.debug(f"board_event channel={ch} bid={bid} ask={ask} has_book={has_book} snapshot_seen={snapshot_seen}")
+                        try:
+                            setattr(ob, "_dbg_seen", dbg_seen + 1)
+                        except Exception:
+                            pass
+
                     # 何をするか：現在の窓状態を判定（メンテ／Funding計算・授受のどれかでもTrue）
                     maint_now = _in_maintenance(now, cfg)
                     if maint_now:  # 何をするか：メンテ窓の間は新規発注を止める
@@ -1604,7 +1648,6 @@ def run_live(
                         _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="funding")
                         continue  # 何をするか：この周回は新規パートへ進まない
 
-
                     # 何をするか：窓の“出入り”を検知してCSVに1行追記（enter/exit）
                     if (maint_prev is not None) and (maint_now != maint_prev):
                         _csv_event_write(maint_csv, {"ts": now.isoformat(), "event": ("enter" if maint_now else "exit")})
@@ -1614,25 +1657,42 @@ def run_live(
                     # 何をするか：次回の比較用に前回状態を更新
                     maint_prev, fund_prev = maint_now, fund_now
 
-                    # 何をするか：接続直後の一定期間はstale/bad_bookを判定しない
+                    # 何をするか：接続直後の一定期間はstale/bad_bookを判定しない（ただし板は更新済みなので状態は進む）
                     if connection_started_at and (now - connection_started_at).total_seconds() < warmup_guard_s:
                         bad_book_since = None
                         stale_since = None
-                        last_ev_at = now
                         continue
 
-                    if stale_ms and (now - last_ev_at).total_seconds() * 1000.0 >= stale_ms:  # 何をするか：前回イベントからの空白が長すぎたら新規停止
+                    # 何をするか：スナップショット未取得の間は bad_book/stale を判定しない（一定時間で強制再接続）
+                    has_bid = _best_px(getattr(ob, "best_bid", None)) is not None
+                    has_ask = _best_px(getattr(ob, "best_ask", None)) is not None
+                    if not snapshot_seen:
+                        bid_tmp = _best_px(getattr(ob, "best_bid", None))
+                        ask_tmp = _best_px(getattr(ob, "best_ask", None))
+                        if has_bid and has_ask and ask_tmp is not None and bid_tmp is not None and ask_tmp > bid_tmp:
+                            snapshot_seen = True
+                        else:
+                            bad_book_since = None
+                            stale_since = None
+                            if board_reconnect_after_s > 0.0 and connection_started_at and (now - connection_started_at).total_seconds() >= board_reconnect_after_s:
+                                logger.warning(f"live: no_snapshot_yet persisted {int((now - connection_started_at).total_seconds())}s → reconnect board stream")
+                                _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="board_reconnect_no_snapshot", duration_s=int((now - connection_started_at).total_seconds()))
+                                force_reconnect = True
+                                break
+                            continue
+
+                    # stale_data 判定：スナップショット取得前は判定しない
+                    if stale_ms and (now - last_ev_at).total_seconds() * 1000.0 >= stale_ms:
                         if stale_since is None:
                             stale_since = now
                         logger.debug(f"pause: stale_data gap={int((now - last_ev_at).total_seconds()*1000)}ms ? {stale_ms}ms")
-                        _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="stale_data")  # 何をするか：心拍に停止理由を記録
+                        _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="stale_data")
                         if board_reconnect_after_s > 0.0 and (now - stale_since).total_seconds() >= board_reconnect_after_s:
                             logger.warning(f"live: stale_data persisted {int((now - stale_since).total_seconds())}s → reconnect board stream")
                             _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="board_reconnect_stale", gap_ms=int((now - last_ev_at).total_seconds() * 1000), duration_s=int((now - stale_since).total_seconds()))
                             force_reconnect = True
                             break
-                        last_ev_at = now  # 何をするか：連続通知を避けるため基準を更新
-                        continue  # 何をするか：この周回は新規発注パートへ進まない
+                        continue
                     else:
                         stale_since = None
 
@@ -1646,51 +1706,8 @@ def run_live(
                         exit_reason = "signal"
                         _hb_write(hb_path, event="kill", ts=now.isoformat(), daily_pnl_jpy=daily_R, dd_jpy=R_HWM - daily_R, reason="signal")  # 何をするか：停止を1行JSONで記録
                         break  # 何をするか：イベントループを終了
-                    
+
                     # Canary 停止は (not dry_run) and canary_m の判定に統一
-
-                    ob.update_from_event(ev)  # 何をするか：ローカル板にイベントを反映
-                    # 何をするか：スナップショットを受信したらフラグを立てる（差分のみの場合も最低一度は受信するまで待つ）
-                    if not snapshot_seen:
-                        try:
-                            if getattr(ob, "best_bid", None) is not None or getattr(ob, "best_ask", None) is not None:
-                                snapshot_seen = True
-                        except Exception:
-                            snapshot_seen = False
-                    # 何をするか：WS接続直後/再接続直後の板充填猶予中はbad_book/stale判定をスキップ
-                    if (book_warmup_until and now < book_warmup_until) or not snapshot_seen:
-                        bad_book_since = None
-                        stale_since = None
-                        last_ev_at = now
-                        continue
-                    bid = _best_px(getattr(ob, "best_bid", None))  # 何をするか：オブジェクト/辞書/数値を価格(float)に正規化
-                    ask = _best_px(getattr(ob, "best_ask", None))  # 何をするか：同上
-                    if (bid is None) or (ask is None) or (ask <= bid):  # 何をするか：片側欠落 or 反転板を検知（float同士の比較）
-
-                        if bad_book_since is None:
-                            bad_book_since = now
-                        duration_bad = (now - bad_book_since).total_seconds()
-                        logger.debug("pause: bad_book (missing side or ask<=bid)")  # 何をするか：理由をrun.logに記録
-                        _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="bad_book", duration_s=int(duration_bad))  # 何をするか：心拍に停止を記録
-                        if board_reconnect_after_s > 0.0 and duration_bad >= board_reconnect_after_s:
-                            logger.warning(f"live: bad_book persisted {int(duration_bad)}s → reconnect board stream")
-                            _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="board_reconnect_bad_book", duration_s=int(duration_bad))
-                            force_reconnect = True
-                            break
-                        continue  # 何をするか：この周回は新規発注パートへ進まない
-                    bad_book_since = None
-
-                    # 何をするか：best_ask と best_bid のスプレッド(bp)がしきい値以上なら、その周回は新規発注を止める
-                    if max_spread_bp is not None:
-                        bid = _best_px(getattr(ob, "best_bid", None))
-                        ask = _best_px(getattr(ob, "best_ask", None))
-
-                        if (bid is not None) and (ask is not None) and (ask > bid) and (bid > 0):
-                            spread_bp = ((ask - bid) / ((ask + bid) / 2.0)) * 10000.0
-                            if spread_bp >= float(max_spread_bp):
-                                logger.debug(f"pause: wide_spread {spread_bp:.1f}bp ? {float(max_spread_bp)}bp")  # 何をするか：理由をrun.logに記録
-                                _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="wide_spread", spread_bp=spread_bp)  # 何をするか：心拍にも停止を記録
-                                continue  # 何をするか：この周回は新規発注パートに進まない
 
                     # 何をするか：30秒間のミッド価格変化(bp)がしきい値以上なら、その周回は新規発注を止める
                     if max_bp is not None:

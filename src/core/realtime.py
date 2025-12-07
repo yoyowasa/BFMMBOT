@@ -72,6 +72,7 @@ async def event_stream(
                 for ch in channels:
                     await ws.send(_subscribe_msg(ch))
                     logger.info(f"subscribed: {ch}")
+                logger.info(f"ws_connected product={product_code} channels={list(channels)}")
                 # 接続・購読が成功したことを上位へ通知
                 yield {
                     "ts": _now_iso_utc(),
@@ -98,6 +99,14 @@ async def event_stream(
                     params = msg.get("params") or {}
                     ch = params.get("channel")
                     payload = params.get("message")
+
+                    # 何をするか：最初の数件だけ受信内容をINFOログ（診断用）
+                    try:
+                        event_stream._dbg_seen += 1  # type: ignore[attr-defined]
+                    except Exception:
+                        event_stream._dbg_seen = 1  # type: ignore[attr-defined]
+                    if getattr(event_stream, "_dbg_seen", 0) <= 3:
+                        logger.info(f"ws_recv channel={ch} payload_type={type(payload)} keys={list(payload.keys()) if isinstance(payload, dict) else 'n/a'}")
 
                     # executions は配列メッセージ（id重複の可能性あり）
                     if ch and ch.startswith("lightning_executions_") and isinstance(payload, list):
@@ -164,10 +173,17 @@ def stream_events(product_code: str = "FX_BTC_JPY", channels: Iterable[str] | No
     th = threading.Thread(target=_run_loop, daemon=True)  # 何をするか：バックグラウンドでasyncを回す
     th.start()
 
+    dbg_emit = 0
     while True:
         item = q.get()  # 何をするか：キューから順に取り出して同期forの呼び出し側へ渡す
         if item is _STOP:
             break
+        if dbg_emit < 5:
+            try:
+                logger.info(f"stream_yield channel={item.get('channel')} keys={list(item.keys())}")
+            except Exception:
+                logger.info(f"stream_yield item={item}")
+            dbg_emit += 1
         if throttle_ms:
             now = time.monotonic() * 1000.0
             if (now - _last_emit[0]) < float(throttle_ms):
