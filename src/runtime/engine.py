@@ -34,6 +34,7 @@ from src.core.utils import monotonic_ms
 from src.core.risk import cap_order_size_by_inventory  # 在庫と上限に基づき新規サイズを安全側へ切り下げる
 from src.core.risk import inv_capping_preflight  # 在庫前処理（ログ: headroom/shrink/no_room を一元管理）
 from src.core.orders import Order  # Reduce-Only+IOCの仕様とOrder
+from src.core.position_replay import http_replay_for_position  # HTTP約定リプレイでQ/A/R/Fの欠損を埋める関数
 
 _CORR_MAP_MAX = 8192  # 何をするか：client_order_id→corr_id の保持件数上限
 _coid_to_corr: OrderedDict[str, str] = OrderedDict()  # 何をするか：corr参照用のLRUマップ
@@ -262,6 +263,16 @@ class PaperEngine:
         jst_midnight = jst_now.replace(hour=0, minute=0, second=0, microsecond=0)
         self._day_start_utc = jst_midnight.astimezone(timezone.utc)  # 【関数】当日JST 0時（UTC）
         self._daily_R, self._R_HWM = 0.0, 0.0  # 【関数】日次PnLとそのHWM（DD計算に使用）
+
+    async def _http_replay_position(self) -> None:
+        # この関数は「WSが再接続したあとにHTTPで自分の約定履歴を取り寄せて、
+        # position が覚えている last_fill_id 以降の Q/A/R/F の“穴”をまとめて埋める」係です。
+        # 実際のバリアID→HTTPリプレイ→適用のロジックは core.position_replay 側にまとめてあります。
+        await http_replay_for_position(
+            exchange=self.exchange,        # 取引所へのHTTPクライアント（Engineが持っている想定）
+            product_code=getattr(self, "product", getattr(self, "product_code", None)),  # このEngineが扱っている銘柄
+            position=self.position,        # Q/A/R/Fとlast_fill_idを持っているポジションオブジェクト
+        )
 
     def _ts_jst(self, dt: datetime) -> str:
         """ログ用のJST ISO文字列を返す（タイムゾーン未指定ならUTC扱い）。"""
@@ -516,6 +527,50 @@ class PaperEngine:
         if s in ("buy", "sell"):
             return s
         return None
+
+    def _gate_key_from_tag(self, tag: str | None) -> str:
+        """コード内でcorr付きタグを基底キーに畳み込む"""
+        if not tag:
+            return ""
+        parts = [p for p in str(tag).split("|") if p and not str(p).startswith("corr:")]
+        return parts[0] if parts else ""
+
+    def _inflight_snapshot(
+        self,
+        *,
+        side: str | None = None,
+        ignore_reduce_only: bool = True,
+    ) -> tuple[int, float, dict[str, int]]:
+        """未約定注文の本数・数量・キー別本数を集計する（同一サイドのみ）"""
+        orders = getattr(self, "sim", None)
+        opens = getattr(orders, "open", []) if orders is not None else []
+        total_count = 0
+        total_qty = 0.0
+        per_key: dict[str, int] = {}
+        side_norm = self._normalize_side(side) if side is not None else None
+        for o in opens or []:
+            if o is None:
+                continue
+            if side_norm is not None and self._normalize_side(getattr(o, "side", None)) != side_norm:
+                continue
+            try:
+                qty = float(getattr(o, "remaining", getattr(o, "size", 0.0)) or 0.0)
+            except Exception:
+                qty = 0.0
+            if qty <= 0:
+                continue
+            try:
+                reduces_pos = self.would_reduce_inventory(self.Q, getattr(o, "side", None), qty)
+            except Exception:
+                reduces_pos = False
+            is_reduce = bool(getattr(o, "reduce_only", False) or getattr(o, "close_only", False) or reduces_pos)
+            if ignore_reduce_only and is_reduce:
+                continue
+            total_count += 1
+            total_qty += abs(qty)
+            key = self._gate_key_from_tag(getattr(o, "tag", None))
+            per_key[key] = per_key.get(key, 0) + 1
+        return total_count, total_qty, per_key
 
     def now_ms(self) -> int:
         """【関数】戦略から利用する単調増加の現在時刻(ms)。"""
@@ -1751,6 +1806,10 @@ class PaperEngine:
                         self._maybe_auto_reduce(now=monotonic())
 
                     actions = self.strat.evaluate(self.ob, now, self.cfg)
+                    try:
+                        logger.debug(f"engine.debug_actions: total_actions={len(actions) if actions is not None else 0}")
+                    except Exception:
+                        pass
                     feats_win = getattr(getattr(self.cfg, "features", None), "ca_ratio_win_ms", 500)  # 何をする行か：CA比率集計窓(ms)を取得
                     features = {
                         "best_age_ms": self.ob.best_age_ms(now),  # 何をする行か：Best静止時間(ms)を記録
@@ -2044,6 +2103,39 @@ class PaperEngine:
                                     if (not self.risk.market_mode_allows(side=side_val, qty=req_qty)) and not (reduce_only and reduces):
                                         logger.debug("skip place: market_mode close_only")
                                         self._heartbeat(now, "pause", reason="market_mode")
+                                        continue
+                                inflight_limit = _cfg_pick(self.cfg, "orders.max_inflight")
+                                if inflight_limit is None:
+                                    inflight_limit = _cfg_pick(self.cfg, "risk.max_active_orders")
+                                per_key_limit = _cfg_pick(self.cfg, "gate.max_inflight_per_key")
+                                limit_qty_cfg = _cfg_pick(self.cfg, "risk.limit_qty")
+                                try:
+                                    limit_qty_val = float(limit_qty_cfg) if limit_qty_cfg is not None else None
+                                except Exception:
+                                    limit_qty_val = None
+                                inflight_count, inflight_qty, inflight_by_key = self._inflight_snapshot(side=side_val)
+                                gate_key = self._gate_key_from_tag(getattr(o, "tag", None))
+                                is_reduce_order = bool(reduce_only or self.would_reduce_inventory(self.Q, side_val, req_qty))
+                                if inflight_limit is not None and not is_reduce_order:
+                                    try:
+                                        if inflight_count >= int(inflight_limit):
+                                            logger.debug(f"skip place: inflight_guard count={inflight_count} limit={int(inflight_limit)}")
+                                            self._heartbeat(now, "pause", reason="inflight_guard")
+                                            continue
+                                    except Exception:
+                                        pass
+                                if per_key_limit is not None and gate_key and not is_reduce_order:
+                                    try:
+                                        if inflight_by_key.get(gate_key, 0) >= int(per_key_limit):
+                                            logger.debug(f"skip place: inflight_guard key={gate_key} count={inflight_by_key.get(gate_key, 0)} limit={int(per_key_limit)}")
+                                            self._heartbeat(now, "pause", reason="inflight_guard")
+                                            continue
+                                    except Exception:
+                                        pass
+                                if limit_qty_val is not None and not is_reduce_order:
+                                    if (inflight_qty + abs(req_qty)) > limit_qty_val:
+                                        logger.debug(f"skip place: inflight_guard qty={inflight_qty + abs(req_qty):.6f} limit={limit_qty_val}")
+                                        self._heartbeat(now, "pause", reason="inflight_guard")
                                         continue
                                 self.sim.place(o, now)
                                 corr_for_log = _coid_to_corr.get(

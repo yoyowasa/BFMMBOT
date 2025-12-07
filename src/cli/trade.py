@@ -5,7 +5,11 @@ from __future__ import annotations
 
 import argparse  # 引数処理
 import asyncio  # 非同期ランタイム
+import os  # プロセスID取得やロックファイル用
+import sys  # コマンドライン表示用
+import hashlib  # ロック名ハッシュ化
 from collections.abc import Mapping, Sequence  # 何をするか：設定のdictアクセスを許可
+from datetime import datetime  # ロックファイルに時刻を書く
 from typing import List
 from loguru import logger  # 実行ログ
 try:
@@ -17,6 +21,70 @@ except Exception:
 
 from pathlib import Path  # run.log の保存先を扱う
 from zoneinfo import ZoneInfo  # ログ時刻をJSTに固定する
+try:
+    import msvcrt as _MSVCRT  # Windows用ロック
+except Exception:
+    _MSVCRT = None
+try:
+    import fcntl as _FCNTL  # Unix用ロック
+except Exception:
+    _FCNTL = None
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# この関数は「どの python.exe から起動されているか」を確認して、
+# 想定外（.venv ではなく system Python）からの二重起動であれば、
+# すぐに静かに終了するためのガードです。
+def _ensure_venv_python_or_exit() -> None:
+    """プロジェクト直下の .venv の python 以外からの起動なら、すぐに終了する。"""
+    # src/cli/trade.py から2つ上がプロジェクトルート（E:\BF-MMBOT を想定）
+    project_root = Path(__file__).resolve().parents[2]
+
+    # Windows の .venv/Scripts/python.exe を想定したパス
+    venv_python = (project_root / ".venv" / "Scripts" / "python.exe").resolve()
+
+    # 今このプロセスで動いている python.exe のフルパス
+    current_python = Path(sys.executable).resolve()
+
+    # venv判定（sys.prefix と sys.base_prefix が同じなら system Python）
+    in_venv = sys.prefix != sys.base_prefix
+
+    # Windows かつ .venv の python.exe が存在するときだけチェックする
+    if sys.platform.startswith("win") and venv_python.exists():
+        # .venv の python ではなく、別の python.exe から起動されているなら
+        # あるいは venv で起動されていないなら
+        if (not in_venv) or (current_python != venv_python):
+            # ここが「system Python から -m src.cli.trade が呼ばれた」ケースに当たる
+            # エラーレベルは 0 にしておく（あくまで余計な子プロセスを静かに終わらせるだけ）
+            print(
+                f"[BF-MMBOT guard] unexpected python executable: {current_python} "
+                f"(expected .venv python at {venv_python}). exit this extra process.",
+                file=sys.stderr,
+            )
+            sys.exit(0)
+
+def _debug_log_process_boot():
+    """プロセス起動時に、一度だけPIDなどを表示して多重起動や子プロセスかどうかを確認するための関数。"""
+    try:
+        import multiprocessing  # この関数内だけで使用（起動元が子プロセスかを見るため）
+        proc_name = multiprocessing.current_process().name
+    except Exception:
+        proc_name = "unknown"
+    print(
+        "[BF-MMBOT boot] "
+        f"pid={os.getpid()} "
+        f"ppid={os.getppid()} "
+        f"exe={sys.executable} "
+        f"proc_name={proc_name} "
+        f"argv={sys.argv}",
+        flush=True,
+    )
+
+def _mutex_name(env_name: str | None, config_path: str) -> str:
+    """何をするか：Windows名前付きMutex用の一意な名前を作る"""
+    base = f"{env_name or 'unknown'}|{Path(config_path).resolve()}"
+    h = hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return f"Global\\BFMMBOT_{h}"
 
 
 def _cfg_get(obj, key: str, default):
@@ -90,6 +158,169 @@ def _force_jst_logger() -> None:
             pass
     logger.configure(patcher=_patch)
 
+def _lock_path(config_path: str, env_name: str | None) -> Path:
+    """何をするか：env＋config名でロックファイルパスを決める"""
+    safe_env = (env_name or "unknown").replace("/", "_").replace("\\", "_")
+    cfg_stem = Path(config_path).name.replace(".", "_").replace(" ", "_")
+    return REPO_ROOT / "logs/runtime" / f"trade_{safe_env}_{cfg_stem}.lock"
+
+def _acquire_file_lock(lock_path: Path):
+    """何をするか：ファイルロックを非ブロッキング取得する。取れなければ None を返す"""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = lock_path.open("a+")
+    try:
+        fh.seek(0)
+        fh.write("0")  # locking の長さ確保
+        fh.flush()
+        fh.seek(0)
+        if _MSVCRT is not None:
+            try:
+                _MSVCRT.locking(fh.fileno(), _MSVCRT.LK_NBLCK, 1)
+            except OSError:
+                fh.close()
+                return None
+        elif _FCNTL is not None:
+            try:
+                _FCNTL.flock(fh, _FCNTL.LOCK_EX | _FCNTL.LOCK_NB)
+            except OSError:
+                fh.close()
+                return None
+        else:
+            # どちらも無い環境ではロックできないので諦めて None
+            fh.close()
+            return None
+        # ここまで来ればロック確保済み。情報を書き出して保持する
+        fh.seek(0)
+        fh.truncate()
+        fh.write(
+            f"pid={os.getpid()} started={datetime.now().isoformat()} cmd={' '.join(sys.argv)}\n"
+        )
+        fh.flush()
+        return fh
+    except Exception:
+        try:
+            fh.close()
+        except Exception:
+            pass
+        raise
+
+def _release_file_lock(fh) -> None:
+    """何をするか：ファイルロックを解除してファイルも掃除する"""
+    if fh is None:
+        return
+    try:
+        if _MSVCRT is not None:
+            try:
+                _MSVCRT.locking(fh.fileno(), _MSVCRT.LK_UNLCK, 1)
+            except Exception:
+                pass
+        elif _FCNTL is not None:
+            try:
+                _FCNTL.flock(fh, _FCNTL.LOCK_UN)
+            except Exception:
+                pass
+        path = None
+        try:
+            path = Path(fh.name)
+        except Exception:
+            path = None
+        try:
+            fh.close()
+        finally:
+            if path:
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+def _acquire_windows_mutex(env_name: str | None, config_path: str):
+    """何をするか：Windows名前付きMutexを非ブロッキング取得する。取れなければ None"""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes  # 遅延import（環境によっては無い場合がある）
+        from ctypes import wintypes
+    except Exception:
+        return None
+    name = _mutex_name(env_name, config_path)
+    try:
+        kernel = ctypes.windll.kernel32
+        kernel.SetLastError(0)
+        handle = kernel.CreateMutexW(ctypes.c_void_p(None), True, wintypes.LPCWSTR(name))
+        if not handle:
+            return None
+        ERROR_ALREADY_EXISTS = 183
+        last_err = kernel.GetLastError()
+        if last_err == ERROR_ALREADY_EXISTS:
+            # 既に他プロセスが保持
+            kernel.ReleaseMutex(handle)
+            kernel.CloseHandle(handle)
+            return None
+        return handle
+    except Exception:
+        return None
+
+def _release_windows_mutex(handle) -> None:
+    """何をするか：Windows Mutexの解放"""
+    if os.name != "nt" or handle is None:
+        return
+    try:
+        import ctypes
+    except Exception:
+        return
+    try:
+        kernel = ctypes.windll.kernel32
+        kernel.ReleaseMutex(handle)
+        kernel.CloseHandle(handle)
+    except Exception:
+        pass
+
+def _acquire_singleton_lock(lock_path: Path, env_name: str | None, config_path: str):
+    """何をするか：多重起動を避けるロックを取得（WindowsはMutex優先）"""
+    mutex_handle = _acquire_windows_mutex(env_name, config_path)
+    if os.name == "nt" and mutex_handle is None:
+        return None
+    fh = _acquire_file_lock(lock_path)
+    if fh is None:
+        _release_windows_mutex(mutex_handle)
+        return None
+    return (fh, mutex_handle)
+
+def _release_singleton_lock(lock_obj) -> None:
+    """何をするか：取得したロック（Mutex＋ファイル）を解除する"""
+    if not lock_obj:
+        return
+    fh, mutex_handle = lock_obj
+    _release_file_lock(fh)
+    _release_windows_mutex(mutex_handle)
+
+def _ensure_running_from_project_venv() -> None:
+    """何をするか：プロジェクト直下の .venv の python 以外から呼ばれたら即終了する"""
+    exe_path = Path(sys.executable).resolve()
+    project_root = Path(__file__).resolve().parents[2]  # .../src/cli/trade.py から2階層上がプロジェクトルート想定
+
+    windows_venv_python = project_root / ".venv" / "Scripts" / "python.exe"
+    posix_venv_python = project_root / ".venv" / "bin" / "python"
+
+    expected_python = None
+    if windows_venv_python.exists():
+        expected_python = windows_venv_python.resolve()
+    elif posix_venv_python.exists():
+        expected_python = posix_venv_python.resolve()
+    else:
+        # .venv 自体が無い環境ではチェックしない（従来どおり継続）
+        return
+
+    if exe_path != expected_python:
+        print(
+            "[BF-MMBOT] この trade CLI はプロジェクト直下の .venv の python からのみ起動してください。\n"
+            f"  期待している python: {expected_python}\n"
+            f"  現在の python: {exe_path}"
+        )
+        sys.exit(1)
+
 from src.core.utils import load_config  # 【関数】設定ローダー（base＋上書き）:contentReference[oaicite:12]{index=12}
 from src.runtime.engine import PaperEngine  # 【関数】paperエンジン（本ステップ）
 try:
@@ -127,10 +358,23 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     """【関数】エントリ：設定を読み、paperエンジンを走らせる"""
+    _debug_log_process_boot()  # 起動ごとにPID/PPID/argvを出力し、多重起動や親子関係を調べる
+    _ensure_running_from_project_venv()  # 何をするか：.venv 以外の python から起動されていないかを先に確認
     load_dotenv(find_dotenv())  # 何をするか：プロジェクト直下の .env を読み込んでから run_live を呼ぶ
     _force_jst_logger()  # 何をするか：loguru出力をJST表記に統一する
     args = _parse_args()
     cfg = load_config(args.config, env=args.env)
+    lock_handle = None
+    lock = _lock_path(args.config, getattr(cfg, "env", None))
+    lock_handle = _acquire_singleton_lock(lock, getattr(cfg, "env", None), args.config)
+    if lock_handle is None:
+        existing = ""
+        try:
+            existing = lock.read_text(errors="ignore").strip()
+        except Exception:
+            existing = ""
+        logger.error(f"別プロセスが実行中のため開始しません lock={lock} info='{existing}'")
+        raise SystemExit(1)
     strategy_cfg = _cfg_get(cfg, "strategy_cfg", None)
 
     raw_cli = getattr(args, "strategy", None)
@@ -248,8 +492,13 @@ def main() -> None:
             except KeyboardInterrupt:
                 pass
     finally:
+        _release_singleton_lock(lock_handle)
         for sink_id in sink_ids:
             logger.remove(sink_id)
 
 if __name__ == "__main__":
+    # これは「.venv の python 以外から src.cli.trade が起動されたらすぐ終了する」ガードです。
+    _ensure_venv_python_or_exit()
+
+    # ここから先は、.venv の python.exe から起動されたプロセスだけが実行されます。
     main()

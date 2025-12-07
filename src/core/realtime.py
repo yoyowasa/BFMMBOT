@@ -24,6 +24,7 @@ import threading         # 何をするか：asyncストリームをバックグ
 
 
 _WS_URL = "wss://ws.lightstream.bitflyer.com/json-rpc"  # Lightning WS（文書の購読先）:contentReference[oaicite:5]{index=5}
+_WS_BACKOFF_MAX = 30.0  # WS再接続時のバックオフ上限（秒）
 
 def _subscribe_msg(channel: str) -> str:
     """【関数】購読メッセージ作成：JSON-RPC 2.0のsubscribeを作る（最小）"""
@@ -50,7 +51,7 @@ async def event_stream(
         )
 
     backoff = 1.0  # 秒（指数的に増やすが上限あり）
-    max_backoff = 30.0
+    max_backoff = _WS_BACKOFF_MAX
     seen_exec_ids: set[int] = set()  # 重複排除（最小）
 
     while True:
@@ -71,6 +72,13 @@ async def event_stream(
                 for ch in channels:
                     await ws.send(_subscribe_msg(ch))
                     logger.info(f"subscribed: {ch}")
+                # 接続・購読が成功したことを上位へ通知
+                yield {
+                    "ts": _now_iso_utc(),
+                    "channel": "__ws_status__",
+                    "event": "ws_connected",
+                    "source": "bitflyer_ws",
+                }
 
                 backoff = 1.0  # 成功したらバックオフをリセット
 
@@ -118,12 +126,21 @@ async def event_stream(
             logger.warning(f"WS error: {e!r} (reconnect in {backoff:.1f}s)")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2.0, max_backoff)
+            # 上位へ再接続通知（エラー詳細付き）
+            yield {
+                "ts": _now_iso_utc(),
+                "channel": "__ws_status__",
+                "event": "ws_error",
+                "detail": repr(e),
+                "source": "bitflyer_ws",
+            }
             continue
 
-def stream_events(product_code: str = "FX_BTC_JPY", channels: Iterable[str] | None = None):
+def stream_events(product_code: str = "FX_BTC_JPY", channels: Iterable[str] | None = None, *, throttle_ms: float | None = None):
     """何をする関数か：asyncな event_stream(...) をバックグラウンドで動かし、同期forで使えるようにするブリッジ"""
     q: Queue = Queue(maxsize=1024)  # 何をするか：イベント受け渡し用のキュー
     _STOP = object()                # 何をするか：終了の合図
+    _last_emit: list[float] = [0.0]  # 何をするか：直近emit時刻（time.monotonic）を1要素リストで閉包に持たせる
 
     async def _runner():
         """何をするか：asyncのevent_streamから受けたイベントを順次キューへ入れる"""
@@ -151,4 +168,9 @@ def stream_events(product_code: str = "FX_BTC_JPY", channels: Iterable[str] | No
         item = q.get()  # 何をするか：キューから順に取り出して同期forの呼び出し側へ渡す
         if item is _STOP:
             break
+        if throttle_ms:
+            now = time.monotonic() * 1000.0
+            if (now - _last_emit[0]) < float(throttle_ms):
+                continue
+            _last_emit[0] = now
         yield item

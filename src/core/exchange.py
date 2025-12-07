@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio  # syncな呼び出しを非同期で使うときに to_thread で逃がす
 import hashlib  # 署名（HMAC-SHA256）に使う
 import hmac     # 署名（HMAC-SHA256）に使う
 import httpx    # HTTPクライアント（Poetry依存に含まれる）
@@ -197,6 +198,17 @@ class BitflyerExchange:
         )
         return data["child_order_acceptance_id"]
 
+    async def fetch_my_executions(self, product_code, after=None, count=500):
+        # この関数は HTTP で「自分の約定履歴」をまとめて取得する係です。
+        # 後でポジション自炊の整合チェックや HTTP リプレイで使います。
+        params = {"product_code": product_code, "count": count}
+        # after に「この約定IDより後」という境界を渡せるようにしています（None のときは最新から）。
+        if after is not None:
+            params["after"] = after
+        # self._request は、すでに sendchildorder などで使っている
+        # 「bitFlyer の private API を叩く共通関数」を想定しています。
+        return await asyncio.to_thread(self._request, "GET", "/v1/me/getexecutions", params=params)
+
     def place_ioc_reduce_only(
         self,
         side: str,
@@ -259,6 +271,24 @@ class BitflyerExchange:
             pass
 
         return data.get("child_order_acceptance_id") or ""
+
+    def get_executions(
+        self,
+        *,
+        after: int | None = None,
+        before: int | None = None,
+        count: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """約定履歴（自口座）を取得する。after/before は execution id。"""
+        params: Dict[str, Any] = {"product_code": self.product_code, "count": count}
+        if after is not None:
+            params["after"] = int(after)
+        if before is not None:
+            params["before"] = int(before)
+        data = self._request("GET", "/v1/me/getexecutions", params=params)
+        if not isinstance(data, list):
+            return []
+        return data
 
     def cancel_child_order(
         self,

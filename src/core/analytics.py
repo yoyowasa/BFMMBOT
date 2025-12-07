@@ -8,6 +8,7 @@ import polars as pl  # Parquet I/O
 import orjson  # features_json 直列化
 from loguru import logger  # ログ
 from datetime import datetime, timezone, timedelta  # JSTタグ
+from zoneinfo import ZoneInfo  # JST固定の現在時刻
 
 # ---- NDJSON ローテ（20MB + 日次） ----
 _NDJSON_LIMIT_BYTES_DEFAULT = 20 * 1024 * 1024
@@ -16,7 +17,7 @@ def _jst_tag_from_iso(ts: str) -> str:
     try:
         dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
     except Exception:
-        dt = datetime.now(timezone.utc)
+        dt = datetime.now(ZoneInfo("Asia/Tokyo"))
     jst = timezone(timedelta(hours=9))
     return dt.astimezone(jst).strftime("%Y%m%d")
 

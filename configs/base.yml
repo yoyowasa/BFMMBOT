@@ -10,12 +10,19 @@ tx:
   min_interval_ms: 1000    # 送信間隔の最小値
   place_dedup_ms: 1000     # 同一内容の短時間重複を抑止
 
+orders:
+  max_inflight: null
+
+gate:
+  max_inflight_per_key: null
+
 size:  # 取引サイズ
   min: 0.001
-  default: 0.01
+  default: 0.001  # デフォルトロットを最小ロットに下げて、必要証拠金を小さくする
 
 risk:  # 上限・非常停止
   max_inventory: 0.05       # 在庫の絶対上限（BTC）
+  limit_qty: null
   inventory_eps: 0.002      # 上限手前の安全マージン
   inv_capping:
     enabled: true
@@ -48,7 +55,7 @@ guard:  # 相場が速いときのブレーキ
     recover_ok_consecutive: 2
     cooldown_sec: 10
   caution:
-    max_order_size: 0.003
+    max_order_size: 0.001
     max_order_rate_per_sec: 2
 
 mode_switch:  # 窓の扱い（メンテ/ファンディング）
@@ -72,8 +79,8 @@ features:  # 戦略の共通しきい値（#1/#2 の主材料）
   min_spread_tick: 1           # 共通: 最低スプレッドtick
   ttl_ms: 900                  # 共通: 注文寿命(ms)
   stall_ttl_ms: 650            # #1: STだけ寿命を短く
-  stall_min_mp_edge_bp: 0.1    # GE1エントリ用の最小MPエッジ(bps)。未満ならスキップ
-  zero_min_mp_edge_bp: 1.0     # スプレッド0時はこのエッジ(bps)未満の逆サイドを出さない
+  stall_min_mp_edge_bp: 0.0
+  zero_min_mp_edge_bp: 0.0
   zero_min_mp_edge_bp_sell: 1.5  # スプレッド0時の売り側MPエッジ下限(bps)。この値未満のsellを止める
   age_ms: 200                  # Age×MP 用滞留時間(ms)
   mp_offset_tick: 1.0          # Micropriceのずらしtick
@@ -144,9 +151,10 @@ env_overrides:
     size:
       default: 0.001
     risk:
-      max_inventory: 0.1
+      max_inventory: 0.001      # 最大建玉を1本分に抑制（0.001 BTC）
+      inventory_eps: 0.0        # 余白なし（0.001ちょうどまで許容）
     guard:
-      max_mid_move_bp_30s: 10
+      max_mid_move_bp_30s: 25  # テスト用に許容幅を25bpへ緩和
       zero_spread:
         suppress_ms: 300       # アルパカスプレッド長期の閾値(ms)超過で新規抑制
         cooldown_ms: 600       # 抑制解除までのクールダウン(ms)

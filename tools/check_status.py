@@ -72,7 +72,8 @@ def check_config(repo: Path) -> None:
         print(f"- {key}: {'OK' if key in s else 'MISSING'}")
     for key in [
         "product_code:", "guard:", "max_stale_ms:", "max_spread_bp:",
-        "risk:", "max_active_orders:", "max_inventory:", "kill:",
+        "orders:", "max_inflight", "gate:", "max_inflight_per_key:",
+        "risk:", "max_active_orders:", "max_inventory:", "limit_qty:", "kill:",
         "mode_switch:", "maintenance:", "funding_calc_jst:", "funding_transfer_lag_hours:",
         "logging:", "rotate_mb:", "size:", "step:", "min:", "default:", "dry_run_max_sec:",
     ]:
