@@ -7,4 +7,4 @@ rem 自分自身が置かれているフォルダに移動する
 cd /d "%~dp0.."
 
 rem 仮想環境(poetry)を使って trade.py を実行する
-poetry run python -m src.cli.trade --config configs/live.yaml --strategy stall_then_strike cancel_add_gate
+poetry run python -m src.cli.trade --config configs/live.yml --strategy stall_then_strike cancel_add_gate

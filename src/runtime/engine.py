@@ -609,6 +609,44 @@ class PaperEngine:
         delta = qty if side_norm == "buy" else -qty
         return abs(current_inventory + delta) <= abs(current_inventory)
 
+    def _inv_brake_filter(self, orders: list["Order"], pos: float) -> list["Order"]:
+        # 【関数】在庫ブレーキ（executor側）：在庫が閾値以上のとき、在庫が増える側の新規注文だけ落として偏りを戻す
+        max_inv_raw = _cfg_pick(getattr(self, "cfg", None), "risk.max_inventory")
+        if max_inv_raw is None:
+            max_inv_raw = getattr(self, "max_inv", None)
+        try:
+            max_inv = float(max_inv_raw)
+        except Exception:
+            return orders
+        brake_ratio = 0.25  # max_inventoryの25%から「増える側」を止めて、canary終了時のpos_beforeを小さく寄せる
+        thr = max_inv * brake_ratio
+
+        # 閾値が無効 or 在庫が小さいうちは何もしない
+        try:
+            pos_val = float(pos)
+        except Exception:
+            pos_val = 0.0
+        if thr <= 0.0 or abs(pos_val) < thr:
+            return orders
+
+        # ロングなら BUY を落とす、ショートなら SELL を落とす（＝増える側だけ止める）
+        blocked = "BUY" if pos_val > 0.0 else "SELL"
+
+        kept: list["Order"] = []
+        for o in orders or []:
+            # side を持たない（cancel等の）オブジェクトが混ざっても壊れないように守る
+            side = getattr(o, "side", None)
+            if side is None:
+                kept.append(o)
+                continue
+
+            if str(side).upper() == blocked:
+                continue
+
+            kept.append(o)
+
+        return kept
+
     # ─────────────────────────────────────────────────────────────
     def _guard_midmove_bp(self, now: datetime) -> bool:
         """【関数】30sのミッド変化(bps)を監視：閾値超ならTrue（新規停止＋全取消）
@@ -2137,6 +2175,10 @@ class PaperEngine:
                                         logger.debug(f"skip place: inflight_guard qty={inflight_qty + abs(req_qty):.6f} limit={limit_qty_val}")
                                         self._heartbeat(now, "pause", reason="inflight_guard")
                                         continue
+                                if not self._inv_brake_filter([o], pos=self.Q):
+                                    logger.debug("skip place: inv_brake")
+                                    self._heartbeat(now, "pause", reason="inv_brake")
+                                    continue
                                 self.sim.place(o, now)
                                 corr_for_log = _coid_to_corr.get(
                                     getattr(o, "client_order_id", ""),

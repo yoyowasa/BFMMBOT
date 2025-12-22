@@ -156,6 +156,8 @@ def _setup_text_logs(cfg, strategy: str) -> list[int]:
     log_cfg = getattr(cfg, "logging", None)
     rotate_mb = _cfg_get(log_cfg, "rotate_mb", 128)
     base_level = _cfg_get(log_cfg, "level", "INFO")
+    # 何をするか：全シンクのフォーマットにPIDを含め、同時起動時に発生源を判別しやすくする
+    fmt_with_pid = "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | pid={process.id} | {name}:{function}:{line} - {message}"
     run_template = _cfg_get(log_cfg, "run_log_template", None)
     strategy_template = _cfg_get(log_cfg, "strategy_log_template", None)
     strategy_level = _cfg_get(log_cfg, "strategy_level", None) or base_level
@@ -176,7 +178,7 @@ def _setup_text_logs(cfg, strategy: str) -> list[int]:
             logger.error(f"log_path_mkdir_failed path={path} err={exc}")
             return
         rotation = f"{int(rotate_mb)} MB"
-        sink_ids.append(logger.add(path, level=level, rotation=rotation, enqueue=True))
+        sink_ids.append(logger.add(path, level=level, rotation=rotation, enqueue=True, format=fmt_with_pid))
         seen_paths.add(key)
 
     resolved_run = _format_log_template(run_template, strategy)

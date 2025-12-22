@@ -46,6 +46,8 @@ async def event_stream(
     """
     if channels is None:
         channels = (
+            # 何をするか：最初にスナップショットを購読して“初期板”を作れるようにする（差分だけだと板が壊れやすい）
+            f"lightning_board_snapshot_{product_code}",
             f"lightning_board_{product_code}",
             f"lightning_executions_{product_code}",
         )

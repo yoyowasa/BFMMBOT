@@ -49,15 +49,75 @@ class OrderBook:
         self._last_best_update_mono = time.monotonic()  # Age起点（単調時計）
         self._best_age_ms = 0.0  # Bestの滞留時間（ms）— 外部へ提供する指標
         self._mid_history: Deque[Tuple[float, float]] = deque()  # ミッド価格履歴（timestamp, mid）
+        self.snapshot_seen = False  # 何をするか：board_snapshot を受けたか（初期化済み判定）
+
+    def reset(self) -> None:
+        """何をする関数か：板状態を初期化（再接続/再同期用）"""
+        self.bids.clear()
+        self.asks.clear()
+        self.best_bid = _BestSide()
+        self.best_ask = _BestSide()
+        self.ca_events.clear()
+        self._last_ts = None
+        self._last_best_bid_px = None
+        self._last_best_ask_px = None
+        self._last_best_update_mono = time.monotonic()
+        self._best_age_ms = 0.0
+        self._mid_history.clear()
+        self.snapshot_seen = False
 
     # ── 【関数】イベント受信→適用（boardチャンネルのみ拾う）
     def update_from_event(self, ev: Dict[str, Any]) -> None:
         ch = (ev or {}).get("channel") or ""
-        if not ch.startswith("lightning_board_"):
+        if not str(ch).startswith("lightning_board_"):
             return
         now = _parse_iso((ev or {}).get("ts", ""))
         msg = (ev or {}).get("message") or {}
+        ch_l = str(ch).lower()
+        if "board_snapshot" in ch_l:
+            self.snapshot_seen = True
+            self.apply_snapshot(now, msg)
+            return
         self.apply_board(now, msg)
+
+    def apply_snapshot(self, now: datetime, message: Dict[str, Any]) -> None:
+        """【関数】board_snapshot を“全置換”として適用する"""
+        self._last_ts = now
+        self.bids.clear()
+        self.asks.clear()
+        self.ca_events.clear()  # 何をするか：スナップショットではC/A窓を復元できないのでリセット
+
+        # 何をするか：スナップショットは price→size を全投入（size<=0は念のため無視）
+        for lv in message.get("bids") or []:
+            try:
+                px = float(lv["price"])
+                sz = float(lv.get("size", 0.0))
+            except Exception:
+                continue
+            if sz > 0.0:
+                self.bids[px] = sz
+
+        for lv in message.get("asks") or []:
+            try:
+                px = float(lv["price"])
+                sz = float(lv.get("size", 0.0))
+            except Exception:
+                continue
+            if sz > 0.0:
+                self.asks[px] = sz
+
+        self._refresh_best("bid", now)
+        self._refresh_best("ask", now)
+
+        # 何をするか：スナップショット直後は“新鮮”扱いにしてAgeをリセット
+        self._last_best_bid_px = self.best_bid.price
+        self._last_best_ask_px = self.best_ask.price
+        self._last_best_update_mono = time.monotonic()
+        self._best_age_ms = 0.0
+
+        if self.best_bid.price is not None and self.best_ask.price is not None:
+            mid = (self.best_bid.price + self.best_ask.price) / 2.0
+            self._mid_history.append((now.timestamp(), mid))
 
     # ── 【関数】board差分を適用（bids/asks の price/size を反映）
     def apply_board(self, now: datetime, message: Dict[str, Any]) -> None:

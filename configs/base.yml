@@ -10,6 +10,11 @@ tx:
   min_interval_ms: 1000    # 送信間隔の最小値
   place_dedup_ms: 1000     # 同一内容の短時間重複を抑止
 
+fees:
+  # bitFlyer Crypto CFD（FX_BTC_JPY相当）の売買手数料は原則「無料」扱い（詳細は bitFlyer公式の手数料ページ参照）
+  # - ここは“売買手数料(commission)”のみ。ファンディング/レバレッジポイント等は別枠。
+  bps: 0.0
+
 orders:
   max_inflight: null
 

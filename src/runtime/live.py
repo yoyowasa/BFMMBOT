@@ -798,6 +798,17 @@ def _gate_key(tag: str | None) -> str:
     parts = [p for p in str(tag).split("|") if p and not str(p).startswith("corr:")]
     return parts[0] if parts else ""
 
+def _tag_matches(order_tag: str | None, query: str | None) -> bool:
+    """何をする関数か：タグ一致を緩く判定（base と base|corr:xxx のような付加情報付きも拾う）。"""
+    if not query:
+        return False
+    if order_tag == query:
+        return True
+    try:
+        return str(order_tag).startswith(f"{query}|")
+    except Exception:
+        return False
+
 def _inflight_state(live_orders: dict[str, dict], *, side: str | None = None) -> tuple[int, float, dict[str, int]]:
     """未約定のエントリー注文だけを本数/数量で集計（同一サイドのみ）"""
     total_count = 0
@@ -1547,6 +1558,13 @@ def run_live(
                     except Exception:
                         logger.info(f"live_loop recv ev={ev}")
                     now = _now_utc()  # 何をするか：UTCの現在時刻
+                    try:
+                        logger.info(
+                            f"trace: loop head force_reconnect={force_reconnect} throttle_until={throttle_until} "
+                            f"throttled={(throttle_until is not None and now < throttle_until)}"
+                        )
+                    except Exception:
+                        pass
                     if throttle_until and now >= throttle_until:
                         throttle_until = None  # 何をするか：クールダウンが明けたら解除
 
@@ -1620,10 +1638,13 @@ def run_live(
                     # 受信した値を毎回ログ（診断優先）
                     if ch.startswith("lightning_board"):
                         logger.info(f"board_event channel={ch} bid={bid} ask={ask} has_book={has_book} snapshot_seen={snapshot_seen}")
-
-                    # board系イベントが来た時点でスナップショット取得済みとみなす（暫定で強制）
-                    if ch.startswith("lightning_board"):
-                        snapshot_seen = True
+                        try:
+                            logger.info(
+                                f"trace: after_update state bid={bid} ask={ask} has_book={has_book} "
+                                f"snapshot_seen={snapshot_seen} maint_prev={maint_prev} fund_prev={fund_prev}"
+                            )
+                        except Exception:
+                            pass
 
                     try:
                         dbg_seen = getattr(ob, "_dbg_seen", 0)
@@ -1636,17 +1657,74 @@ def run_live(
                         except Exception:
                             pass
 
+                    # 以降どのガードで止まるかを追跡するためのトレース
+                    try:
+                        logger.info(
+                            f"trace: pre_guard warmup_guard_s={warmup_guard_s} "
+                            f"connection_started_at={connection_started_at} now={now} "
+                            f"snapshot_seen={snapshot_seen} has_book={has_book}"
+                        )
+                    except Exception:
+                            pass
+
+                    # 何をするか：bid>=ask の逆転板はこのイベントを無視しつつ bad_book_since を進める（一定時間で再接続）
+                    bid_sz = getattr(getattr(ob, "best_bid", None), "size", 0.0) or 0.0
+                    ask_sz = getattr(getattr(ob, "best_ask", None), "size", 0.0) or 0.0
+                    if bid is not None and ask is not None and ask <= bid:
+                        # サイズ0や欠損の場合は逆転扱いにしない（実質的に板欠損として待機）
+                        if bid_sz <= 0 or ask_sz <= 0:
+                            logger.info(
+                                f"skip: inverted_book_zero_size bid={bid} bid_sz={bid_sz} "
+                                f"ask={ask} ask_sz={ask_sz} → wait"
+                            )
+                            stale_since = None
+                            bad_book_since = None
+                            continue
+                        bad_book_since = bad_book_since or now
+                        elapsed_bad = int((now - bad_book_since).total_seconds()) if bad_book_since else 0
+                        logger.info(f"skip: inverted_book bid={bid} ask={ask} elapsed_bad={elapsed_bad}s")
+                        if board_reconnect_after_s > 0.0 and (now - bad_book_since).total_seconds() >= board_reconnect_after_s:
+                            logger.warning(
+                                f"live: inverted_book persisted {int((now - bad_book_since).total_seconds())}s "
+                                f"→ reconnect board stream"
+                            )
+                            _hb_write(
+                                hb_path,
+                                event="pause",
+                                ts=now.isoformat(),
+                                reason="board_reconnect_inverted_book",
+                                duration_s=int((now - bad_book_since).total_seconds()),
+                            )
+                            force_reconnect = True
+                            break
+                        continue
+
                     # 何をするか：現在の窓状態を判定（メンテ／Funding計算・授受のどれかでもTrue）
                     maint_now = _in_maintenance(now, cfg)
+                    try:
+                        logger.info(f"trace: guard_check maint_now={maint_now} fund_now_pending=?")
+                    except Exception:
+                        pass
                     if maint_now:  # 何をするか：メンテ窓の間は新規発注を止める
-                        logger.debug("pause: maintenance window")
+                        logger.info("guard: maintenance window → skip evaluate")
                         _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="maintenance")
                         continue  # 何をするか：この周回は新規パートへ進まない
                     fund_now = (_in_funding_calc(now, cfg) or _in_funding_transfer(now, cfg))  # 何をするか：Funding窓の“現在”を先に計算
                     if fund_now:  # 何をするか：Funding（計算/授受）窓の間は新規発注を止める
-                        logger.debug("pause: funding window")
+                        logger.info("guard: funding window → skip evaluate")
                         _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="funding")
                         continue  # 何をするか：この周回は新規パートへ進まない
+                    else:
+                        try:
+                            logger.info(
+                                f"trace: guard_pass maint_now={maint_now} fund_now={fund_now} snapshot_seen={snapshot_seen} has_book={has_book}"
+                            )
+                        except Exception:
+                            pass
+                    try:
+                        logger.info("trace: before_fills_entry (guard passed)")
+                    except Exception:
+                        pass
 
                     # 何をするか：窓の“出入り”を検知してCSVに1行追記（enter/exit）
                     if (maint_prev is not None) and (maint_now != maint_prev):
@@ -1661,7 +1739,19 @@ def run_live(
                     if connection_started_at and (now - connection_started_at).total_seconds() < warmup_guard_s:
                         bad_book_since = None
                         stale_since = None
+                        logger.info(
+                            f"skip: warmup_guard secs={(now - connection_started_at).total_seconds():.2f} "
+                            f"warmup={warmup_guard_s:.2f} snapshot={snapshot_seen}"
+                        )
                         continue
+                    else:
+                        try:
+                            logger.info(
+                                f"trace: warmup_passed secs={(now - (connection_started_at or now)).total_seconds():.2f} "
+                                f"warmup={warmup_guard_s:.2f} snapshot={snapshot_seen}"
+                            )
+                        except Exception:
+                            pass
 
                     # 何をするか：スナップショット未取得の間は bad_book/stale を判定しない（一定時間で強制再接続）
                     has_bid = _best_px(getattr(ob, "best_bid", None)) is not None
@@ -1679,13 +1769,44 @@ def run_live(
                                 _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="board_reconnect_no_snapshot", duration_s=int((now - connection_started_at).total_seconds()))
                                 force_reconnect = True
                                 break
+                            logger.info(
+                                f"skip: no_snapshot_yet has_bid={has_bid} has_ask={has_ask} "
+                                f"bid_tmp={bid_tmp} ask_tmp={ask_tmp}"
+                            )
                             continue
+
+                    # 何をするか：板が逆転している・欠落している間は評価をスキップし、一定時間続いたら再接続
+                    if not has_book:
+                        if bad_book_since is None:
+                            bad_book_since = now
+                            _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="bad_book")
+                        if board_reconnect_after_s > 0.0 and (now - bad_book_since).total_seconds() >= board_reconnect_after_s:
+                            logger.warning(
+                                f"live: bad_book persisted {int((now - bad_book_since).total_seconds())}s "
+                                f"→ reconnect board stream bid={bid} ask={ask}"
+                            )
+                            _hb_write(
+                                hb_path,
+                                event="pause",
+                                ts=now.isoformat(),
+                                reason="board_reconnect_bad_book",
+                                duration_s=int((now - bad_book_since).total_seconds()),
+                            )
+                            force_reconnect = True
+                            break
+                        logger.info(
+                            f"skip: bad_book has_book={has_book} bid={bid} ask={ask} "
+                            f"elapsed={int((now - bad_book_since).total_seconds())}s"
+                        )
+                        continue
+                    else:
+                        bad_book_since = None
 
                     # stale_data 判定：スナップショット取得前は判定しない
                     if stale_ms and (now - last_ev_at).total_seconds() * 1000.0 >= stale_ms:
                         if stale_since is None:
                             stale_since = now
-                        logger.debug(f"pause: stale_data gap={int((now - last_ev_at).total_seconds()*1000)}ms ? {stale_ms}ms")
+                        logger.info(f"guard: stale_data gap={int((now - last_ev_at).total_seconds()*1000)}ms ? {stale_ms}ms → skip evaluate")
                         _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="stale_data")
                         if board_reconnect_after_s > 0.0 and (now - stale_since).total_seconds() >= board_reconnect_after_s:
                             logger.warning(f"live: stale_data persisted {int((now - stale_since).total_seconds())}s → reconnect board stream")
@@ -1722,7 +1843,7 @@ def run_live(
                         if (base is not None) and (base > 0.0):
                             move_bp = abs((mid - base) / base) * 10000.0
                             if move_bp >= float(max_bp):
-                                logger.debug(f"pause: mid_move {move_bp:.1f}bp ? {float(max_bp)}bp (30s)")  # 何をするか：理由をrun.logに記録
+                                logger.info(f"guard: mid_move {move_bp:.1f}bp ? {float(max_bp)}bp (30s) → skip evaluate")  # 何をするか：理由をrun.logに記録
                                 _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="mid_move", move_bp=move_bp)  # 何をするか：心拍にも停止を記録
                                 continue  # 何をするか：この周回は新規発注パートに進まない
 
@@ -1749,7 +1870,7 @@ def run_live(
                         paused_mid = False
 
                     if paused_mid:  # 何をするか：ミッド変化が大きい間は新規発注を止める
-                        logger.debug(f"pause: midmove_guard Δ30s={bp_30s:.1f}bp ? {float(max_bp)}bp")  # 何をするか：理由をrun.logに記録
+                        logger.info(f"guard: midmove_guard Δ30s={bp_30s:.1f}bp ? {float(max_bp)}bp → skip evaluate")  # 何をするか：理由をrun.logに記録
                         _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="midmove_guard")  # 何をするか：心拍にも停止を記録
                         continue  # 何をするか：この周回は新規発注パートに進まない
 
@@ -1800,10 +1921,25 @@ def run_live(
                             else:
                                 paused_mid = move_bp >= float(max_bp)
                                 if paused_mid:
-                                    logger.debug(f"pause midmove_guard: {move_bp:.1f}bp >= {max_bp}")
+                                    logger.info(f"guard: midmove_guard Δ30s={move_bp:.1f}bp >= {max_bp}bp → skip evaluate")
+
+                    try:
+                        logger.info(
+                            f"trace: pre_eval paused_mid={paused_mid} maint_now={_in_maintenance(now, cfg)} "
+                            f"fund_now={_in_funding_calc(now, cfg) or _in_funding_transfer(now, cfg)} "
+                            f"stop={stop_event.is_set()} live_orders={len(live_orders)}"
+                        )
+                    except Exception:
+                        pass
 
                     # 何をするか：メンテ/ファンディングの“窓”やガード中は新規を出さず整理だけ
                     if paused_mid or _in_maintenance(now, cfg) or _in_funding_calc(now, cfg) or _in_funding_transfer(now, cfg):
+                        try:
+                            logger.info(
+                                f"trace: skip_before_fill reason={'midmove_guard' if paused_mid else ('maintenance' if _in_maintenance(now, cfg) else ('funding' if (_in_funding_calc(now, cfg) or _in_funding_transfer(now, cfg)) else 'pause'))}"
+                            )
+                        except Exception:
+                            pass
                         reason = "midmove_guard" if paused_mid else ("maintenance" if _in_maintenance(now, cfg) else ("funding" if (_in_funding_calc(now, cfg) or _in_funding_transfer(now, cfg)) else "pause"))  # 何をするか：停止理由を決める
                         _hb_write(hb_path, event="pause", ts=now.isoformat(), reason=reason)  # 何をするか：停止を記録
 
@@ -1812,39 +1948,75 @@ def run_live(
                             live_orders.clear()
                         continue  # 何をするか：次のイベントまで待つ
 
+                    try:
+                        logger.info("trace: enter_fill_pipeline")
+                    except Exception:
+                        pass
+
+                    try:
+                        logger.info(f"trace: enter_fill_pipeline_pre_stop stop_event={stop_event.is_set()}")
+                    except Exception:
+                        pass
+
+                    try:
+                        logger.info("[version-check] live.py build mark=ENTER_FILL_PIPELINE")
+                    except Exception:
+                        pass
+
                     if stop_event.is_set():
                         exit_reason = "signal"
                         break
 
                 # 何をするか：fill パイプラインの健全性を監視し、欠損疑いならHTTPバックフィルを試みて在庫系ガードを強める
-                fills_unhealthy = False
-                if fills_stale_after_s > 0.0:
-                    gap_s = None if fills_last_seen is None else (now - fills_last_seen).total_seconds()
-                    has_risk = (abs(float(pnl_state.get("pos", 0.0) or 0.0)) >= float(inventory_eps or 0.0)) or bool(live_orders)
-                    if has_risk and (fills_last_seen is None or (gap_s is not None and gap_s >= fills_stale_after_s)):
-                        fills_unhealthy = True
-                        if fills_unhealthy_since is None:
-                            fills_unhealthy_since = now
-                            _hb_write(
-                                hb_path,
-                                event="pause",
-                                ts=now.isoformat(),
-                                reason="fills_unhealthy",
-                                gap_ms=(None if gap_s is None else int(gap_s * 1000)),
-                                q=float(pnl_state.get("pos", 0.0) or 0.0),
-                                live=len(live_orders),
-                            )
-                            logger.warning("live: fills stream looks stale → switch to caution (skip auto_reduce/new orders)")
-                        # 欠損疑いのときだけHTTPバックフィルを一定間隔で試みる
-                        if (not dry_run) and (
-                            fills_replay_cooldown_s <= 0.0
-                            or fills_last_replay is None
-                            or (now - fills_last_replay).total_seconds() >= fills_replay_cooldown_s
-                        ):
-                            fills_last_replay = now
-                            try:
+                try:
+                    import sys as _sys  # ローカルでstderr出力に使う
+                    _sys.stderr.write("MARK_A\n")
+                    logger.info("trace: PIPELINE_START")
+                    logger.info("trace: MARK_A_LOG")
+                    logger.info("trace: after_enter_fill_pipeline")
+                    logger.info(
+                        f"trace: fills_guard_entry last_seen={fills_last_seen} pos={pnl_state.get('pos', 0.0)} "
+                        f"live_orders={len(live_orders)} throttled={throttled}"
+                    )
+                    logger.info("trace: after_enter_fill_pipeline (post-logging guard)")
+                    logger.info("trace: before_fill_guard_logic")
+                    logger.info("trace: PIPELINE_MARK_LOG")
+
+                    fills_unhealthy = False
+                    if fills_stale_after_s > 0.0:
+                        gap_s = None if fills_last_seen is None else (now - fills_last_seen).total_seconds()
+                        has_risk = (abs(float(pnl_state.get("pos", 0.0) or 0.0)) >= float(inventory_eps or 0.0)) or bool(live_orders)
+                        if has_risk and (fills_last_seen is None or (gap_s is not None and gap_s >= fills_stale_after_s)):
+                            fills_unhealthy = True
+                            if fills_unhealthy_since is None:
+                                fills_unhealthy_since = now
+                                _hb_write(
+                                    hb_path,
+                                    event="pause",
+                                    ts=now.isoformat(),
+                                    reason="fills_unhealthy",
+                                    gap_ms=(None if gap_s is None else int(gap_s * 1000)),
+                                    q=float(pnl_state.get("pos", 0.0) or 0.0),
+                                    live=len(live_orders),
+                                )
+                                logger.warning("live: fills stream looks stale → switch to caution (skip auto_reduce/new orders)")
+                                try:
+                                    logger.info(
+                                        f"trace: fills_unhealthy start gap_s={gap_s} has_risk={has_risk} pos={pnl_state.get('pos', 0.0)} live={len(live_orders)}"
+                                    )
+                                except Exception:
+                                    pass
+                            # 欠損疑いのときだけHTTPバックフィルを一定間隔で試みる
+                            if (not dry_run) and (
+                                fills_replay_cooldown_s <= 0.0
+                                or fills_last_replay is None
+                                or (now - fills_last_replay).total_seconds() >= fills_replay_cooldown_s
+                            ):
+                                logger.info("trace: before_backfill_attempt")
+                                fills_last_replay = now
                                 maint_now = _in_maintenance(now, cfg)
                                 fund_now = (_in_funding_calc(now, cfg) or _in_funding_transfer(now, cfg))
+                                logger.info("trace: BEFORE_FETCH_PULL_DELTAS")
                                 last_exec_id = _backfill_executions(
                                     ex,
                                     last_exec_id=last_exec_id,
@@ -1860,12 +2032,23 @@ def run_live(
                                     hb_path=hb_path,
                                     on_fill_seen=lambda: _mark_fill_seen(_now_utc()),
                                 )
-                            except Exception as e:
-                                logger.warning(f"live: fills backfill attempt failed: {e}")
+                                logger.info("trace: AFTER_FETCH_PULL_DELTAS")
+                                logger.info("trace: after_backfill_attempt")
+                        else:
+                            fills_unhealthy_since = None
                     else:
                         fills_unhealthy_since = None
-                else:
-                    fills_unhealthy_since = None
+                    logger.info("trace: fills_guard_done")
+                    logger.info("trace: PIPELINE_BEFORE_FETCH")
+                except Exception as e:
+                    logger.exception(f"fill_pipeline error: {e}")
+                    continue
+                try:
+                    logger.info(
+                        f"trace: fills_guard_exit fills_unhealthy={fills_unhealthy} since={fills_unhealthy_since} throttled={throttled}"
+                    )
+                except Exception:
+                    pass
 
                 # 何をするか：一定間隔で取引所の建玉（get_positions）とローカル状態を再同期し、ズレを減らす
                 resync_failed = False
@@ -1992,6 +2175,15 @@ def run_live(
 
                 fill_actions: list[dict[str, Any]] = []
                 try:
+                    logger.info(f"trace: before_fills connection_started_at={connection_started_at} now={now}")
+                    logger.info(f"trace: pre_fills throttled={throttled} live={len(live_orders)}")
+                except Exception:
+                    pass
+                try:
+                    logger.info("trace: BEFORE_FETCH_PULL_DELTAS")
+                except Exception:
+                    pass
+                try:
                     fills = [] if throttled else _pull_fill_deltas(ex, live_orders)  # 何をするか：レート制限中はRESTを呼ばない
                 except RateLimitError as e:
                     logger.error(f"live: exchange RateLimit → cooldown: {e}")  # 何をするか：停止せずクールダウンへ切替
@@ -2003,6 +2195,10 @@ def run_live(
                     throttled = True
                     _hb_write(hb_path, event="pause", ts=_now_utc().isoformat(), reason="throttle")  # 何をするか：心拍に“throttle”を記録
                     continue  # 何をするか：haltせず次周回へ
+                try:
+                    logger.info(f"trace: AFTER_FETCH_PULL_DELTAS count={len(fills)} throttled={throttled}")
+                except Exception:
+                    pass
                 for fill in fills:  # 何をするか：done=True なら完了（fill）、False なら部分約定（partial）
                     side = str(fill.get("side", "BUY")).upper()
                     px = float(fill.get("price", 0.0))
@@ -2061,7 +2257,17 @@ def run_live(
                 skip_new_orders = False
                 evaluate_actions: list[dict[str, Any]] = []
 
+                # decision ブロックに入ったことを明示（どこで止まっているかの診断用）
                 try:
+                    logger.info("decision reach: about to check guards and evaluate")
+                except Exception:
+                    pass
+
+                try:
+                    logger.info(
+                        f"decision checkpoint: enter guards q={float(pnl_state.get('pos', 0.0) or 0.0):.4f} "
+                        f"live={len(live_orders)} throttled={throttled} fills_unhealthy={fills_unhealthy}"
+                    )
                     if resync_failed:
                         logger.debug("pause: inventory_resync_failed")
                         skip_new_orders = True
@@ -2072,11 +2278,11 @@ def run_live(
 
                     inv_paused = (eff_inv_limit is not None) and (abs(float(pnl_state.get("pos", 0.0))) >= eff_inv_limit)  # 何をするか：在庫上限に達しているかを判定
                     if inv_paused:
-                        logger.debug(f"pause: inventory guard |Q|={abs(pnl_state.get('pos', 0.0)):.3f} >= {eff_inv_limit}")  # 何をするか：理由をrun.logに記録
+                        logger.info(f"guard: inventory |Q|={abs(pnl_state.get('pos', 0.0)):.3f} >= {eff_inv_limit} → skip new orders")  # 何をするか：理由をrun.logに記録
                         _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="inventory_guard")  # 何をするか：ハートビートに停止を記録
                         skip_new_orders = True
                     elif margin_guard:
-                        logger.debug("pause: margin_guard (recent -205 exceeded limit)")  # 何をするか：run.logに停止理由を記録
+                        logger.info("guard: margin_guard (recent -205 exceeded limit) → skip new orders")  # 何をするか：run.logに停止理由を記録
                         _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="margin_guard", cooldown_s=margin_cooldown_s)  # 何をするか：心拍にも margin_guard を記録
                         # 可能なら Reduce-Only IOC で少しでも在庫を削る
                         if (not dry_run) and (not throttled) and (not fills_unhealthy):
@@ -2105,6 +2311,7 @@ def run_live(
                     else:
                         feats_win = getattr(getattr(cfg, "features", None), "ca_ratio_win_ms", 500)
                         try:
+                            logger.info(f"decision checkpoint: evaluate start summary={summary_name}")
                             t0 = time.perf_counter()  # 何をするか：戦略評価の開始時刻（ms測定）
                             evaluate_actions = strat.evaluate(ob, now, cfg) or []  # 何をするか：None安全化
                         except Exception as e:
@@ -2151,6 +2358,16 @@ def run_live(
                     logger.error(f"strategy evaluate failed: {e}")
                     skip_new_orders = True
 
+                # ここで「なぜこの周回で新規を出さないのか」を明示する診断ログを出す
+                try:
+                    logger.info(
+                        f"decision summary skip_new_orders={skip_new_orders} throttled={throttled} "
+                        f"close_only={close_only_mode} margin_guard={margin_guard} inv_paused={inv_paused} "
+                        f"fills_unhealthy={fills_unhealthy} actions={(len(evaluate_actions) if evaluate_actions is not None else 0)}"
+                    )
+                except Exception:
+                    pass
+
                 if not skip_new_orders and evaluate_actions:
                     try:
                         logger.debug(f"engine.debug_actions: total_actions={len(evaluate_actions) if evaluate_actions is not None else 0}")
@@ -2166,16 +2383,67 @@ def run_live(
                 margin_guard_triggered = False  # 何をするか：-205検知でこの周回の新規発注を止めるフラグ
 
                 for o in actions_to_process or []:
-                    sz = float(_act(o, "size", getattr(getattr(cfg, "size", None), "default", 0.0)) or 0.0)  # 何をするか：dict/object両対応でサイズ取得（未指定ならconfigのdefault）
+                    act_type = str(_act(o, "type", "place") or "place").lower()  # 何をするか：action.type を拾う（無ければplace扱い）
+                    if act_type == "cancel_tag":
+                        tag_query = str(_act(o, "tag", "") or "")
+                        if dry_run:
+                            logger.info(f"live[dry_run]: skip cancel_tag tag={tag_query}")  # 何をするか：dry-runでは取消しは実行しない
+                            continue
+                        if throttled:
+                            logger.debug("pause: throttle (skip cancel_tag)")  # 何をするか：レート制限クールダウン中は取消しもしない
+                            _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="throttle")
+                            continue
+                        if not tag_query:
+                            continue
+                        cancelled = 0
+                        for acc_id, meta in list(live_orders.items()):
+                            order_meta = meta.get("order")
+                            if not _tag_matches(_act(order_meta, "tag", None), tag_query):
+                                continue
+                            try:
+                                ex.cancel_child_order(child_order_acceptance_id=acc_id)  # 何をするか：タグ一致の注文を個別にキャンセル
+                            except (RateLimitError, ServerError, NetworkError, ExchangeError) as e:
+                                logger.warning(f"cancel_tag failed for {acc_id}: {e}")
+                                if isinstance(e, RateLimitError) and _rate_limit_strike(rate_limit_hits, rate_limit_window_s, rate_limit_limit):
+                                    exit_reason = "rate_limit"
+                                    _hb_write(hb_path, event="kill", ts=_now_utc().isoformat(), reason="rate_limit")
+                                    stop_event.set()  # 何をするか：レート制限多発時は安全停止
+                                    break
+                                throttle_until = _now_utc() + timedelta(seconds=10)
+                                throttled = True
+                                _hb_write(hb_path, event="pause", ts=_now_utc().isoformat(), reason="throttle")
+                                break
+                            del live_orders[acc_id]
+                            cancelled += 1
+                            order_log.add(
+                                ts=now.isoformat(),
+                                action="cancel",
+                                tif=_act(order_meta, "tif", "GTC"),
+                                ttl_ms=_act(order_meta, "ttl_ms", None),
+                                px=_act(order_meta, "price", None),
+                                sz=_act(order_meta, "size", None),
+                                reason=tag_query,
+                            )
+                            _hb_write(hb_path, event="cancel", ts=now.isoformat(), acc=acc_id, reason="cancel_tag", tag=tag_query)
+                        if cancelled:
+                            logger.info(f"cancel_tag applied tag={tag_query} cancelled={cancelled}")
+                        if exit_reason == "rate_limit" or throttled:
+                            break
+                        continue
+                    if act_type != "place":
+                        continue
+
+                    order_obj = _act(o, "order", o)  # 何をするか：action内にorderがあれば優先的に読む
+                    sz = float(_act(order_obj, "size", getattr(getattr(cfg, "size", None), "default", 0.0)) or 0.0)  # 何をするか：dict/object両対応でサイズ取得（未指定ならconfigのdefault）
                     if sz <= 0.0:  # 何をするか：サイズが無い/0のときは発注しない
                         logger.debug("pause: size_missing_or_zero")  # 何をするか：理由をrun.logに残す
                         _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="size_missing_or_zero")  # 何をするか：心拍にも残す
                         continue  # 何をするか：この周回の発注パートはスキップ
 
-                    px_raw = _act(o, "price", None)  # 何をするか：dict/object両対応で価格を取得（未指定ならNone）
+                    px_raw = _act(order_obj, "price", None)  # 何をするか：dict/object両対応で価格を取得（未指定ならNone）
                     if px_raw is None:
                         # 何をするか：price未指定のときは板の最良気配から自動補完（実稼働向けの安全デフォルト）
-                        side_norm = _side_norm(_act(o, "side"))  # 何をするか：'BUY'/'SELL'へ正規化
+                        side_norm = _side_norm(_act(order_obj, "side"))  # 何をするか：'BUY'/'SELL'へ正規化
                         bid = _best_px(getattr(ob, "best_bid", None))  # 何をするか：最良買いの価格(float)を取り出す
                         ask = _best_px(getattr(ob, "best_ask", None))  # 何をするか：最良売りの価格(float)を取り出す
                         px = (bid if side_norm == "BUY" else ask)  # 何をするか：向きに応じて使う価格を選ぶ
@@ -2205,8 +2473,8 @@ def run_live(
                     if sz < min_sz: sz = min_sz  # 何をするか：丸めた結果が下限未満なら下限に引き上げる
 
                     px = float(px)  # 何をするか：上流で決定済みの価格(px)をそのまま使う（_normalize_px_szでtick丸め済みのため二重丸めしない）
-                    tag = getattr(o, "tag", "")  # 何をするか：発注理由（タグ）
-                    dedup_key = f"{_side_norm(_act(o, 'side'))}|{px}|{_act(o, 'tag', '')}"  # 何をするか：実発注と同じ'BUY'/'SELL'でキー化し二重発注を防ぐ
+                    tag = getattr(order_obj, "tag", getattr(o, "tag", ""))  # 何をするか：発注理由（タグ）
+                    dedup_key = f"{_side_norm(_act(order_obj, 'side'))}|{px}|{_act(order_obj, 'tag', '')}"  # 何をするか：実発注と同じ'BUY'/'SELL'でキー化し二重発注を防ぐ
 
 
                     if dedup_key in last_place and (now - last_place[dedup_key]).total_seconds() * 1000.0 < place_dedup_ms:
@@ -2217,16 +2485,16 @@ def run_live(
 
                     try:
                         if dry_run:  # 何をするか：dry-run時は実発注せずスキップ（ログはrun.logにだけ残す）
-                            logger.info(f"live[dry_run]: skip place side={_act(o, 'side')} px={px} sz={sz} tag={_act(o, 'tag', '')}")  # 何をするか：dict対応のtagを表示
+                            logger.info(f"live[dry_run]: skip place side={_act(order_obj, 'side')} px={px} sz={sz} tag={_act(order_obj, 'tag', '')}")  # 何をするか：dict対応のtagを表示
                             continue
 
                         px, sz = _normalize_px_sz(cfg, px, sz)  # 何をするか：価格/サイズを取引所の刻みに正規化（最小サイズ未満はNone）
                         try:
-                            setattr(o, "size", sz)
-                            setattr(o, "price", px)
+                            setattr(order_obj, "size", sz)
+                            setattr(order_obj, "price", px)
                         except Exception:
                             pass
-                        dedup_key = f"{_side_norm(_act(o, 'side'))}|{px}|{_act(o, 'tag', '')}"  # 何をするか：正規化後の価格でデデュープキーを作る
+                        dedup_key = f"{_side_norm(_act(order_obj, 'side'))}|{px}|{_act(order_obj, 'tag', '')}"  # 何をするか：正規化後の価格でデデュープキーを作る
 
                         gap_ms = getattr(getattr(cfg, "tx", None), "place_dedup_ms", None)  # 何をするか：デデュープ間隔（ms）。None/0なら無効
                         cool_ms = getattr(getattr(cfg, "tx", None), "min_interval_ms", None)  # 何をするか：最小発注間隔(ms)。None/0なら無効
@@ -2247,15 +2515,15 @@ def run_live(
                             _hb_write(hb_path, event="pause", ts=now.isoformat(), reason="size_too_small")  # 何をするか：心拍にスキップ理由を記録
                             continue  # 何をするか：この周回は発注を行わない
 
-                        side_norm = _side_norm(_act(o, "side"))  # 何をするか：sideを'BUY'/'SELL'に正規化
+                        side_norm = _side_norm(_act(order_obj, "side"))  # 何をするか：sideを'BUY'/'SELL'に正規化
                         try:
                             current_pos = float(pnl_state["pos"])
                         except Exception:
                             current_pos = 0.0
-                        reduce_only = bool(_act(o, "reduce_only", False))
+                        reduce_only = bool(_act(order_obj, "reduce_only", False))
                         reduces_inventory = _would_reduce_inventory(current_pos, side_norm, sz)
                         try:
-                            setattr(o, "reduce_only", reduce_only)
+                            setattr(order_obj, "reduce_only", reduce_only)
                         except Exception:
                             pass
                         inflight_count, inflight_qty, inflight_by_key = _inflight_state(live_orders, side=side_norm)
@@ -2359,7 +2627,7 @@ def run_live(
                                 logger.debug(f"margin_precheck skipped: {e}")
 
                         acc = ex.send_child_order(
-                            side=side_norm, size=sz, price=px, time_in_force=_act(o, "tif", "GTC"), reduce_only=reduce_only
+                            side=side_norm, size=sz, price=px, time_in_force=_act(order_obj, "tif", "GTC"), reduce_only=reduce_only
                         )  # 何をするか：正規化後・ガード通過後にだけ実発注する
                         if reduce_only:
                             reduce_fail_count = 0
@@ -2373,10 +2641,10 @@ def run_live(
                         last_place[dedup_key] = now  # 何をするか：この(side×price×tag)は今出した、と記録
                         _last_tx_at = now  # 何をするか：送信できたので直近送信時刻を更新
 
-                        deadline = _ttl_deadline(now, _act(o, "ttl_ms", getattr(getattr(cfg, "features", None), "ttl_ms", None)))  # 何をするか：ttl_ms を dict/object両対応で取得
-                        live_orders[acc] = {"deadline": deadline, "order": o, "executed": 0.0, "avg_price": 0.0, "reduce_only": reduce_only, "reduces_inventory": reduces_inventory}  # TTL管理と約定進捗を保持
-                        order_log.add(ts=now.isoformat(), action="place", tif=_act(o, "tif", "GTC"), ttl_ms=_act(o, "ttl_ms", None), px=px, sz=sz, reason=_act(o, "tag", ""))  # 何をするか：発注イベントをordersログへ記録
-                        _hb_write(hb_path, event="place", ts=now.isoformat(), acc=acc, reason=_act(o, "tag", ""), tif=_act(o, "tif", "GTC"), ttl_ms=_act(o, "ttl_ms", None), px=px, sz=sz)  # 何をするか：発注イベントを心拍に記録
+                        deadline = _ttl_deadline(now, _act(order_obj, "ttl_ms", getattr(getattr(cfg, "features", None), "ttl_ms", None)))  # 何をするか：ttl_ms を dict/object両対応で取得
+                        live_orders[acc] = {"deadline": deadline, "order": order_obj, "executed": 0.0, "avg_price": 0.0, "reduce_only": reduce_only, "reduces_inventory": reduces_inventory}  # TTL管理と約定進捗を保持
+                        order_log.add(ts=now.isoformat(), action="place", tif=_act(order_obj, "tif", "GTC"), ttl_ms=_act(order_obj, "ttl_ms", None), px=px, sz=sz, reason=_act(order_obj, "tag", ""))  # 何をするか：発注イベントをordersログへ記録
+                        _hb_write(hb_path, event="place", ts=now.isoformat(), acc=acc, reason=_act(order_obj, "tag", ""), tif=_act(order_obj, "tif", "GTC"), ttl_ms=_act(order_obj, "ttl_ms", None), px=px, sz=sz)  # 何をするか：発注イベントを心拍に記録
 
 
                     except RateLimitError as e:
@@ -2421,16 +2689,16 @@ def run_live(
                                             side=side_norm,
                                             size=fallback_sz,
                                             price=px,
-                                            time_in_force=_act(o, "tif", "GTC"),
+                                            time_in_force=_act(order_obj, "tif", "GTC"),
                                             reduce_only=True,
                                         )
                                         reduce_fail_count = 0
                                         last_place[dedup_key] = now
                                         _last_tx_at = now
-                                        deadline = _ttl_deadline(now, _act(o, "ttl_ms", getattr(getattr(cfg, "features", None), "ttl_ms", None)))
-                                        live_orders[acc_fb] = {"deadline": deadline, "order": o, "executed": 0.0, "avg_price": 0.0}
-                                        order_log.add(ts=now.isoformat(), action="place", tif=_act(o, "tif", "GTC"), ttl_ms=_act(o, "ttl_ms", None), px=px, sz=fallback_sz, reason=_act(o, "tag", ""))
-                                        _hb_write(hb_path, event="place", ts=now.isoformat(), acc=acc_fb, reason=_act(o, "tag", ""), tif=_act(o, "tif", "GTC"), ttl_ms=_act(o, "ttl_ms", None), px=px, sz=fallback_sz)
+                                        deadline = _ttl_deadline(now, _act(order_obj, "ttl_ms", getattr(getattr(cfg, "features", None), "ttl_ms", None)))
+                                        live_orders[acc_fb] = {"deadline": deadline, "order": order_obj, "executed": 0.0, "avg_price": 0.0}
+                                        order_log.add(ts=now.isoformat(), action="place", tif=_act(order_obj, "tif", "GTC"), ttl_ms=_act(order_obj, "ttl_ms", None), px=px, sz=fallback_sz, reason=_act(order_obj, "tag", ""))
+                                        _hb_write(hb_path, event="place", ts=now.isoformat(), acc=acc_fb, reason=_act(order_obj, "tag", ""), tif=_act(order_obj, "tif", "GTC"), ttl_ms=_act(order_obj, "ttl_ms", None), px=px, sz=fallback_sz)
                                         continue
                                     except Exception as fb_exc:
                                         logger.warning(f"reduce-only retry failed: {fb_exc}")

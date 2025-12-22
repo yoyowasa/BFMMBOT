@@ -11,6 +11,30 @@ from src.core.orders import Order  # 置く指値
 from src.strategy.base import StrategyBase  # 共通IF
 
 
+def lean_side_by_microprice(ob: OrderBook) -> str:
+    """何をする関数か：MP（板の厚み）でリーン方向のside("buy"/"sell")を返す"""
+    mid = (ob.best_bid.price + ob.best_ask.price) / 2.0
+    mp = ob.microprice()
+    if mp is None:
+        return "buy"
+    return "sell" if mp >= mid else "buy"
+
+
+def _inv_brake_side(lean_side: str, pos: float, max_inventory: float) -> str:
+    # 在庫が偏ってきたら、これ以上「偏り方向」に増やさないために side を上書きする
+    # pos > 0（ロング）なら "sell" を優先、pos < 0（ショート）なら "buy" を優先する
+    if max_inventory <= 0:
+        return lean_side  # 設定が無効なら何もしない
+
+    soft = max_inventory * 0.25  # 上限の25%から“ソフトブレーキ”を踏んで、早めに在庫を減らす方向へ寄せる
+    if pos >= soft:
+        return "sell"  # ロングが増えてきた → 売り側だけ出して減らす
+    if pos <= -soft:
+        return "buy"  # ショートが増えてきた → 買い側だけ出して減らす
+
+    return lean_side  # まだ偏ってない → いつも通り MP リーンを使う
+
+
 class CancelAddGate(StrategyBase):
     """#2 キャンセル比ゲートの最小実装"""
 
@@ -200,12 +224,20 @@ class CancelAddGate(StrategyBase):
             return [{"type": "cancel_tag", "tag": "ca_gate"}]
 
         # 条件維持: 片側だけ提示（Microprice寄り）
-        mid = (ob.best_bid.price + ob.best_ask.price) / 2.0
-        mp = ob.microprice()
-        if mp is None:
-            side = "buy"
-        else:
-            side = "sell" if mp >= mid else "buy"
+        try:
+            pos = float(getattr(self, "_inventory", 0.0) or 0.0)
+        except Exception:
+            pos = 0.0
+        max_inventory = self._value_from(cfg, "risk", "max_inventory")
+        if max_inventory is None:
+            max_inventory = self._value_from(getattr(self, "cfg", None), "risk", "max_inventory")
+        try:
+            max_inventory = float(max_inventory) if max_inventory is not None else 0.0
+        except Exception:
+            max_inventory = 0.0
+
+        side = lean_side_by_microprice(ob)  # まずは MP（板の厚み）でリーン方向を決める
+        side = _inv_brake_side(side, pos=pos, max_inventory=max_inventory)  # 在庫が偏ってきたら減らす方向を優先する
 
         px = ob.best_bid.price if side == "buy" else ob.best_ask.price
         self._set_decision_features(decision_features)

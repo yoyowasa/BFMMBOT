@@ -9,7 +9,9 @@ import hashlib  # 署名（HMAC-SHA256）に使う
 import hmac     # 署名（HMAC-SHA256）に使う
 import httpx    # HTTPクライアント（Poetry依存に含まれる）
 import json     # リクエストBodyのシリアライズ
+import threading  # レート制限の排他制御に使う
 import time     # 単調なタイムスタンプ生成（簡易ノンス）
+from collections import deque  # 直近N秒の呼び出し時刻をキューで持つ
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode  # GETのクエリを安全に構築
 from loguru import logger           # リトライ時の警告出力
@@ -29,6 +31,39 @@ class ServerError(ExchangeError):
 
 class NetworkError(ExchangeError):
     """ネットワーク到達性などの httpx 例外"""
+
+
+class _SlidingWindowRateLimiter:
+    # このクラスが何をするか：直近window秒の呼び出し回数がlimitを超えないように、必要なら待つ
+
+    def __init__(self, *, limit: int, window_sec: float, safety_ratio: float, name: str) -> None:
+        # この関数が何をするか：上限・窓幅・安全マージン・内部状態（時刻キュー）を初期化する
+        self._limit = max(1, int(limit * safety_ratio))  # 安全マージン込みの実効上限
+        self._window_sec = float(window_sec)  # 監視窓（秒）
+        self._name = name  # 識別名（デバッグ用）
+        self._ts = deque()  # 呼び出し時刻（monotonic秒）を保持
+        self._lock = threading.Lock()  # 同時呼び出しでも壊れないように守る
+
+    def acquire(self) -> None:
+        # この関数が何をするか：枠が空くまで待ってから「1回分」を消費する
+        while True:
+            wait_sec = 0.0
+            with self._lock:
+                now = time.monotonic()  # ずれに強い現在時刻
+                cutoff = now - self._window_sec  # 窓の外に出た時刻は捨てる
+                while self._ts and self._ts[0] <= cutoff:
+                    self._ts.popleft()
+
+                if len(self._ts) < self._limit:
+                    self._ts.append(now)  # ここで「1回分」を確保
+                    return
+
+                wait_sec = self._window_sec - (now - self._ts[0])  # 一番古い枠が空くまで待つ
+
+            if wait_sec > 0:
+                time.sleep(wait_sec)
+            else:
+                time.sleep(0)
 
 # ---- 本体：bitFlyer 送信口 ----
 class BitflyerExchange:
@@ -53,6 +88,11 @@ class BitflyerExchange:
         self.product_code = product_code
         self._client = httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout)
         self._last_ts = 0.0  # 単調増加の時刻を保ち、簡易ノンス衝突を避ける
+        # 何をするか：bitFlyerの上限を守るため、HTTP送信前に待つレート制限器を用意する
+        self._rl_private_5m = _SlidingWindowRateLimiter(limit=500, window_sec=300, safety_ratio=0.95, name="bf_private_5m")  # Private API: 500/5min
+        self._rl_send_order_5m = _SlidingWindowRateLimiter(limit=300, window_sec=300, safety_ratio=0.90, name="bf_send_order_5m")  # sendchildorder/sendparentorder: 300/5min
+        self._rl_cancel_all_5m = _SlidingWindowRateLimiter(limit=300, window_sec=300, safety_ratio=0.90, name="bf_cancel_all_5m")  # cancelallchildorders: 300/5min
+        self._rl_small_place_1m = _SlidingWindowRateLimiter(limit=100, window_sec=60, safety_ratio=0.90, name="bf_small_place_1m")  # size<=0.1: 100 placements/min
 
     # ---- ライフサイクル管理 ----
     def close(self) -> None:
@@ -83,6 +123,28 @@ class BitflyerExchange:
         """
         payload = f"{ts}{method}{path_with_query}{body_str}"
         return hmac.new(self.api_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def _rate_limit_before_request(self, path: str, json_body: object | None) -> None:
+        # この関数が何をするか：bitFlyer の API 上限を超えないよう、HTTP送信前に必要なら待つ
+
+        if not path.startswith("/v1/me/"):
+            return  # Public API は対象外
+
+        self._rl_private_5m.acquire()  # Private API 全体の上限
+
+        if path.endswith("/sendchildorder") or path.endswith("/sendparentorder"):
+            self._rl_send_order_5m.acquire()  # 新規発注系の上限
+
+            if isinstance(json_body, dict):
+                size = json_body.get("size")
+                try:
+                    if size is not None and float(size) <= 0.1:
+                        self._rl_small_place_1m.acquire()  # 小口発注の上限（超えると重いペナルティ）
+                except (TypeError, ValueError):
+                    pass
+
+        if path.endswith("/cancelallchildorders"):
+            self._rl_cancel_all_5m.acquire()  # 一括キャンセルの上限（明示で別枠）
 
     def _request(
         self,
@@ -115,6 +177,7 @@ class BitflyerExchange:
             }
 
             try:
+                self._rate_limit_before_request(path, json_body)
                 resp = self._client.request(
                     method,
                     path_with_query,

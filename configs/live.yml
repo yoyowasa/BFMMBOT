@@ -12,15 +12,26 @@ strategy_cfg:
       default: 0.001
     take_profit_ticks: 1.0
     stop_ticks: 2.0
+    # 発注閾値を極力緩めてトリガーしやすくする
+    stall_min_mp_edge_bp: -5.0
+    stall_min_spread_tick: 0
+    stall_ttl_band_threshold_bp: 10.0
+    stall_buy_filter_threshold_bp: 10.0
+    stall_buy_filter_mode: none
   cancel_add_gate:
     size:
       default: 0.001
     ca_ratio_win_ms: 600
-    ca_threshold: 1.25
-    taker_zscore_threshold: 3.0
+    ca_threshold: 0.01
+    taker_zscore_threshold: 0.1
 
 # 銘柄
 product_code: FX_BTC_JPY
+
+# 手数料（売買手数料/commission）
+# - bitFlyer Crypto CFD（FX_BTC_JPY相当）は当面「無料」表記（0.0bps）。必要なら運用に合わせて上書き。
+fees:
+  bps: 0.0
 
 # 送信デデュープ
 tx:
@@ -50,23 +61,30 @@ risk:
     force_on_risk: true
     tif: IOC
     min_step_qty: 0.001
+guard:
+  fills_stale_after_s: 0  # 自分の約定が途切れてもcautionに入れない（一時的に無効化）
 
 logging:
   level: DEBUG
   heartbeat_status_sec: 2
 features:
   # ST閾値を最小化して「とりあえず発注」できるよう緩める
-  stall_min_mp_edge_bp: -0.5
-  zero_min_mp_edge_bp: 0.0001
+  stall_min_mp_edge_bp: -5.0
+  stall_min_spread_tick: 0
+  stall_ttl_band_threshold_bp: 10.0
+  stall_buy_filter_threshold_bp: 10.0
+  stall_buy_filter_mode: none
+  zero_min_mp_edge_bp: -5.0
 mode_switch:
   # Funding関連の一時停止を無効化（calc/transferで止まらないようにする）
   funding_calc_jst: []
   funding_transfer_lag_hours: 0
-# dry-run を一定時間で終了させる秒数（ここでは30分）
-dry_run_max_sec: 1800
+# dry-run を一定時間で終了させる秒数（ここでは2時間）
+dry_run_max_sec: 900
 env_overrides:
   live:
     logging:
       level: DEBUG
 strategies:
   - stall_then_strike
+  - cancel_add_gate

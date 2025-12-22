@@ -582,8 +582,9 @@ class StallThenStrike(StrategyBase):
                     )
                 return actions
             actions: list[Dict[str, Any]] = []
-            if allow_buy:
-                actions.append(
+            # stall_then_strike：在庫が片寄らないように、ミッド±1tickへ最小ロットを「両面」で同時に置く
+            actions.extend(
+                [
                     {
                         "type": "place",
                         "order": Order(
@@ -592,24 +593,23 @@ class StallThenStrike(StrategyBase):
                             size=lot,
                             tif="GTC",
                             ttl_ms=ttl_st,
-                            tag="stall",
+                            tag="stall|stall_then_strike",
                         ),
                         "allow_multiple": True,
-                    }
-                )
-            actions.append(
-                {
-                    "type": "place",
-                    "order": Order(
-                        side="sell",
-                        price=mid + 1 * tick,
-                        size=lot,
-                        tif="GTC",
-                        ttl_ms=ttl_st,
-                        tag="stall",
-                    ),
-                    "allow_multiple": True,
-                }
+                    },
+                    {
+                        "type": "place",
+                        "order": Order(
+                            side="sell",
+                            price=mid + 1 * tick,
+                            size=lot,
+                            tif="GTC",
+                            ttl_ms=ttl_st,
+                            tag="stall|stall_then_strike",
+                        ),
+                        "allow_multiple": True,
+                    },
+                ]
             )
             return actions
 
