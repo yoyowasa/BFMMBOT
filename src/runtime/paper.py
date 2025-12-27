@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo  # 何をするか：JSTタイムゾーンを扱�
 import json  # 何をするか：心拍を ndjson(1行1JSON) で書く
 import uuid  # 何をするか：疑似の受理ID(acc)を作る
 import math  # 何をするか：サイズ刻みの丸めに使う
+import time  # 何をするか：ログ間引き用に単調増加時計を使う
 from typing import Any, Dict, List, Optional  # 何をするか：型ヒント（辞書など）
 from collections.abc import Mapping
 import csv  # 何をするか：orders.csv / trades.csv に追記するために使う
@@ -29,6 +30,9 @@ def _now_utc() -> datetime:
     return datetime.now(ZoneInfo("Asia/Tokyo"))
 
 __hb_ctx: dict[str, Any] = {}  # 何をするか：bad_book切り分け用に、直近の板/WS状態を保持して_hb_writeから参照する
+_pause_last_key = None  # 直近に出した pause のキー(reason/min_ms)
+_pause_last_emit_mono = 0.0  # 直近 pause を出した monotonic 時刻
+_pause_suppressed = 0  # 間引きで捨てた pause の回数（次にまとめて出す）
 
 def _apply_inventory_brake(orders, *, pos, max_pos, brake_ratio):
     # 在庫ブレーキ: 在庫が偏ったら「偏り方向に増える side」の新規注文を落として片寄りを止める
@@ -63,8 +67,24 @@ def _apply_inventory_brake(orders, *, pos, max_pos, brake_ratio):
 
 def _hb_write(hb_path: Path, **fields):
     """何をする関数か：心拍を ndjson で1行追記する（paper用の簡易版）"""
+    global _pause_last_key, _pause_last_emit_mono, _pause_suppressed
     try:
         rec = dict(fields)
+
+        if rec.get("event") == "pause":
+            pause_key = (rec.get("reason"), rec.get("min_ms"))
+            now_mono = time.monotonic()
+
+            if pause_key == _pause_last_key and (now_mono - _pause_last_emit_mono) < 1.0:
+                _pause_suppressed += 1
+                return
+
+            rec = dict(rec)
+            rec["suppressed"] = _pause_suppressed if pause_key == _pause_last_key else 0
+
+            _pause_last_key = pause_key
+            _pause_last_emit_mono = now_mono
+            _pause_suppressed = 0
 
         # bad_book のときだけ、切り分けに必要な「板＋WSの状態」をheartbeatへ同梱する（後方互換：既存キーは残す）
         event = rec.get("event")
@@ -482,13 +502,15 @@ def flatten_on_halt(
     last_mark: float | None,
     reason: str,
     max_attempts: int = 5,
-) -> tuple[float, float | None, bool]:
+) -> tuple[float, float | None, bool, str, float | None]:
     """何をする関数か：停止理由が来たら、在庫を0へ寄せ切ってから終了させる（paper用）"""
     try:
         pos0 = float(pnl_state.get("pos", 0.0) or 0.0)
     except Exception:
         pos0 = 0.0
 
+    flatten_action = "n/a"
+    summary_dust = None
     dust = float(min_sz or 0.001)
     if abs(pos0) < dust:
         # 最小ロット未満（dust未満）はクローズ注文を出せないため、flattenをスキップした事実だけheartbeatに残す
@@ -500,7 +522,10 @@ def flatten_on_halt(
             pos_before=pos0,
             dust=dust,
         )
-        return fee_total, last_mark, True
+        # pos_before < dust なのでフラット化はスキップ、という印を summary に残す
+        flatten_action = "skip"
+        summary_dust = dust
+        return fee_total, last_mark, True, flatten_action, summary_dust
 
     _hb_write(hb_path, event="flatten_start", ts=_now_utc().isoformat(), reason=reason, pos_before=pos0, dust=dust, max_attempts=int(max_attempts))
 
@@ -565,7 +590,10 @@ def flatten_on_halt(
             pass
 
     _hb_write(hb_path, event="flatten_done", ts=_now_utc().isoformat(), reason=reason, pos_after=pos_after, attempts=int(attempts), success=bool(success))
-    return fee_total, last_px, bool(success)
+    # IOC フラット化の結果（成功/失敗）を summary に残す
+    flatten_action = "done" if success else "fail"
+    summary_dust = dust
+    return fee_total, last_px, bool(success), flatten_action, summary_dust
 
 
 def _attach_strategy_time_source(strategy, time_source) -> None:
@@ -652,6 +680,9 @@ def run_paper(
     logger.info(
         f"paper start: product={product} strategies={strategy_names}"
     )
+    # run.log の summary に「dust と flatten_action」を出すための箱（初期値）
+    flatten_action = "n/a"  # skip/done/fail など、停止時フラット化の結果を入れる
+    summary_dust = None     # 判定に使った dust（最小サイズ）を入れる
     _hb_write(
         hb_path,
         event="start",
@@ -667,7 +698,8 @@ def run_paper(
     # 何をするか：受理ID(acc) → メタ情報（side/px/sz/ttl/置いた時刻/tag）
     live_orders: Dict[str, Dict[str, Any]] = {}
     tx_cfg = _act(cfg, "tx", None)
-    min_tx_ms = int(_act(tx_cfg, "min_interval_ms", 0) or 0)  # 何をするか：新規発注の最小間隔(ms)
+    min_ms = 600  # throttle の最小間隔(ms)。TTL(650/900ms)より短くして「常時 throttle」を減らす
+    min_tx_ms = min_ms  # 何をするか：新規発注の最小間隔(ms)
     place_dedup_ms = int(_act(tx_cfg, "place_dedup_ms", 0) or 0)  # 何をするか：同一発注の短時間重複抑止(ms)
     last_place: Dict[str, datetime] = {}  # 何をするか：直近に出した(side|px|tag)→時刻
     _last_tx_at: datetime = _now_utc() - timedelta(milliseconds=(min_tx_ms or 0))  # 何をするか：直近の送信時刻（初期は即送れる状態）
@@ -974,7 +1006,7 @@ def run_paper(
         # 何をするか：posが残っていれば在庫を0へ寄せ切る（canaryでもinterruptでも同様）
         bid = _best_px(getattr(ob, "best_bid", None))
         ask = _best_px(getattr(ob, "best_ask", None))
-        fee_total, flat_px, flat_ok = flatten_on_halt(
+        fee_total, flat_px, flat_ok, flatten_action, summary_dust = flatten_on_halt(
             hb_path=hb_path,
             order_log=order_log,
             trade_log=trade_log,
@@ -1012,7 +1044,8 @@ def run_paper(
         else:
             unreal = 0.0
         total = realized_net + unreal
-        logger.info(f"paper summary: reason={exit_reason} realized_net={realized_net:.3f} fee={fee_total:.3f} unreal={unreal:.3f} total={total:.3f} pos={pos:.6f} avg={avg_px:.1f} mark={last_mark}")
+        mark_px = f"{float(last_mark):.1f}" if last_mark is not None else "None"
+        logger.info(f"paper summary: reason={exit_reason} realized_net={realized_net:.3f} fee={fee_total:.3f} unreal={unreal:.3f} total={total:.3f} pos={pos:.6f} avg={avg_px:.1f} mark={mark_px} dust={summary_dust} flatten_action={flatten_action}")
         _hb_write(
             hb_path,
             event="summary",
@@ -1025,6 +1058,8 @@ def run_paper(
             pos=pos,
             avg_px=avg_px,
             mark_px=float(last_mark) if last_mark is not None else None,
+            dust=summary_dust,  # summaryにもdustを入れて「posが残って見えるのがダストか」を即判別できるようにする
+            flatten_action=flatten_action,  # summaryにもflatten結果(skip/done/fail)を入れて終了時の状態を1イベントで追えるようにする
         )
         if exit_reason == "canary":
             _hb_write(hb_path, event="kill", ts=now.isoformat(), reason="canary", daily_pnl_jpy=total, dd_jpy=0.0)

@@ -7,7 +7,7 @@ product_code: FX_BTC_JPY
 tick_size: 1  # 1 tick = 1 JPY
 
 tx:
-  min_interval_ms: 1000    # 送信間隔の最小値
+  min_interval_ms: 600    # throttle の最小間隔(ms)。TTL(650/900ms)より短くして「常時 throttle」を減らす
   place_dedup_ms: 1000     # 同一内容の短時間重複を抑止
 
 fees:

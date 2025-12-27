@@ -10,6 +10,7 @@ import uuid  # 何をするか：corr_idのフォールバック生成に使用
 from collections import OrderedDict, deque  # 30sミッド履歴でガード＋client_order_id↔corr_id対応の保持
 from collections.abc import Mapping  # 戦略別設定の判定に使用
 from datetime import datetime, timezone, timedelta  # ts解析と現在時刻 JST日付の境界計算にtimedeltaを使う
+from zoneinfo import ZoneInfo  # 何をするか：JSTタイムゾーンを扱う
 from typing import Deque, Optional, Sequence, Tuple  # 型ヒント
 import csv  # 役割：窓イベントをCSVに1行追記するために使用
 import time  # 何をするか：現在時刻(ms)を取得してHB間隔を測る

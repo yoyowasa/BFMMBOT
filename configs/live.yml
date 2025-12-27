@@ -35,7 +35,7 @@ fees:
 
 # 送信デデュープ
 tx:
-  min_interval_ms: 1000
+  min_interval_ms: 600
   place_dedup_ms: 1000
 
 # 同時インフライト上限

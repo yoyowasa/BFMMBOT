@@ -399,6 +399,14 @@ class StallThenStrike(StrategyBase):
             "stall_min_spread_tick": min_sp,
             "tick_size": tick,
         }
+        eta_ms = getattr(ob, "eta_ms", None)
+        if eta_ms is None:
+            eta_ms = getattr(ob, "queue_eta_ms", None)
+        try:
+            eta_ms = float(eta_ms) if eta_ms is not None else 0.0
+        except Exception:
+            eta_ms = 0.0
+        decision_features["eta_ms"] = eta_ms
         if selected_band is not None and selected_band.get("threshold_bp") is not None:
             decision_features["stall_ttl_band_threshold_bp"] = selected_band["threshold_bp"]
         if buy_filter_window is not None:
@@ -515,7 +523,7 @@ class StallThenStrike(StrategyBase):
             return []
 
         # ここからは建玉なしのエントリー判定
-        if age_ms is not None and age_ms >= stall_T and sp_tick >= min_sp and not stall_orders:
+        if age_ms is not None and age_ms >= stall_T and sp_tick >= min_sp and eta_ms <= ttl_st and not stall_orders:  # ETA>TTLなら置かない（TTL失効の無駄発注＝ttl cancelを減らす）
             if guard_active:
                 decision_features["stall_local_guard"] = guard_reason or "local_guard"
                 if not self._guard_notified:
