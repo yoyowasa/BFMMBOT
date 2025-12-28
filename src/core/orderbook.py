@@ -14,6 +14,7 @@ from collections import deque  # C/Aイベントのスライディング窓
 from datetime import datetime, timezone  # ISO→datetime と経過ms計算
 import time  # Bestの滞留時間(ms)を単調時計で測るために使用
 from loguru import logger  # ログ（必要時）
+from src.features.queue_eta import QueueETA  # 何をするか：板の先頭の待ち時間(Queue ETA)推定器を使う
 
 # ─────────────────────────────────────────────────────────────
 # 補助：ISO文字列をdatetimeへ（'Z'も+00:00として扱えるよう正規化）
@@ -50,6 +51,8 @@ class OrderBook:
         self._best_age_ms = 0.0  # Bestの滞留時間（ms）— 外部へ提供する指標
         self._mid_history: Deque[Tuple[float, float]] = deque()  # ミッド価格履歴（timestamp, mid）
         self.snapshot_seen = False  # 何をするか：board_snapshot を受けたか（初期化済み判定）
+        self._queue_eta = QueueETA()  # 何をするか：executionsを受けて queue_eta_ms を推定する内部状態
+        self.queue_eta_ms = None  # 何をするか：現在の推定ETA(ms)。未計算ならNone
 
     def reset(self) -> None:
         """何をする関数か：板状態を初期化（再接続/再同期用）"""
@@ -266,6 +269,30 @@ class OrderBook:
         except Exception:
             pass
         return ratio
+
+    def on_executions(self, executions: list[dict]) -> None:
+        """[関数] executions をQueueETAへ渡して queue_eta_ms を更新する。"""
+        if not executions:
+            return
+
+        # 何をするか：QueueETAが「まとめ受け」を持つならそれを使い、無ければ1件ずつ流す
+        if hasattr(self._queue_eta, "on_executions"):
+            self._queue_eta.on_executions(executions)
+        else:
+            for e in executions:
+                if not hasattr(self._queue_eta, "on_execution"):
+                    continue
+                try:
+                    self._queue_eta.on_execution(e)  # 何をするか：dict丸ごと受ける実装に対応
+                except TypeError:
+                    self._queue_eta.on_execution(  # 何をするか：引数型が違う実装に対応（最低限のキーだけ渡す）
+                        side=str(e.get("side")),
+                        price=float(e.get("price")),
+                        size=float(e.get("size")),
+                        ts=e.get("exec_date"),
+                    )
+
+        self.queue_eta_ms = getattr(self._queue_eta, "eta_ms", None)  # 何をするか：推定結果をOrderBook側へコピー
 
     def state_snapshot(self, now: datetime | None = None) -> Dict[str, Any]:
         now = now or self._last_ts or datetime.now(timezone.utc)

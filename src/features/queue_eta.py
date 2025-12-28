@@ -122,6 +122,58 @@ class QueueETA:
 
         return needed / rate
 
+    def get_eta_ms(
+        self,
+        price: float | None = None,
+        queue_qty: float | None = None,
+        side: str | None = None,
+    ) -> int | None:
+        # 何をするか：estimate_eta_sec の戻り（秒）をミリ秒へ変換して返す。inf/NaN/負値/計算不能は None にする。
+        import math
+
+        # 何をするか：estimate_eta_sec の引数の形が違っても動くように、複数パターンで呼び出しを試す。
+        eta_sec = None
+
+        kwargs = {}
+        if price is not None:
+            kwargs["price"] = price
+        if queue_qty is not None:
+            kwargs["queue_qty"] = queue_qty
+        if side is not None:
+            kwargs["side"] = side
+
+        try:
+            eta_sec = self.estimate_eta_sec(**kwargs) if kwargs else self.estimate_eta_sec()
+        except TypeError:
+            # 何をするか：キーワードが合わない/シグネチャが違う場合に、位置引数でも試す。
+            try:
+                if price is not None and queue_qty is not None:
+                    try:
+                        eta_sec = self.estimate_eta_sec(price, queue_qty)
+                    except TypeError:
+                        eta_sec = self.estimate_eta_sec(queue_qty, price)
+                elif price is not None:
+                    eta_sec = self.estimate_eta_sec(price)
+                elif queue_qty is not None:
+                    eta_sec = self.estimate_eta_sec(queue_qty)
+            except Exception:
+                eta_sec = None
+        except Exception:
+            eta_sec = None
+
+        if eta_sec is None:
+            return None
+
+        try:
+            eta = float(eta_sec)
+        except Exception:
+            return None
+
+        if not math.isfinite(eta) or eta < 0.0:
+            return None
+
+        return int(eta * 1000)
+
     def _rate_per_sec(self, *, hit_side: str, price: Optional[float], price_first: bool) -> float:
         """
         何をする関数：

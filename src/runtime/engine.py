@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo  # 何をするか：JSTタイムゾーンを扱�
 from typing import Deque, Optional, Sequence, Tuple  # 型ヒント
 import csv  # 役割：窓イベントをCSVに1行追記するために使用
 import time  # 何をするか：現在時刻(ms)を取得してHB間隔を測る
+import math  # 何をするか：QueueETAの推定結果（infなど）を安全に判定するため
 from time import monotonic  # これは「auto_reduceのクールダウン用タイマー」です
 from loguru import logger  # 実行ログ
 from functools import wraps  # 再入防止デコレータ用（_maybe_auto_reduce の重複呼び出し抑止）
@@ -21,6 +22,7 @@ from pathlib import Path  # ハートビートNDJSONのファイル出力に使�
 import orjson  # 1行JSON化（高速）
 from src.core.realtime import event_stream  # 【関数】WS購読（board/executions）:contentReference[oaicite:2]{index=2}
 from src.core.orderbook import OrderBook  # 【関数】ローカル板（Best/Spread/C-A）:contentReference[oaicite:3]{index=3}
+from src.features.queue_eta import QueueETA  # 何をするか：QueueのETA推定器（executionsから推定）を使えるようにする
 from src.core.simulator import MiniSimulator  # 【関数】最小約定シミュ（価格タッチ）:contentReference[oaicite:4]{index=4}
 from src.core.logs import OrderLog, TradeLog  # 【関数】発注/約定ログ（Parquet）:contentReference[oaicite:5]{index=5}
 from src.core.analytics import DecisionLog  # 【関数】意思決定ログ（Parquet）:contentReference[oaicite:6]{index=6}
@@ -212,6 +214,10 @@ class PaperEngine:
 
         # ローカル板・シミュ・ログ器
         self.ob = OrderBook(tick_size=self.tick)
+        try:
+            self._queue_eta = QueueETA(window_ms=800)  # 何をするか：直近800msの約定流量からQueueのETAを推定する
+        except TypeError:
+            self._queue_eta = QueueETA()  # 何をするか：QueueETAの__init__引数が違う実装でも落ちないようにする（保険）
         self.sim = MiniSimulator()
         self._feed_mode = "healthy"          # 何をするか：現在のフィード状態（healthy/caution/halted）を保持
         self._last_feed_reason = "init"      # 何をするか：直近の判定理由（ログや監視で参照）
@@ -595,6 +601,87 @@ class PaperEngine:
         if children:
             for child in children:
                 self._attach_strategy_context(child)
+
+    def _queue_eta_on_execution(self, exe: dict) -> None:
+        """[関数] executions(約定)1件をQueueETAへ流し込み、orderbook.queue_eta_msを更新する。"""
+        if not isinstance(exe, dict) or not hasattr(self, "_queue_eta"):
+            return
+
+        # 何をするか：代表的なキーからQueueETAへ渡す（未対応実装ならdictで再試行）
+        side_raw = exe.get("side") or exe.get("taker_side") or exe.get("exec_side") or exe.get("order_side")  # 約定のsideキー表記ゆれを吸収する
+        price_raw = exe.get("price") or exe.get("exec_price") or exe.get("execPrice")  # 約定のpriceキー表記ゆれを吸収する
+        size_raw = exe.get("size") or exe.get("exec_size") or exe.get("execSize") or exe.get("amount")  # 約定のsizeキー表記ゆれを吸収する
+        if side_raw is None or price_raw is None or size_raw is None:
+            return  # 必須キーが欠けている約定はETA推定に使えないので捨てる（推定器を壊さない）
+
+        try:
+            side = str(side_raw).upper()  # QueueETAが期待する "BUY"/"SELL" へ寄せる
+            price = float(price_raw)  # 数値化してQueueETAへ渡す
+            size = float(size_raw)  # 数値化してQueueETAへ渡す
+        except Exception:
+            return  # 変換不能な約定は捨てる（推定器を壊さない）
+        ts_raw = exe.get("exec_date") or exe.get("timestamp") or exe.get("ts")
+        ts = ts_raw
+        if isinstance(ts_raw, str):
+            try:
+                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            except Exception:
+                ts = None
+
+        try:
+            self._queue_eta.on_execution(side=side, price=price, size=size, ts=ts)
+        except TypeError:
+            try:
+                self._queue_eta.on_execution(exe)
+            except Exception:
+                return
+        except Exception:
+            return
+
+        # 何をするか：QueueETAの推定結果（ms）を取り出して、戦略が参照できる場所へ載せる
+        eta_ms = None
+        if hasattr(self._queue_eta, "queue_eta_ms"):
+            eta_ms = getattr(self._queue_eta, "queue_eta_ms")
+        elif hasattr(self._queue_eta, "eta_ms"):
+            eta_ms = getattr(self._queue_eta, "eta_ms")
+
+        # 何をするか：未初期化(None)の間は「無限大」扱いにして、ETAゲートが常に通らないようにする
+        if eta_ms is None:
+            eta_ms = float("inf")
+
+        ob = getattr(self, "orderbook", None) or getattr(self, "ob", None)
+        if ob is not None:
+            setattr(ob, "queue_eta_ms", float(eta_ms))  # 何をするか：stall_then_strikeが読む値を更新する
+
+    def _calc_queue_eta_ms(self, *, ob, now) -> float:
+        """
+        何をする関数：
+          現在の板（bid, bid_size）とQueueETAから、「BUYをbidに置いたときのETA(ms)」を見積もる。
+          流量不足などでETAが無限大（inf）になる場合は、ログや判定が壊れないように巨大な有限msへ落とす。
+        """
+        qeta = getattr(self, "queue_eta", None) or getattr(self, "_queue_eta", None)
+        if qeta is None:
+            return 10_000_000.0  # 何をするか：推定器未配線時は「TTLより長い」扱いで安全側に倒す
+
+        bid = getattr(ob, "bid", None)
+        bid_size = getattr(ob, "bid_size", None)
+        if bid is None or bid_size is None:
+            return 10_000_000.0  # 何をするか：板がまだ無い/欠損なら「置かない」判定に寄せる
+
+        qty = float(getattr(ob, "dust", None) or 0.001)  # 何をするか：代表数量（最小ロット想定）でETAを出す
+
+        eta_sec = qeta.estimate_eta_sec(
+            order_side="BUY",
+            price=float(bid),
+            qty=qty,
+            level_size=float(bid_size),
+            ts=now,
+            price_first=False,  # 何をするか：価格別が薄いとinfになりやすいので、まずはside合計レート優先で安定化
+        )
+
+        if not math.isfinite(eta_sec):
+            return 10_000_000.0  # 何をするか：inf/NaNは巨大msへ（TTLゲートで確実に落ちる）
+        return eta_sec * 1000.0  # 何をするか：秒→ミリ秒へ変換して返す
 
     def would_reduce_inventory(self, current_inventory: float, side: str | None, request_qty: float) -> bool:
         """【関数】注文が在庫|Q|を縮める（=決済）か判定し、縮めるならTrue"""
@@ -1849,11 +1936,15 @@ class PaperEngine:
                         logger.debug(f"engine.debug_actions: total_actions={len(actions) if actions is not None else 0}")
                     except Exception:
                         pass
+                    ob = self.ob
+                    queue_eta_ms = self._calc_queue_eta_ms(ob=ob, now=now)  # 何をするか：このサイクルのQueueETA(ms)を算出
+                    setattr(ob, "queue_eta_ms", queue_eta_ms)  # 何をするか：strategy側（stall_then_strike等）が参照できるように板へ載せる
                     feats_win = getattr(getattr(self.cfg, "features", None), "ca_ratio_win_ms", 500)  # 何をする行か：CA比率集計窓(ms)を取得
                     features = {
                         "best_age_ms": self.ob.best_age_ms(now),  # 何をする行か：Best静止時間(ms)を記録
                         "ca_ratio": self.ob.ca_ratio(now, window_ms=feats_win),  # 何をする行か：C/A比率を記録
                         "spread_tick": self.ob.spread_ticks(),  # 何をする行か：現在スプレッド(tick)を記録
+                        "queue_eta_ms": queue_eta_ms,  # 何をするか：decision_log/analyticsにETA(ms)を残す
                     }
                     self._record_decision(now, actions, features=features)
                     try:
@@ -2229,7 +2320,12 @@ class PaperEngine:
                 elif ch.startswith("lightning_executions_"):
                     self._maybe_auto_reduce(now=monotonic())  # 在庫とモードだけで“薄め”を1口（Reduce‑Only+IOC）
                     # 約定でシミュを進め、Fill明細を受け取る→PnL/ログ反映
-                    fills = self.sim.on_executions(ev.get("message") or [], now)
+                    executions = ev.get("message") or []
+                    if not isinstance(executions, (list, tuple)):
+                        executions = [executions]
+                    for exe in executions:
+                        self._queue_eta_on_execution(exe)  # 何をするか：この約定をQueueETAへ反映してETA(ms)を更新する
+                    fills = self.sim.on_executions(executions, now)
                     for f in fills:
                         self._apply_fill_and_log(
                             ts_iso=f["ts"], side=f["side"], px=float(f["price"]),

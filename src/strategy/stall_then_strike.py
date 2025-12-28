@@ -402,10 +402,13 @@ class StallThenStrike(StrategyBase):
         eta_ms = getattr(ob, "eta_ms", None)
         if eta_ms is None:
             eta_ms = getattr(ob, "queue_eta_ms", None)
+        # 何をするか：ETAをfloatへ正規化し、未計算/異常値(±inf/NaN)はNoneにしてログと判定を壊さない
         try:
-            eta_ms = float(eta_ms) if eta_ms is not None else 0.0
+            eta_ms = float(eta_ms) if eta_ms is not None else None
+            if eta_ms is not None and (eta_ms != eta_ms or eta_ms in (float("inf"), float("-inf"))):
+                eta_ms = None
         except Exception:
-            eta_ms = 0.0
+            eta_ms = None
         decision_features["eta_ms"] = eta_ms
         if selected_band is not None and selected_band.get("threshold_bp") is not None:
             decision_features["stall_ttl_band_threshold_bp"] = selected_band["threshold_bp"]
@@ -523,7 +526,7 @@ class StallThenStrike(StrategyBase):
             return []
 
         # ここからは建玉なしのエントリー判定
-        if age_ms is not None and age_ms >= stall_T and sp_tick >= min_sp and eta_ms <= ttl_st and not stall_orders:  # ETA>TTLなら置かない（TTL失効の無駄発注＝ttl cancelを減らす）
+        if age_ms is not None and age_ms >= stall_T and sp_tick >= min_sp and (eta_ms is None or eta_ms <= ttl_st) and not stall_orders:  # 何をするか：ETAが取れたときだけTTLゲートを有効化し、未計算(None)なら従来通り通す
             if guard_active:
                 decision_features["stall_local_guard"] = guard_reason or "local_guard"
                 if not self._guard_notified:
