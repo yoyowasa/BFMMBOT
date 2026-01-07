@@ -1,5 +1,6 @@
 # configs/live.yml - live用の最小リスク設定
 env: live
+canary_minutes: 15  # canary本番を15分で自動終了させる（止まらない運用を防ぐ）
 
 # 共通サイズ（戦略デフォルト）
 size:
@@ -67,6 +68,9 @@ guard:
 logging:
   level: DEBUG
   heartbeat_status_sec: 2
+
+# 起動時の安全装置（既存注文を残さない）
+cancel_all_on_start: true
 features:
   # ST閾値を最小化して「とりあえず発注」できるよう緩める
   stall_min_mp_edge_bp: -5.0
@@ -79,7 +83,8 @@ mode_switch:
   # Funding関連の一時停止を無効化（calc/transferで止まらないようにする）
   funding_calc_jst: []
   funding_transfer_lag_hours: 0
-# dry-run を一定時間で終了させる秒数（ここでは2時間）
+
+# dry-run を一定時間で終了させる秒数（ここでは15分）
 dry_run_max_sec: 900
 env_overrides:
   live:

@@ -399,17 +399,15 @@ class StallThenStrike(StrategyBase):
             "stall_min_spread_tick": min_sp,
             "tick_size": tick,
         }
-        eta_ms = getattr(ob, "eta_ms", None)
-        if eta_ms is None:
-            eta_ms = getattr(ob, "queue_eta_ms", None)
-        # 何をするか：ETAをfloatへ正規化し、未計算/異常値(±inf/NaN)はNoneにしてログと判定を壊さない
+        # 何をするか：ETAゲートは queue_eta_ms のみを参照して、ob.eta_ms 由来の衝突を避ける
+        queue_eta_ms = getattr(ob, "queue_eta_ms", None)
         try:
-            eta_ms = float(eta_ms) if eta_ms is not None else None
-            if eta_ms is not None and (eta_ms != eta_ms or eta_ms in (float("inf"), float("-inf"))):
-                eta_ms = None
+            queue_eta_ms = float(queue_eta_ms) if queue_eta_ms is not None else 0.0
         except Exception:
-            eta_ms = None
-        decision_features["eta_ms"] = eta_ms
+            queue_eta_ms = 0.0
+        eta_ms = queue_eta_ms  # queueの到達予想時間(ETA)を、互換名eta_msとしても同じ値で扱う
+        decision_features["queue_eta_ms"] = eta_ms  # 明示名（分析用）
+        decision_features["eta_ms"] = eta_ms  # 既存ログ列名（互換用）
         if selected_band is not None and selected_band.get("threshold_bp") is not None:
             decision_features["stall_ttl_band_threshold_bp"] = selected_band["threshold_bp"]
         if buy_filter_window is not None:
@@ -526,7 +524,9 @@ class StallThenStrike(StrategyBase):
             return []
 
         # ここからは建玉なしのエントリー判定
-        if age_ms is not None and age_ms >= stall_T and sp_tick >= min_sp and (eta_ms is None or eta_ms <= ttl_st) and not stall_orders:  # 何をするか：ETAが取れたときだけTTLゲートを有効化し、未計算(None)なら従来通り通す
+        decision_features["queue_eta_gate_ttl_ms"] = float(ttl_st)  # 何をするか：ETAゲート判定に使ったTTL(ms)をdecision_logへ残す
+        decision_features["queue_eta_gate_ok"] = queue_eta_ms <= float(ttl_st)  # 何をするか：ETA<=TTLならTrueとして記録し、ゲート起因の抑止を切り分け可能にする
+        if age_ms is not None and age_ms >= stall_T and sp_tick >= min_sp and queue_eta_ms <= ttl_st and not stall_orders:  # 何をするか：ETA>TTLなら置かない（TTL失効の無駄発注＝ttl cancelを減らす）
             if guard_active:
                 decision_features["stall_local_guard"] = guard_reason or "local_guard"
                 if not self._guard_notified:

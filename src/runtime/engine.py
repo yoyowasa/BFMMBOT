@@ -215,9 +215,10 @@ class PaperEngine:
         # ローカル板・シミュ・ログ器
         self.ob = OrderBook(tick_size=self.tick)
         try:
-            self._queue_eta = QueueETA(window_ms=800)  # 何をするか：直近800msの約定流量からQueueのETAを推定する
+            self._queue_eta = QueueETA(window_sec=30.0)  # 何をするか：直近30秒の約定流量からQueueのETAを推定する
         except TypeError:
             self._queue_eta = QueueETA()  # 何をするか：QueueETAの__init__引数が違う実装でも落ちないようにする（保険）
+        self._queue_eta_last = None  # 何をするか：直近のQueueETA入力/生ETAを保持してdecision_logへ同梱する
         self.sim = MiniSimulator()
         self._feed_mode = "healthy"          # 何をするか：現在のフィード状態（healthy/caution/halted）を保持
         self._last_feed_reason = "init"      # 何をするか：直近の判定理由（ログや監視で参照）
@@ -661,23 +662,86 @@ class PaperEngine:
         """
         qeta = getattr(self, "queue_eta", None) or getattr(self, "_queue_eta", None)
         if qeta is None:
+            self._queue_eta_last = None
             return 10_000_000.0  # 何をするか：推定器未配線時は「TTLより長い」扱いで安全側に倒す
 
+        # 何をするコード：OrderBookから「最良Bid/Askの価格・サイズ」を安全に取り出す（実装差を吸収する）
         bid = getattr(ob, "bid", None)
         bid_size = getattr(ob, "bid_size", None)
+        ask = getattr(ob, "ask", None)
+        ask_size = getattr(ob, "ask_size", None)
+
+        # 何をするコード：OrderBookが best_bid_price / best_ask_price 形式を持つ場合のフォールバック
+        if bid is None:
+            bid = getattr(ob, "best_bid_price", None)
+        if bid_size is None:
+            bid_size = getattr(ob, "best_bid_size", None)
+        if ask is None:
+            ask = getattr(ob, "best_ask_price", None)
+        if ask_size is None:
+            ask_size = getattr(ob, "best_ask_size", None)
+
+        # 何をするコード：OrderBookが best_bid / best_ask （オブジェクト）形式を持つ場合のフォールバック
+        best_bid = getattr(ob, "best_bid", None)
+        if (bid is None or bid_size is None) and best_bid is not None:
+            if bid is None:
+                bid = getattr(best_bid, "price", None)
+                if bid is None:
+                    bid = getattr(best_bid, "px", None)
+            if bid_size is None:
+                bid_size = getattr(best_bid, "size", None)
+                if bid_size is None:
+                    bid_size = getattr(best_bid, "qty", None)
+
+        best_ask = getattr(ob, "best_ask", None)
+        if (ask is None or ask_size is None) and best_ask is not None:
+            if ask is None:
+                ask = getattr(best_ask, "price", None)
+                if ask is None:
+                    ask = getattr(best_ask, "px", None)
+            if ask_size is None:
+                ask_size = getattr(best_ask, "size", None)
+                if ask_size is None:
+                    ask_size = getattr(best_ask, "qty", None)
         if bid is None or bid_size is None:
+            self._queue_eta_last = None
             return 10_000_000.0  # 何をするか：板がまだ無い/欠損なら「置かない」判定に寄せる
 
         qty = float(getattr(ob, "dust", None) or 0.001)  # 何をするか：代表数量（最小ロット想定）でETAを出す
+        side = "BUY"
+        price = float(bid) if bid is not None else None
+
+        level_size = None  # 何をするか：この注文価格レベルに既に乗っている板数量（自分の前の行列）を推定する
+        if price is not None:  # 何をするか：指値のときだけ、板厚（level_size）を推定できる
+            if side == "BUY":  # 何をするか：BUY指値は bid 側の同値レベルに並ぶので best_bid.size を使う
+                bb = best_bid
+                if bb is not None and getattr(bb, "price", None) is not None and abs(float(price) - float(bb.price)) < 1e-9:
+                    level_size = getattr(bb, "size", None)
+            else:  # 何をするか：SELL指値は ask 側の同値レベルに並ぶので best_ask.size を使う
+                ba = best_ask
+                if ba is not None and getattr(ba, "price", None) is not None and abs(float(price) - float(ba.price)) < 1e-9:
+                    level_size = getattr(ba, "size", None)
+
+        # 何をするか：QueueETAに渡したlevel_sizeを、debug用の「ahead_qty」として必ず残す（ob.bid_size未配線でも0固定にしない）
+        ahead_used_qty = 0.0
+        try:
+            ahead_used_qty = float(level_size) if level_size is not None else 0.0
+        except Exception:
+            ahead_used_qty = 0.0
 
         eta_sec = qeta.estimate_eta_sec(
-            order_side="BUY",
-            price=float(bid),
+            order_side=side,
+            price=price,
             qty=qty,
-            level_size=float(bid_size),
+            level_size=level_size,
             ts=now,
             price_first=False,  # 何をするか：価格別が薄いとinfになりやすいので、まずはside合計レート優先で安定化
         )
+        self._queue_eta_last = {
+            "qty": float(qty),
+            "ahead_qty": float(max(0.0, ahead_used_qty)),
+            "eta_sec": eta_sec,
+        }
 
         if not math.isfinite(eta_sec):
             return 10_000_000.0  # 何をするか：inf/NaNは巨大msへ（TTLゲートで確実に落ちる）
@@ -969,7 +1033,7 @@ class PaperEngine:
                     else None
                 )
             ),
-            'eta_ms': (feats.get('eta_ms') or feats.get('queue_eta_ms')),
+            'eta_ms': (feats.get('queue_eta_ms') if feats.get('queue_eta_ms') is not None else feats.get('eta_ms')),  # 本命はqueue_eta_ms、互換としてeta_msにフォールバック
         })
         self.decision_log.add(**decision_record)
 
@@ -1946,6 +2010,41 @@ class PaperEngine:
                         "spread_tick": self.ob.spread_ticks(),  # 何をする行か：現在スプレッド(tick)を記録
                         "queue_eta_ms": queue_eta_ms,  # 何をするか：decision_log/analyticsにETA(ms)を残す
                     }
+                    side = "BUY"
+                    price = getattr(ob, "bid", None)
+                    qty = float(getattr(ob, "dust", None) or 0.001)
+                    level_size = getattr(ob, "bid_size", None)
+                    qeta_dbg = self._queue_eta.debug_estimate(
+                        order_side=side,          # 何をするか：このETAを見たい注文side（既存の変数を使う）
+                        price=price,              # 何をするか：このETAを見たい指値価格（既存の変数を使う）
+                        qty=qty,                  # 何をするか：このETAを見たい注文サイズ（既存の変数を使う）
+                        level_size=level_size,    # 何をするか：その価格レベルの板厚み（持っていれば）
+                        ts=now,                   # 何をするか：QueueETAがexpireに使う時刻（datetime/数値で渡す）
+                        price_first=False,        # 何をするか：現状の見積もり設定と同じに合わせる
+                    )
+
+                    features["queue_eta_dbg_samples"] = qeta_dbg["samples"]                 # 何をするか：サンプルが溜まっているか確認
+                    features["queue_eta_dbg_hit_side"] = qeta_dbg["hit_side"]               # 何をするか：どっちの約定流量で見積もっているか確認
+                    qeta_last = getattr(self, "_queue_eta_last", None) or {}
+                    level_size = qeta_last.get("ahead_qty")
+                    features["queue_eta_dbg_ahead_qty"] = float(level_size or 0.0)  # 何をするか：QueueETA.estimate_eta_secへ渡す「板の行列量(level_size)」と同じ値をdebugに残し、ahead=0張り付きを防ぐ
+                    features["queue_eta_dbg_needed_qty"] = qeta_dbg["needed_qty"]           # 何をするか：必要流量（ahead+qty）が巨大でないか確認
+                    features["queue_eta_dbg_rate_price_per_sec"] = qeta_dbg["rate_price_per_sec"]  # 何をするか：価格別レートが取れているか確認
+                    features["queue_eta_dbg_rate_side_per_sec"] = qeta_dbg["rate_side_per_sec"]    # 何をするか：片側合計レートが取れているか確認
+                    features["queue_eta_dbg_rate_used_per_sec"] = qeta_dbg["rate_used_per_sec"]    # 何をするか：実際に採用したレートが0扱いでないか確認
+                    features["queue_eta_dbg_is_inf"] = qeta_dbg["is_inf"]                   # 何をするか：inf→キャップの発生有無を確認
+                    features["queue_eta_dbg_raw_ms"] = qeta_dbg["raw_ms"]                   # 何をするか：キャップ前の生ETA(ms)を確認（infならNone）
+                    qty = qeta_last.get("qty")
+                    ahead_qty = qeta_last.get("ahead_qty")
+                    eta_sec = qeta_last.get("eta_sec")
+                    if qty is not None and ahead_qty is not None and eta_sec is not None:
+                        # 何をするか：QueueETA が“常に天井(10,000,000ms)”になる原因（qtyの単位ミス or eta=inf）を切り分けるため、入力と生ETAを特徴量へ同梱する
+                        features["queue_eta_dbg_qty_in"] = float(qty)
+                        features["queue_eta_dbg_needed_qty"] = float(ahead_qty) + float(qty)
+
+                        qe_is_inf = (eta_sec == float("inf")) or (eta_sec != eta_sec)  # 何をするか：inf / NaN を安全に検出して orjson で壊れない形にする
+                        features["queue_eta_dbg_eta_sec_raw"] = None if qe_is_inf else float(eta_sec)  # 何をするか：生のETA(秒)を残す（inf/NaNはNone）
+                        features["queue_eta_dbg_eta_ms_raw"] = None if qe_is_inf else float(eta_sec) * 1000.0  # 何をするか：生のETA(ms)を残す（inf/NaNはNone）
                     self._record_decision(now, actions, features=features)
                     try:
                         cfg_size = getattr(self.cfg, 'size', None)

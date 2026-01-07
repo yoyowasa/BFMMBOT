@@ -33,9 +33,13 @@ class QueueETA:
       - order_side=SELL のとき、約定側は BUY 流量（買い成行が ask を叩く）を使う想定。
     """
 
-    def __init__(self, window_ms: int = 800, min_rate: float = 0.0) -> None:
+    def __init__(
+        self,
+        window_sec: float = 30.0,  # 何をするか：ローリング窓を長めにして「サンプル0→レート極小→ETA天井張り付き」を起こしにくくする
+        min_rate: float = 0.0,
+    ) -> None:
         # 何秒ぶんの出来高でレート（size/sec）を作るか
-        self._window_sec = max(0.001, window_ms / 1000.0)
+        self._window_sec = max(0.001, float(window_sec))
 
         # 0割りや“ほぼゼロ流量”で ETA が暴れるのを避けるための下限
         self._min_rate = float(min_rate)
@@ -48,6 +52,7 @@ class QueueETA:
 
         # side ごとのローリング出来高合計（size）
         self._sum_by_side_total: Dict[str, float] = {"BUY": 0.0, "SELL": 0.0}
+        self._last_estimate = {}  # 何をするか：直近のETA計算の材料（rate/ahead/needed等）を保持して、異常値の原因を追えるようにする
 
     def on_execution(self, *, side: str, price: float, size: float, ts: TsLike = None) -> None:
         """
@@ -116,11 +121,122 @@ class QueueETA:
             price_first=price_first,
         )
 
-        # 流量が無い（または小さすぎる）なら ETA は無限大扱い
+        # 流量が無い（または小さすぎる）なら ETA は無限大扱い（ただしデバッグ情報は残す）
         if rate <= self._min_rate:
-            return math.inf
+            eta_sec = math.inf
+        else:
+            eta_sec = needed / rate
 
-        return needed / rate
+        # 何をするか：後段（engine/strategy/log）から「なぜ inf/巨大になったか」を見れるように最後の計算材料を保存する
+        self._last_estimate = {
+            "ts_sec": now,
+            "order_side": ord_side,
+            "hit_side": hit_side,
+            "price": float(price) if price is not None else None,
+            "qty": q,
+            "ahead": ahead,
+            "needed": needed,
+            "rate_per_sec": rate,
+            "samples": len(self._samples),
+            "eta_sec": eta_sec,
+            "price_first": price_first,
+        }
+
+        return eta_sec
+
+    def debug_estimate(
+        self,
+        *,
+        order_side: str,
+        price: Optional[float],
+        qty: float,
+        level_size: Optional[float] = None,
+        queue_ahead: Optional[float] = None,
+        ts: TsLike = None,
+        price_first: bool = True,
+    ) -> dict:
+        """
+        何をする関数：
+          QueueETA の見積もりが「inf扱い→キャップ」になっていないかを切り分けるため、
+          ETA計算に使った前提（ahead/needed）、サンプル数、rate（price別/side合計/採用）、
+          そして生のETA（ms）をまとめて返す（観測専用・例外を投げない）。
+        """
+        try:
+            now = self._to_ts_sec(ts)
+            self._expire(now)
+
+            ord_side = self._norm_side(order_side)
+            hit_side = "SELL" if ord_side == "BUY" else "BUY"
+
+            q = float(qty)
+            if q <= 0.0 or not math.isfinite(q):
+                return {
+                    "samples": len(self._samples),
+                    "hit_side": hit_side,
+                    "ahead_qty": 0.0,
+                    "needed_qty": 0.0,
+                    "rate_price_per_sec": 0.0,
+                    "rate_side_per_sec": 0.0,
+                    "rate_used_per_sec": 0.0,
+                    "is_inf": False,
+                    "raw_ms": 0.0,
+                }
+
+            ahead = float(queue_ahead) if queue_ahead is not None else float(level_size or 0.0)
+            ahead = max(0.0, ahead)
+            needed = ahead + q
+
+            px = float(price) if price is not None else None
+
+            # 価格別レート（取れているかを見る用）
+            rate_price = self._rate_per_sec(hit_side=hit_side, price=px, price_first=True)
+
+            # 片側合計レート（フォールバックが効くかを見る用）
+            rate_side = self._rate_per_sec(hit_side=hit_side, price=None, price_first=False)
+
+            # 実際に採用されるレート（estimate_eta_sec と同じ指定）
+            rate_used = self._rate_per_sec(hit_side=hit_side, price=px, price_first=price_first)
+
+            if rate_used <= self._min_rate:
+                return {
+                    "samples": len(self._samples),
+                    "hit_side": hit_side,
+                    "ahead_qty": ahead,
+                    "needed_qty": needed,
+                    "rate_price_per_sec": float(rate_price),
+                    "rate_side_per_sec": float(rate_side),
+                    "rate_used_per_sec": float(rate_used),
+                    "is_inf": True,
+                    "raw_ms": None,
+                }
+
+            eta_sec = needed / rate_used
+            raw_ms = eta_sec * 1000.0
+
+            return {
+                "samples": len(self._samples),
+                "hit_side": hit_side,
+                "ahead_qty": ahead,
+                "needed_qty": needed,
+                "rate_price_per_sec": float(rate_price),
+                "rate_side_per_sec": float(rate_side),
+                "rate_used_per_sec": float(rate_used),
+                "is_inf": False,
+                "raw_ms": float(raw_ms),
+            }
+        except Exception:
+            # デバッグ関数は「絶対に落とさない」：落ちたら観測不能になるため
+            return {
+                "samples": 0,
+                "hit_side": "UNKNOWN",
+                "ahead_qty": 0.0,
+                "needed_qty": 0.0,
+                "rate_price_per_sec": 0.0,
+                "rate_side_per_sec": 0.0,
+                "rate_used_per_sec": 0.0,
+                "is_inf": True,
+                "raw_ms": None,
+            }
 
     def get_eta_ms(
         self,
