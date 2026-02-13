@@ -2,7 +2,6 @@ import multiprocessing
 import sys
 
 def f():
-    import sys
     print('child sys.executable', sys.executable)
     print('child base', getattr(sys, '_base_executable', None))
     print('child prefix', sys.prefix, sys.base_prefix)

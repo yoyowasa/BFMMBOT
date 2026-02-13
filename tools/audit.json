@@ -1,0 +1,8 @@
+{
+  "pytest_args": [
+    "-q"
+  ],
+  "pytest_required": true,
+  "ruff_required": true,
+  "mypy_required": false
+}

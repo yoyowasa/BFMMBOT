@@ -31,10 +31,9 @@ from threading import Event  # 何をするか：停止フラグを扱う
 
 from pathlib import Path  # 何をするか：ハートビートの出力ファイルを扱う
 import orjson  # 何をするか：1行JSON(NDJSON)を書き出す
-from datetime import datetime, timezone, timedelta  # 何をするか：UTC現在時刻とTTL計算
+from datetime import timezone, timedelta  # 何をするか：UTC現在時刻とTTL計算
 from collections import deque  # 何をするか：ミッド変化ガード用の履歴
 from src.core.orderbook import OrderBook  # 何をするか：ローカル板（戦略の入力）
-from src.core.orders import Order  # 何をするか：戦略が返す注文モデル（tif/ttl_ms/price/size/tag）
 from src.core.realtime import stream_events  # 何をするか：WSのboard/executionsストリーム
 from src.strategy.base import MultiStrategy  # 何をするか：複数戦略をまとめるラッパー
 from src.core.logs import OrderLog, TradeLog  # 何をするか：orders/trades を Parquet＋NDJSON に記録する
@@ -42,7 +41,6 @@ from src.core.analytics import DecisionLog  # 何をするか：戦略の意思�
 
 from src.core.exchange import BitflyerExchange, ExchangeError, ServerError, NetworkError, AuthError  # 何をするか：認証/権限エラー(AuthError)を検知して安全停止する
 from src.core.position_replay import http_replay_for_position  # HTTP経由で約定履歴を取り寄せてポジションに適用する共通関数を使う
-from src.core.position_replay import http_replay_for_position  # HTTP約定リプレイでQ/A/R/Fの欠損を埋める関数
 def _normalize_strategy_names(
     primary: str,
     strategies: Sequence[str] | str | None,
@@ -1213,14 +1211,12 @@ def run_live(
             limit_qty = getattr(getattr(cfg, "risk", None), "limit_qty", None)
             if max_inflight is None:
                 max_inflight = getattr(getattr(cfg, "risk", None), "max_active_orders", None)
-            max_spread_bp = getattr(getattr(cfg, "guard", None), "max_spread_bp", None)  # 何をするか：スプレッドが広すぎる時の停止しきい値(bp)
             stale_ms = int(getattr(getattr(cfg, "guard", None), "max_stale_ms", 3000))  # 何をするか：WS/板の鮮度しきい値(ms)。超えたら新規を止める
             board_reconnect_after_s = float(getattr(getattr(cfg, "guard", None), "board_reconnect_after_s", 5.0) or 0.0)  # 何をするか：bad_book/stale_dataがこの秒数以上続いたら板ストリームを再接続する
             book_warmup_s = float(getattr(getattr(cfg, "guard", None), "book_warmup_s", 2.0) or 0.0)  # 何をするか：接続直後に板の充填を待つ猶予秒数
             fills_stale_after_s = float(getattr(getattr(cfg, "guard", None), "fills_stale_after_s", 15.0) or 0.0)  # 何をするか：この秒数 fill が見えなければ欠損疑いとして扱う
             fills_replay_cooldown_s = float(getattr(getattr(cfg, "guard", None), "fills_replay_cooldown_s", 30.0) or 0.0)  # 何をするか：HTTPバックフィル連打のクールダウン
             last_ev_at = _now_utc()  # 何をするか：直近イベントの時刻（鮮度ガードの基準）
-            book_warmup_until: datetime | None = None  # 何をするか：板ウォームアップ猶予の期限
             connection_started_at: datetime | None = None  # 何をするか：この接続の開始時刻（判定リセット用）
             warmup_guard_s = max(book_warmup_s, 5.0)  # 何をするか：初期のbad_book/stale判定を必ず緩める最低猶予秒数
             snapshot_seen = False  # 何をするか：板スナップショットを受信済みかのフラグ
@@ -1268,7 +1264,6 @@ def run_live(
             atexit.register(exit_handler)  # 何をするか：プロセス終了時も同じ入口を通す
             stop_event = Event()  # 何をするか：シグナルや例外で立てる停止フラグ
 
-            halted = False  # 何をするか：Kill 到達後は新規を出さない
             avg0, net0, ok0 = _seed_inventory_and_avg_px(ex)  # 何をするか：起動時の建玉(数量/平均建値)を反映してPnL状態を初期化
             pnl_state = {"pos": float(net0 or 0.0) if ok0 else 0.0, "avg_px": avg0 if ok0 else None}
             last_exchange_pos = float(net0 or 0.0) if ok0 else None
@@ -1282,7 +1277,6 @@ def run_live(
             last_place: dict[str, datetime] = {}  # 何をするか：直近に出した(side|price|tag)→時刻 を覚える
             _last_tx_at = _now_utc() - timedelta(milliseconds=min_tx_ms)  # 何をするか：直近の送信時刻（初期は「今−間隔」で即送れる状態）
             fee_bps = float(getattr(getattr(cfg, "fees", None), "bps", 0.0))  # 何をするか：手数料のbps設定（未指定は0.0）
-            canary_min = (10**9 if dry_run else int(getattr(cfg, "canary_minutes", 0) or 0))  # DRYは無効（分）
             throttle_until: datetime | None = None  # 何をするか：レート制限に当たった時のクールダウン期限
             auto_reduce_last_ts: datetime | None = None  # 何をするか：auto_reduceのクールダウン共有用
             inv_resync_ms = int(getattr(getattr(getattr(cfg, "risk", None), "auto_reduce", None), "resync_ms", 5000))  # 何をするか：定期的に取引所の建玉とPnL状態を同期する間隔(ms)
@@ -1413,8 +1407,6 @@ def run_live(
             signal.signal(signal.SIGTERM, _on_signal)  # 何をするか：SIGTERM（停止要求）で停止
 
             ob = OrderBook()  # 何をするか：ローカル板（戦略の入力）を用意
-            if book_warmup_s > 0.0:
-                book_warmup_until = _now_utc() + timedelta(seconds=book_warmup_s)  # 何をするか：接続直後は板未充填を許容する猶予を持つ
             cfg_payload = _safe_config_dict(cfg)
             if not cfg_payload and isinstance(cfg, Mapping):
                 cfg_payload = dict(cfg)
@@ -1584,10 +1576,6 @@ def run_live(
                     # 何をするか：WS接続ステータスイベントを受けたらリセット＋欠損約定をRESTで追う
                     if ev.get("channel") == "__ws_status__" and ev.get("event") in ("ws_reconnect", "ws_connected", "ws_error"):
                         # 何をするか：接続イベントごとに判定カウンタをリセットし、ウォームアップ猶予を再設定
-                        if book_warmup_s > 0.0:
-                            book_warmup_until = now + timedelta(seconds=book_warmup_s)
-                        else:
-                            book_warmup_until = None
                         connection_started_at = now
                         bad_book_since = None
                         stale_since = None
@@ -2741,8 +2729,6 @@ def run_live(
                     bad_book_since = None
                     stale_since = None
                     last_ev_at = _now_utc()
-                    if book_warmup_s > 0.0:
-                        book_warmup_until = last_ev_at + timedelta(seconds=book_warmup_s)
                     continue
 
                 break

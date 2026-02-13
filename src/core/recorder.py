@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from pathlib import Path  # パス操作
-from typing import Dict, Any, Iterable  # 型ヒント
+from typing import Dict, Any  # 型ヒント
 import orjson  # 高速JSON
 from loguru import logger  # ログ
 

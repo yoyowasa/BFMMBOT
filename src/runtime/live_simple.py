@@ -4,7 +4,8 @@ import os
 import atexit
 import signal
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any, Sequence
 
 from loguru import logger

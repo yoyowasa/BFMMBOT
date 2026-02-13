@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime  # 時刻・TTL判定
-from typing import List, Dict, Any
-from loguru import logger
+from typing import List, Any
 
 from src.core.orders import Order
 

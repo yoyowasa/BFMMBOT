@@ -34,7 +34,6 @@ from src.strategy.base import (
 )  # 何をするか：複数戦略を束ねるラッパーと子戦略名・相関IDの合図
 from src.core.risk import RiskGate  # 何をするか：在庫ゲート（市場モードでClose-Onlyを切り替える）
 from src.core.utils import monotonic_ms
-from src.core.risk import cap_order_size_by_inventory  # 在庫と上限に基づき新規サイズを安全側へ切り下げる
 from src.core.risk import inv_capping_preflight  # 在庫前処理（ログ: headroom/shrink/no_room を一元管理）
 from src.core.orders import Order  # Reduce-Only+IOCの仕様とOrder
 from src.core.position_replay import http_replay_for_position  # HTTP約定リプレイでQ/A/R/Fの欠損を埋める関数
@@ -301,7 +300,6 @@ class PaperEngine:
     def _place_with_feed_guard(self, *args, **kwargs):
         """フィードの健全性と在庫ガードを踏まえて発注をフィルタする（Haltedでは新規を止める）。"""
         now_ms = int(time.time() * 1000)
-        now_dt = datetime.now(timezone.utc)
         prev_mode = getattr(self, "_feed_mode", "healthy")
         best_age_ms: float | None = None
         hb_gap_sec: float | None = None

@@ -13,7 +13,6 @@ from typing import Dict, Any, Deque, Tuple, Iterable  # 型ヒント
 from collections import deque  # C/Aイベントのスライディング窓
 from datetime import datetime, timezone  # ISO→datetime と経過ms計算
 import time  # Bestの滞留時間(ms)を単調時計で測るために使用
-from loguru import logger  # ログ（必要時）
 from src.features.queue_eta import QueueETA  # 何をするか：板の先頭の待ち時間(Queue ETA)推定器を使う
 
 # ─────────────────────────────────────────────────────────────

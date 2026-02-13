@@ -5,8 +5,7 @@ import json
 import math
 from bisect import bisect_right  # 直前の意思決定(ts)を2秒以内で探すのに使う
 from math import isfinite  # 実数判定（NaN/infを除外するために使う）
-from collections import Counter, defaultdict
-from dataclasses import dataclass
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean, median
@@ -121,7 +120,6 @@ def build_order_lifecycle(orders: list[dict]):
         ts = parse_ts(r.get("ts"))
         tif = r.get("tif")
         ttl_ms = r.get("ttl_ms")
-        px = r.get("px")
         sz = r.get("sz")
         corr, tag, head = _parse_corr_tag_reason(r.get("reason"))
         if corr is None:

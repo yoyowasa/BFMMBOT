@@ -1,4 +1,7 @@
-import websocket, json, threading, time
+import websocket
+import json
+import threading
+import time
 
 CHANNEL_SNAPSHOT = "lightning_board_snapshot_FX_BTC_JPY"
 CHANNEL_BOARD = "lightning_board_FX_BTC_JPY"

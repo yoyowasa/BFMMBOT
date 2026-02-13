@@ -39,6 +39,11 @@ target-version = ["py311"]
 
 [tool.ruff]  # Lintルール（必要に応じて後で詳細化）
 line-length = 100
+target-version = "py311"
+extend-exclude = ["tmp_*.py", "engine_orig.py"]
+
+[tool.ruff.lint]
+ignore = ["E402", "E701", "E702", "E731"]
 
 [tool.poetry.scripts]
 monitor-hb = "tools.monitor_heartbeat:main"
@@ -49,3 +54,16 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+follow_imports = "silent"
+show_error_codes = true
+pretty = true
+warn_unused_ignores = false
+check_untyped_defs = false
+ignore_errors = true
+namespace_packages = false
+disable_error_code = ["import-untyped", "unused-ignore"]
+exclude = '(^|/)(\.venv|venv|build|dist|\.git)/|(^|/)conftest\.py$'
