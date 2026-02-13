@@ -31,7 +31,6 @@ from src.strategy.base import (
 )  # 何をするか：複数戦略を束ねるラッパーと子戦略名・相関IDの合図
 from src.core.risk import RiskGate  # 何をするか：在庫ゲート（市場モードでClose-Onlyを切り替える）
 from src.core.utils import monotonic_ms
-from src.core.risk import cap_order_size_by_inventory  # 在庫と上限に基づき新規サイズを安全側へ切り下げる
 from src.core.risk import inv_capping_preflight  # 在庫前処理（ログ: headroom/shrink/no_room を一元管理）
 from src.core.orders import Order  # Reduce-Only+IOCの仕様とOrder
 

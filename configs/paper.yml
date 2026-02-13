@@ -1,5 +1,6 @@
 # configs/paper.yml - base.yml の共通設定をそのまま使い、env だけをpaperに固定します。
 env: paper
+duration_sec: 60
 # Overrides for paper environment to improve fill likelihood
 size:
   default: 0.003

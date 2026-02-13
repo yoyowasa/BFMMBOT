@@ -1,3 +1,6 @@
+cd c:\BOT\BF-MMBOT
+.\.venv\Scripts\Activate.ps1
+
 1) リアルタイム動作を追う（NDJSONミラー）
 
 何が分かる？ 発注／取消／約定／意思決定が発生順に流れます。
@@ -149,7 +152,7 @@ git --no-pager diff --name-status origin/main
 git --no-pager log -1 --oneline
 git --no-pager log -1 --oneline origin/main
 
-cd E:\BF-MMBOT
+cd c:\BOT\BF-MMBOT
 .\.venv\Scripts\Activate.ps1
 
 
